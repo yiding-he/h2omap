@@ -38,6 +38,47 @@ CREATE TABLE EVENTS(TS TIMESTAMP, HOST VARCHAR, COST DOUBLE)
 
 表定义会随元数据持久化，数据不会。纯内存场景下这是预期行为，重启后需要重新导入。
 
+### 单独运行
+
+`mvn -q package` 产出的是普通 jar `target/h2omap-0.1.0-SNAPSHOT.jar`：不含 H2 依赖，也没有 `Main-Class`，因此 `java -jar` 跑不起来。要把本项目的 jar 与 H2 的 jar 一起放进 classpath，再指定 H2 自带的启动类。
+
+```bash
+# Linux / macOS；Windows 把 classpath 的分隔符 ":" 换成 ";"
+H2_JAR="$HOME/.m2/repository/com/h2database/h2/2.5.252/h2-2.5.252.jar"
+CP="target/h2omap-0.1.0-SNAPSHOT.jar:$H2_JAR"
+```
+
+H2 的 jar 在执行 `mvn -q package` 时已落到本地 Maven 仓库；也可以直接从 Maven Central 取 `https://repo1.maven.org/maven2/com/h2database/h2/2.5.252/h2-2.5.252.jar`。下面三种方式的 `CP` 都是这一串。
+
+命令行 Shell，交互或一次执行：
+
+```bash
+java -cp "$CP" org.h2.tools.Shell -url "jdbc:h2:~/omap-demo" -user sa
+java -cp "$CP" org.h2.tools.Shell -url "jdbc:h2:mem:omap-demo" -user sa \
+  -sql "CREATE TABLE EVENTS(TS TIMESTAMP, HOST VARCHAR, COST DOUBLE) ENGINE \"com.hyd.h2omap.engine.OmapTableEngine\" WITH \"segmentSize=65536\";"
+```
+
+Web Console 与 TCP 服务器，浏览器开 `http://localhost:18082`，或用 TCP 连接：
+
+```bash
+java -cp "$CP" org.h2.tools.Server -tcp -tcpPort 19092 -web -webPort 18082 -ifNotExists
+java -cp "$CP" org.h2.tools.Shell -url "jdbc:h2:tcp://localhost:19092/~/omap-demo" -user sa
+```
+
+`-ifNotExists` 必须加：H2 服务器默认禁止远程建库，不加时客户端首次访问会报 `Database "..." not found`。
+
+自己写的 Java 程序：
+
+```bash
+javac -cp "$CP" -d out Demo.java
+java -cp "$CP:out" Demo
+```
+
+两个容易踩的点：
+
+- 引擎类由 H2 反射加载，本项目的 jar 不在 classpath 时报 `Class "com.hyd.h2omap.engine.OmapTableEngine" not found`（SQL 错误码 90086），不是引擎实现本身出错。
+- `jdbc:h2:mem:名字` 只在当前进程内有效，进程退出即消失；`jdbc:h2:~/名字` 会落盘，但 OMAP 表的数据不随元数据持久化，重启后仍需重新导入。
+
 ## 已知限制
 
 - **`DEFAULT_TABLE_ENGINE` 不能用**：它会让 `Schema.createTable` 把 H2 自己的元数据表也交给本引擎（`schema/Schema.java:795`），而元数据必须落在 MVStore 里，实测开库直接抛 `Unexpected code path`。它也只能通过 JDBC URL 参数设置，`2.5.252` 没有 `SET DEFAULT_TABLE_ENGINE` 命令。
