@@ -41,7 +41,7 @@ CREATE TABLE EVENTS(TS TIMESTAMP, HOST VARCHAR, COST DOUBLE)
 ## 已知限制
 
 - **`DEFAULT_TABLE_ENGINE` 不能用**：它会让 `Schema.createTable` 把 H2 自己的元数据表也交给本引擎（`schema/Schema.java:795`），而元数据必须落在 MVStore 里，实测开库直接抛 `Unexpected code path`。它也只能通过 JDBC URL 参数设置，`2.5.252` 没有 `SET DEFAULT_TABLE_ENGINE` 命令。
-- **列式结构尚未生效**：段列表从未被填充，所有数据停留在行式 delta，读路径就是行式数组扫描。zone map 剪枝与合并都还没实现。
+- **列式结构已生效，但优化未做**：写入达到 `segmentSize` 后冻结成不可变列段，读路径先段后 delta；zone map 剪枝、合并与字典编码都还没实现。
 - **没有事务**：失败的部分更新不会回滚，并发写由 delta 内部加锁保证。
 
 ## 设计与实现
