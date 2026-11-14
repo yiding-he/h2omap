@@ -5,6 +5,7 @@ package com.hyd.h2omap.table;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.h2.command.ddl.CreateTableData;
 import org.h2.engine.SessionLocal;
@@ -38,6 +39,8 @@ public final class OmapTable extends TableBase {
 
     private final List<Index> indexes = new ArrayList<>(2);
 
+    private final AtomicLong lastModificationId = new AtomicLong();
+
     public OmapTable(CreateTableData data, OmapOptions options) {
         super(data);
         this.store = new ColumnarStore(getColumns(), options, getCompareMode());
@@ -68,6 +71,8 @@ public final class OmapTable extends TableBase {
             store.remove(rowId);
             row.setKey(0);
             throw e;
+        } finally {
+            syncLastModificationIdWithDatabase();
         }
     }
 
@@ -77,6 +82,7 @@ public final class OmapTable extends TableBase {
         for (Index index : indexes) {
             index.remove(session, row);
         }
+        syncLastModificationIdWithDatabase();
     }
 
     @Override
@@ -85,6 +91,7 @@ public final class OmapTable extends TableBase {
         for (Index index : indexes) {
             index.truncate(session);
         }
+        syncLastModificationIdWithDatabase();
         return old;
     }
 
@@ -101,29 +108,35 @@ public final class OmapTable extends TableBase {
     public void updateRows(SessionLocal session, LocalResult rows, Runnable cancellationCheck) {
         rows.done();
         int scanned = 0;
-        while (rows.next()) {
-            if ((++scanned & 127) == 0) {
-                cancellationCheck.run();
+        try {
+            while (rows.next()) {
+                if ((++scanned & 127) == 0) {
+                    cancellationCheck.run();
+                }
+                Row oldRow = rows.currentRowForTable();
+                rows.next();
+                Row newRow = rows.currentRowForTable();
+                // 先在旧值失效前取到它，索引失败时靠它回退。
+                Value[] oldValues = oldRow.getValueList();
+                store.update(oldRow.getKey(), newRow.getValueList());
+                try {
+                    for (Index index : indexes) {
+                        index.remove(session, oldRow);
+                        index.add(session, newRow);
+                    }
+                } catch (DbException e) {
+                    // 同上：唯一约束失败时把旧像写回去。
+                    store.update(oldRow.getKey(), oldValues);
+                    for (Index index : indexes) {
+                        index.remove(session, newRow);
+                        index.add(session, oldRow);
+                    }
+                    throw e;
+                }
             }
-            Row oldRow = rows.currentRowForTable();
-            rows.next();
-            Row newRow = rows.currentRowForTable();
-            // 先在旧值失效前取到它，索引失败时靠它回退。
-            Value[] oldValues = oldRow.getValueList();
-            store.update(oldRow.getKey(), newRow.getValueList());
-            try {
-                for (Index index : indexes) {
-                    index.remove(session, oldRow);
-                    index.add(session, newRow);
-                }
-            } catch (DbException e) {
-                // 同上：唯一约束失败时把旧像写回去。
-                store.update(oldRow.getKey(), oldValues);
-                for (Index index : indexes) {
-                    index.remove(session, newRow);
-                    index.add(session, oldRow);
-                }
-                throw e;
+        } finally {
+            if (scanned > 0) {
+                syncLastModificationIdWithDatabase();
             }
         }
         rows.reset();
@@ -172,7 +185,19 @@ public final class OmapTable extends TableBase {
 
     @Override
     public long getMaxDataModificationId() {
-        return store.getDataModificationId();
+        return lastModificationId.get();
+    }
+
+    /**
+     * 与 H2 全局修改计数同步（CAS 保证并发写时不倒退），
+     * 使 {@code Query} 的结果集缓存判定与标量子查询复用生效并在写入后失效。
+     */
+    private void syncLastModificationIdWithDatabase() {
+        long next = database.getNextModificationDataId();
+        long current;
+        do {
+            current = lastModificationId.get();
+        } while (next > current && !lastModificationId.compareAndSet(current, next));
     }
 
     // ------------------------------------------------------------------
@@ -196,11 +221,12 @@ public final class OmapTable extends TableBase {
     }
 
     /**
-     * 有 delta 时扫描结果随写入变化，不能返回 true。
+     * 表本身是确定性的，数据变更通过 {@link #getMaxDataModificationId()} 通知 H2 失效缓存。
+     * 若返回 false，{@code Query.getNoCache()} 会禁用结果复用，导致标量子查询按外层行数重复执行。
      */
     @Override
     public boolean isDeterministic() {
-        return false;
+        return true;
     }
 
     @Override

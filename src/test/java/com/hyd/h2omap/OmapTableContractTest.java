@@ -6,6 +6,7 @@ package com.hyd.h2omap;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
@@ -501,6 +502,53 @@ class OmapTableContractTest {
         }
     }
 
+    @Test
+    void scalarSubqueryReusesResultAndInvalidatesOnWrite() throws SQLException {
+        execute(createTable("T", "ID INT PRIMARY KEY, V INT", null));
+        execute("INSERT INTO T VALUES (1, 10), (2, 20), (3, 30)");
+
+        try (PreparedStatement psWhere = conn.prepareStatement(
+                "SELECT ID FROM T WHERE V > (SELECT AVG(V) FROM T) ORDER BY ID");
+                PreparedStatement psProj = conn.prepareStatement(
+                        "SELECT ID, (SELECT MAX(V) FROM T) FROM T ORDER BY ID");
+                PreparedStatement psExists = conn.prepareStatement(
+                        "SELECT COUNT(*) FROM T WHERE EXISTS (SELECT 1 FROM T WHERE V >= 100)");
+                PreparedStatement psIn = conn.prepareStatement(
+                        "SELECT ID FROM T WHERE V IN (SELECT V FROM T WHERE V >= 30) ORDER BY ID")) {
+
+            assertEquals(List.of("3"), queryStrings(psWhere));
+            assertEquals(List.of("1/30", "2/30", "3/30"), queryStrings(psProj));
+            assertEquals(List.of("0"), queryStrings(psExists));
+            assertEquals(List.of("3"), queryStrings(psIn));
+
+            // INSERT 后缓存必须立即失效。
+            execute("INSERT INTO T VALUES (4, 100)");
+            assertEquals(List.of("4"), queryStrings(psWhere));
+            assertEquals(List.of("1/100", "2/100", "3/100", "4/100"), queryStrings(psProj));
+            assertEquals(List.of("4"), queryStrings(psExists));
+            assertEquals(List.of("3", "4"), queryStrings(psIn));
+
+            // UPDATE 后缓存必须立即失效。
+            execute("UPDATE T SET V = 10 WHERE ID = 4");
+            assertEquals(List.of("2", "3"), queryStrings(psWhere));
+            assertEquals(List.of("1/30", "2/30", "3/30", "4/30"), queryStrings(psProj));
+            assertEquals(List.of("0"), queryStrings(psExists));
+            assertEquals(List.of("3"), queryStrings(psIn));
+
+            // DELETE 后缓存必须立即失效。
+            execute("DELETE FROM T WHERE ID = 3");
+            assertEquals(List.of("2"), queryStrings(psWhere));
+            assertEquals(List.of("1/20", "2/20", "4/20"), queryStrings(psProj));
+            assertEquals(List.of(), queryStrings(psIn));
+
+            // TRUNCATE 后缓存必须立即失效。
+            execute("TRUNCATE TABLE T");
+            assertEquals(List.of(), queryStrings(psWhere));
+            assertEquals(List.of(), queryStrings(psProj));
+            assertEquals(List.of("0"), queryStrings(psExists));
+        }
+    }
+
     // ------------------------------------------------------------------
     // 工具
     // ------------------------------------------------------------------
@@ -525,6 +573,24 @@ class OmapTableContractTest {
     private List<String> rows(String sql) throws SQLException {
         List<String> result = new ArrayList<>();
         try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(sql)) {
+            int n = rs.getMetaData().getColumnCount();
+            while (rs.next()) {
+                StringBuilder b = new StringBuilder();
+                for (int i = 1; i <= n; i++) {
+                    if (i > 1) {
+                        b.append('/');
+                    }
+                    b.append(rs.getString(i));
+                }
+                result.add(b.toString());
+            }
+        }
+        return result;
+    }
+
+    private static List<String> queryStrings(PreparedStatement ps) throws SQLException {
+        List<String> result = new ArrayList<>();
+        try (ResultSet rs = ps.executeQuery()) {
             int n = rs.getMetaData().getColumnCount();
             while (rs.next()) {
                 StringBuilder b = new StringBuilder();

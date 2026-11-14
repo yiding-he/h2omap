@@ -24,7 +24,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`），**不修改 H2 �
 | JDK | 构建与运行用 JDK 21.0.11；字节码目标 `maven.compiler.release=17` |
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变） |
 | 依赖 | 只有 `com.h2database:h2` 与 `junit-jupiter` |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（33 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（10 个用例）与 `src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）。改动表、索引或存储实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（34 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（10 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例）。改动表、索引或存储实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/` |
 
 ## H2 侧的依据
@@ -119,8 +119,8 @@ rowId 在 `append` 时就确定，之后不变。段号在开放段创建时预�
 | `Index.getCreateSQL()` 返回 `null` | H2 认为该索引已经提供行顺序，跳过 `ORDER BY` 排序，结果按 rowId 顺序返回 | `Select.java:638` |
 | `Table.canTruncate()` 返回 `true` | `TRUNCATE TABLE` 被拒绝，报 `Cannot truncate` | `TruncateTable.java:41` |
 | `Table.isRowLockable()` 保持 `false` | 返回 `true` 会让 H2 调 `lockRow`，默认实现直接抛 `UnsupportedException` | `Table.java:1423` |
-| `Table.isDeterministic()` 返回 `false` | H2 不缓存该表参与的结果集，每次重算（代价，不是错误） | `Query.java:474` |
-| `getMaxDataModificationId()` 随每次写入严格递增 | H2 会命中过期的缓存结果，读到旧行 | `Select.java:1715`、`Query.java:588` |
+| `Table.isDeterministic()` 返回 `true` | 返回 `false` 会让 `Query.getNoCache()` 禁用结果集缓存，导致标量子查询按外层行数重复执行 | `Query.java:474`、`Select.java:1707` |
+| `getMaxDataModificationId()` 与 `Database.getNextModificationDataId()` 同步并随每次写入单调递增 | 使用独立计数会大于全局 `now` 导致缓存永不生效；不递增则会命中过期缓存读到旧行 | `Database.java:442`、`Query.java:538,551`、`Select.java:1715` |
 | `addIndex` 自己把已有行回填进索引 | `ALTER TABLE ADD PRIMARY KEY` 之后，经该索引的点查查不到任何行 | `MVTable.java:368` |
 | `updateRows` 按「先前像、后新像」成对读取 `LocalResult` | UPDATE 写到错误的行 | `Table.java:525` |
 | 唯一约束失败时自己撤回已写入的行与索引项 | 无事务，异常后脏行留在 delta，计数与内容都不对 | `Table.java:541` |
@@ -161,11 +161,23 @@ src/main/java/com/hyd/h2omap/
 └── stats/         zone map
 ```
 
+```
+src/test/java/com/hyd/h2omap/
+├── OmapTableContractTest.java    H2 接入契约
+├── storage/ColumnarStoreTest.java 存储层
+├── vector/ValueVectorTest.java   回退向量
+└── bench/                        测试数据生成与规模验证
+```
+
+`bench/DataGenerator.java` 是固定种子（20260923）的数据生成器，同时建 OMAP 表 `T` 与 MVStore 对比表 `T_MV`，两表数据完全一致。表结构 9 列：`ID` 主键、`LOW_CARD`（10 取值）、`HIGH_CARD`、`INT_COL`（部分连续部分随机）、`DOUBLE_COL`、`TS_COL`、`NULLABLE_COL`（约 5% null）、`ARRAY_COL`、`STR_ARRAY_COL`。
+
+命令行用法：`java -cp "target/h2omap-0.1.0-SNAPSHOT.jar:<h2 jar>:target/test-classes" com.hyd.h2omap.bench.DataGenerator [rows] [url] [omap|mv]`，默认 100 万行、内存库 `omapbench`、OMAP 引擎。第三参数选 `omap` 或 `mv`，两种引擎分开跑，每次只建一张表 `T`；命令行走 `benchSetup`（先插满预热，再 `TRUNCATE` 清空重插，最后跑查询），MVStore 作为基准只在测试条件变化时才重跑。`DataScaleTest` 用 1 万行加 `segmentSize=1000`、`compactionMinRows=1000` 跑默认测试，同时建两表做签名对比；`DataScaleLargeTest` 用 100 万行，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行。
+
 `src/test/java/com/hyd/h2omap/OmapTableContractTest.java` 是 H2 接入契约的集成测试；`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java` 直接驱动存储层，断言段数与 rowId 稳定性；`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java` 断言回退向量的内存估算随值内容变化。
 
 ## 当前状态与后续阶段
 
-M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）与 M4（索引区间查询）已完成：33 个契约用例、10 个存储层用例与 3 个向量用例全部通过，生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
+M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）与 M4（索引区间查询）已完成：34 个契约用例、10 个存储层用例、3 个向量用例与 3 个规模用例全部通过，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
 
 | 阶段 | 目标 | 状态 |
 | --- | --- | --- |
