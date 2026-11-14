@@ -77,6 +77,10 @@ public final class DataGenerator {
             "SELECT SUM(INT_COL) FROM %s WHERE INT_COL > 500000",
             "SELECT * FROM %s WHERE INT_COL > 500000",
             "SELECT COUNT(*) FROM %s WHERE INT_COL > (SELECT AVG(INT_COL) FROM %s)",
+            "SELECT COUNT(*) FROM %s WHERE LOW_CARD <> 'C9' AND INT_COL >= 10000 "
+                    + "AND DOUBLE_COL < 950 AND TS_COL >= TIMESTAMP '2026-02-01' "
+                    + "AND NULLABLE_COL IS NOT NULL AND CARDINALITY(ARRAY_COL) >= 1 "
+                    + "AND CARDINALITY(STR_ARRAY_COL) >= 1",
     };
 
     private static final int BATCH = 2000;
@@ -303,7 +307,9 @@ public final class DataGenerator {
     public static void bench(Connection conn, String table) throws SQLException {
         for (String q : QUERIES) {
             String sql = q.replace("%s", table);
-            System.out.println("bench " + table + " " + query(conn, sql) + " ms : " + sql);
+            StringBuilder info = new StringBuilder();
+            long ms = query(conn, sql, info);
+            System.out.println("bench " + table + " " + ms + " ms" + info + " : " + sql);
         }
     }
 
@@ -394,11 +400,16 @@ public final class DataGenerator {
         }
     }
 
-    private static long query(Connection conn, String sql) throws SQLException {
+    private static long query(Connection conn, String sql, StringBuilder info) throws SQLException {
+        boolean singleScalar = sql.startsWith("SELECT COUNT(*)");
         long t0 = System.nanoTime();
         try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(sql)) {
-            while (rs.next()) {
-                // 只计时，不取值。
+            if (singleScalar && rs.next()) {
+                info.append(" (count=").append(rs.getLong(1)).append(')');
+            } else {
+                while (rs.next()) {
+                    // 只计时，不取值。
+                }
             }
         }
         return (System.nanoTime() - t0) / 1_000_000L;
