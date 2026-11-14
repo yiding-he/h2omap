@@ -24,7 +24,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`），**不修改 H2 �
 | JDK | 构建与运行用 JDK 21.0.11；字节码目标 `maven.compiler.release=17` |
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变） |
 | 依赖 | 只有 `com.h2database:h2` 与 `junit-jupiter` |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（26 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（6 个用例）与 `src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）。改动表、索引或存储实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（28 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（10 个用例）与 `src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）。改动表、索引或存储实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/` |
 
 ## H2 侧的依据
@@ -68,12 +68,13 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`），**不修改 H2 �
 
 ## 存储设计
 
-列式和“高频点改”天然矛盾。这里用“不可变列段加行式 delta”，也就是 delta store 的常规做法。
+列式和“高频点改”天然矛盾。这里用“列段加行式 delta”，也就是 delta store 的常规做法。段不是严格不可变：合并会把 delta 的改动写回段，删除只打标记，两者都不改变 rowId。
 
 ```
 OmapTable
-├── segments : List<ColumnSegment>      不可变、只读，按段号升序
+├── segments : List<ColumnSegment>      按段号升序，可原地改写
 │     每列：primitive 数组 + null 位图 + zone map（可选字典）
+│     段级：删除位图（每行 1 bit）
 └── delta    : DeltaStore               行式写缓冲
       ├── updated        已冻结段内被更新行的新像
       └── segmentDeletes 已冻结段内已删除行的 rowId
@@ -93,9 +94,11 @@ rowId 在 `append` 时就确定，之后不变。段号在开放段创建时预�
 | `updateRows` | 已冻结段记进 `updated`，开放段整体替换 builder 里的值数组 |
 | `truncate` | 清空 segments 和 delta，段号不回收，返回旧行数 |
 
-读取路径：先遍历已冻结的段，再遍历开放段（跳过 `openDeletes`），输出时物化 `Row`。
+读取路径：`ColumnarStore.RowIterator` 按段推进，每次 `next()` 自己取读锁，跳过删除位图标记的行；`OmapCursor.next()` 拿到 rowId 后立刻物化并缓存，避免「迭代器说可见、物化时已被删」的空行。`OmapScanIndex.find` 把 H2 的 `first`/`last` 边界翻译成每列的上下界，迭代器用 zone map 跳过不相交的段。
 
-合并（compaction）：`delta` 超过阈值后，把可见行重写成新段，旧段整段丢弃。重写会改变 rowId，必须配合读游标持有的段集合快照，旧快照引用计数归零后才能回收。
+迭代器是创建时刻的快照：构造时固定最后一个段号与开放段的行数。开放段在迭代期间被写满冻结时，迭代器改从段列表读它，rowId 不变；冻结之后新开的段不在本次快照内。
+
+合并（compaction）：`delta` 的改动数达到 `compactionMinRows` 时，在写锁内把新值写回段、把删除写进段的删除位图，然后清空 delta 并重算被触及段的 zone map。段号与段内偏移都不变，所以 rowId 稳定，读路径不需要快照，段也从不被删除。
 
 ## 与 H2 的契约
 
@@ -160,34 +163,36 @@ src/main/java/com/hyd/h2omap/
 
 ## 当前状态与后续阶段
 
-M0（接入契约验证）与 M1（段真正产生）已完成：26 个契约用例、6 个存储层用例与 3 个向量用例全部通过，生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
+M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）与 M3（合并与并发）已完成：28 个契约用例、10 个存储层用例与 3 个向量用例全部通过，生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
 
 | 阶段 | 目标 | 状态 |
 | --- | --- | --- |
 | M0 接入契约验证 | 真实调用下 CREATE/INSERT/SELECT/UPDATE/DELETE/TRUNCATE/DROP 全通 | 完成 |
 | M1 段真正产生 | rowId 插入时确定；`append` 累积到 `segmentSize` 冻结成 `ColumnSegment`；读路径先段后 delta | 完成 |
-| M2 剪枝与流式扫描 | `OmapScanIndex.find` 用 zone map 剪枝；扫描按段惰性推进 | 未开始 |
-| M3 合并与并发 | `compact()`；后台合并线程；段集合快照与引用计数 | 未开始 |
+| M2 剪枝与流式扫描 | `OmapScanIndex.find` 用 zone map 剪枝；扫描按段惰性推进 | 完成 |
+| M3 合并与并发 | `compact()` 就地写回段；删除位图；读迭代器快照 | 完成（后台合并线程未做） |
 | M4 索引 | `OmapRowIdIndex` 区间查询；唯一约束；`addIndex` 回填的规模验证 | 未开始 |
 | M5 编码与性能 | Varchar 字典编码、列裁剪物化、与 MVStore 表的量化对比 | 未开始 |
 | M6 判决点 | 给出「行式物化开销占总耗时比例」的实测结论 | 未开始 |
 
 已确认的设计决策：
 
-- rowId 在插入时按「预分配的段号 + 段内偏移」编码，冻结与合并都不改变已有 rowId（合并改段号除外）。
+- rowId 在插入时按「预分配的段号 + 段内偏移」编码，冻结与合并都不改变已有 rowId。
 - 非 Int/Long/Double/Varchar 的列用 `ValueVector` 原样存放，保证段机制对所有类型生效，专用向量按需逐列补。
 - 冻结同步在 `append` 的写锁内完成，不交给后台线程。
-- 合并时的 rowId 稳定性采用「读游标固定段集合快照、合并发布新快照、旧快照引用计数归零后回收」。
-- 性能数字只在 M5 交付，M0—M4 只要求集成测试与内部计数器断言。
+- 合并采用「就地写回」而不是「写新段」：段内增加删除位图，delta 的新值写回列向量，rowId 全程不变，因此不需要段集合快照与引用计数。
+- 合并同步在写锁内触发（`append`/`remove`/`update` 后判断 delta 大小），不交给后台线程。
+- 读迭代器采用创建时刻快照：固定最后一个段号与开放段行数，开放段冻结后从段列表继续读，冻结后新开的段不可见。
+- zone map 比较失败（JSON、几何等不可比较的类型）时该列退化为「恒相交」，不参与剪枝；剪枝只是优化，不能让它阻止建段。
+- 性能数字只在 M5 交付，M0—M5 只要求集成测试与内部计数器断言。
 
 ## 尚未实现
 
-- `ColumnarStore.compact()`：把 delta 合并成新列段，目前是空操作。
-- `OmapScanIndex.find()`：zone map 剪枝，现在是全量 rowId 扫描。
 - `OmapRowIdIndex.find()`：区间查询，现在只支持精确匹配，其余退化成全表扫描。
 - 低基数列的字典编码。
-- 并发写的合并线程。
+- 并发写的后台合并线程：现在合并同步在写锁内触发。
 - 数组列的按元素存储与剪枝：目前整值存放在 `ValueVector` 里，zone map 只能整值比较，无法按元素过滤。
+- 行数超过 `Integer.MAX_VALUE` 时 `collectVisibleRowIds` 的数组分配会溢出（用 `(int) Math.min(rowCount, Integer.MAX_VALUE)` 分配，实际写入会越界）。
 
 ## 待核对
 
