@@ -17,9 +17,17 @@ import com.hyd.h2omap.storage.ColumnarStore;
  */
 public final class OmapCursor implements Cursor {
 
+    private static final int BATCH_SIZE = 512;
+
     private final ColumnarStore store;
 
     private final ColumnarStore.RowIterator rows;
+
+    private final Row[] batch = new Row[BATCH_SIZE];
+
+    private int batchSize;
+
+    private int batchPos;
 
     private Row current;
 
@@ -39,23 +47,22 @@ public final class OmapCursor implements Cursor {
     }
 
     /**
-     * 推进并立刻物化。物化放在这里而不是 {@code get()}，
-     * 是为了避免「迭代器说这行可见、物化时已被删除」的空行。
+     * 批量读取并立刻物化。物化放在单次读锁批内而不是 {@code get()}，
+     * 既避免「迭代器说这行可见、物化时已被删除」的空行，又减少每行加解锁开销。
      */
     @Override
     public boolean next() {
-        while (true) {
-            long next = rows.next();
-            if (next < 0) {
+        if (batchPos >= batchSize) {
+            batchSize = rows.nextBatch(store, batch);
+            batchPos = 0;
+            if (batchSize == 0) {
                 current = null;
                 return false;
             }
-            Row row = store.materialize(next);
-            if (row != null) {
-                current = row;
-                return true;
-            }
         }
+        current = batch[batchPos];
+        batch[batchPos++] = null;
+        return true;
     }
 
     @Override

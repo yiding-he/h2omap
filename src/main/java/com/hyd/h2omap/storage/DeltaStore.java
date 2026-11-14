@@ -29,15 +29,27 @@ public final class DeltaStore {
 
     private final Set<Long> segmentDeletes = new HashSet<>();
 
+    private final Set<Integer> dirtySegments = new HashSet<>();
+
     /** 标记删除。 */
     public void markDeleted(long rowId) {
         updated.remove(rowId);
         segmentDeletes.add(rowId);
+        dirtySegments.add(RowId.segmentId(rowId));
     }
 
     /** 记录已冻结段内行的新像。 */
     public void markUpdated(long rowId, Value[] values) {
         updated.put(rowId, values);
+        dirtySegments.add(RowId.segmentId(rowId));
+    }
+
+    public boolean isEmpty() {
+        return updated.isEmpty() && segmentDeletes.isEmpty();
+    }
+
+    public boolean hasSegmentDelta(int segmentId) {
+        return !isEmpty() && dirtySegments.contains(segmentId);
     }
 
     public Value[] getUpdated(long rowId) {
@@ -67,5 +79,6 @@ public final class DeltaStore {
     public void clear() {
         updated.clear();
         segmentDeletes.clear();
+        dirtySegments.clear();
     }
 }

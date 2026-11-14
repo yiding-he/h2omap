@@ -207,10 +207,33 @@ public final class ColumnarStore {
      * 开放段在迭代期间被冻结时，迭代器改从段列表读它，rowId 不变；
      * 冻结之后新开的段不在本次快照内。
      */
+    @FunctionalInterface
     public interface RowIterator {
 
         /** 下一个可见行的 rowId，结束时返回 -1。 */
         long next();
+
+        /**
+         * 批量读取并物化最多 {@code buffer.length} 行。
+         *
+         * @param store  存储实例
+         * @param buffer 接收物化行的缓冲区
+         * @return 实际写入的行数，0 表示迭代结束
+         */
+        default int nextBatch(ColumnarStore store, Row[] buffer) {
+            int filled = 0;
+            while (filled < buffer.length) {
+                long rowId = next();
+                if (rowId < 0) {
+                    break;
+                }
+                Row row = store.materialize(rowId);
+                if (row != null) {
+                    buffer[filled++] = row;
+                }
+            }
+            return filled;
+        }
     }
 
     /**
@@ -237,14 +260,22 @@ public final class ColumnarStore {
         try {
             Value[] values;
             if (isFrozen(rowId)) {
-                ColumnSegment segment = segment(RowId.segmentId(rowId));
+                int segId = RowId.segmentId(rowId);
+                ColumnSegment segment = segment(segId);
                 int offset = RowId.offset(rowId);
                 if (segment == null || offset >= segment.getRowCount()
-                        || segment.isDeleted(offset) || delta.isSegmentRowDeleted(rowId)) {
+                        || segment.isDeleted(offset)) {
                     return null;
                 }
-                Value[] updated = delta.getUpdated(rowId);
-                values = updated != null ? updated : segment.getRow(offset);
+                if (delta.hasSegmentDelta(segId)) {
+                    if (delta.isSegmentRowDeleted(rowId)) {
+                        return null;
+                    }
+                    Value[] updated = delta.getUpdated(rowId);
+                    values = updated != null ? updated : segment.getRow(offset);
+                } else {
+                    values = segment.getRow(offset);
+                }
             } else {
                 int offset = RowId.offset(rowId);
                 if (offset >= openSegment.rowCount() || openDeletes.contains(rowId)) {
@@ -421,6 +452,131 @@ public final class ColumnarStore {
             } finally {
                 lock.readLock().unlock();
             }
+        }
+
+        @Override
+        public int nextBatch(ColumnarStore store, Row[] buffer) {
+            lock.readLock().lock();
+            try {
+                return reverse ? nextBatchReverse(buffer) : nextBatchForward(buffer);
+            } finally {
+                lock.readLock().unlock();
+            }
+        }
+
+        private int nextBatchForward(Row[] buffer) {
+            int filled = 0;
+            while (filled < buffer.length && segmentId <= lastSegmentId) {
+                boolean open = isOpen();
+                ColumnSegment segment = open ? null : segment(segmentId);
+                if (segment == null && !open) {
+                    nextSegmentForward();
+                    continue;
+                }
+                if (segment != null && !intersects(segment)) {
+                    nextSegmentForward();
+                    continue;
+                }
+                int count = countOf(open, segment);
+                if (open) {
+                    boolean noDeletes = openDeletes.isEmpty();
+                    while (offset < count && filled < buffer.length) {
+                        int currentOffset = offset++;
+                        long rowId = RowId.ofSegment(segmentId, currentOffset);
+                        if (noDeletes || !openDeletes.contains(rowId)) {
+                            Row row = Row.get(openSegment.rowValues(currentOffset), 0);
+                            row.setKey(rowId);
+                            buffer[filled++] = row;
+                        }
+                    }
+                } else {
+                    boolean hasDelta = delta.hasSegmentDelta(segmentId);
+                    while (offset < count && filled < buffer.length) {
+                        int currentOffset = offset++;
+                        if (segment.isDeleted(currentOffset)) {
+                            continue;
+                        }
+                        long rowId = RowId.ofSegment(segmentId, currentOffset);
+                        Value[] values;
+                        if (hasDelta) {
+                            if (delta.isSegmentRowDeleted(rowId)) {
+                                continue;
+                            }
+                            Value[] updated = delta.getUpdated(rowId);
+                            values = updated != null ? updated : segment.getRow(currentOffset);
+                        } else {
+                            values = segment.getRow(currentOffset);
+                        }
+                        Row row = Row.get(values, 0);
+                        row.setKey(rowId);
+                        buffer[filled++] = row;
+                    }
+                }
+                if (offset >= count) {
+                    nextSegmentForward();
+                }
+            }
+            return filled;
+        }
+
+        private int nextBatchReverse(Row[] buffer) {
+            int filled = 0;
+            int minSegmentId = firstSegmentId();
+            while (filled < buffer.length && segmentId >= minSegmentId) {
+                boolean open = isOpen();
+                ColumnSegment segment = open ? null : segment(segmentId);
+                if (segment == null && !open) {
+                    nextSegmentReverse();
+                    continue;
+                }
+                if (segment != null && !intersects(segment)) {
+                    nextSegmentReverse();
+                    continue;
+                }
+                int count = countOf(open, segment);
+                if (!started) {
+                    offset = count - 1;
+                    started = true;
+                }
+                if (open) {
+                    boolean noDeletes = openDeletes.isEmpty();
+                    while (offset >= 0 && filled < buffer.length) {
+                        int currentOffset = offset--;
+                        long rowId = RowId.ofSegment(segmentId, currentOffset);
+                        if (noDeletes || !openDeletes.contains(rowId)) {
+                            Row row = Row.get(openSegment.rowValues(currentOffset), 0);
+                            row.setKey(rowId);
+                            buffer[filled++] = row;
+                        }
+                    }
+                } else {
+                    boolean hasDelta = delta.hasSegmentDelta(segmentId);
+                    while (offset >= 0 && filled < buffer.length) {
+                        int currentOffset = offset--;
+                        if (segment.isDeleted(currentOffset)) {
+                            continue;
+                        }
+                        long rowId = RowId.ofSegment(segmentId, currentOffset);
+                        Value[] values;
+                        if (hasDelta) {
+                            if (delta.isSegmentRowDeleted(rowId)) {
+                                continue;
+                            }
+                            Value[] updated = delta.getUpdated(rowId);
+                            values = updated != null ? updated : segment.getRow(currentOffset);
+                        } else {
+                            values = segment.getRow(currentOffset);
+                        }
+                        Row row = Row.get(values, 0);
+                        row.setKey(rowId);
+                        buffer[filled++] = row;
+                    }
+                }
+                if (offset < 0) {
+                    nextSegmentReverse();
+                }
+            }
+            return filled;
         }
 
         private long nextForward() {
