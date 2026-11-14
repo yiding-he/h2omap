@@ -68,6 +68,16 @@ public final class DeltaStore {
         updated.put(rowId, new DeltaRow(rowId, values));
     }
 
+    /**
+     * 替换已存在行的值。只换对象，不改旧值数组。
+     */
+    public void replaceInserted(int slot, Value[] values) {
+        if (slot >= 0 && slot < inserted.size()) {
+            long rowId = inserted.get(slot).getRowId();
+            inserted.set(slot, new DeltaRow(rowId, values));
+        }
+    }
+
     public DeltaRow getInserted(int slot) {
         return slot >= 0 && slot < inserted.size() ? inserted.get(slot) : null;
     }

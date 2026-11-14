@@ -87,11 +87,9 @@ public final class ColumnarStore {
         lock.writeLock().lock();
         try {
             if (RowId.isDelta(rowId)) {
-                DeltaRow row = delta.getInserted(RowId.slot(rowId));
-                if (row != null) {
-                    // 简化处理：delta 行原地换值，避免再占一个槽位。
-                    System.arraycopy(values, 0, row.getValues(), 0, values.length);
-                }
+                // 整体替换 DeltaRow，而不是就地改写值数组：
+                // 游标交给 H2 的 Row 直接引用那个数组，就地改写会篡改正在使用的行。
+                delta.replaceInserted(RowId.slot(rowId), values);
             } else {
                 delta.markUpdated(rowId, values);
             }

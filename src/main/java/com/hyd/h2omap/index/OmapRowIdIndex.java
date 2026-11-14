@@ -75,9 +75,15 @@ public final class OmapRowIdIndex extends Index {
 
     @Override
     public double getCost(SessionLocal session, int[] masks, TableFilter[] filters, int filter,
-            SortOrder sortOrder, AllColumnsForPlan allColumnsSet, boolean isSelectCommand) {
-        return 10 * getCostRangeIndex(masks, getRowCountApproximation(session), filters, filter,
+            SortOrder sortOrder, AllColumnsForPlan allColumnsSet, boolean isSelectCommand) {        return 10 * getCostRangeIndex(masks, getRowCountApproximation(session), filters, filter,
                 sortOrder, false, allColumnsSet, isSelectCommand);
+    }
+
+    @Override
+    public String getCreateSQL() {
+        // 同 OmapScanIndex：返回非 null 会让 H2 跳过 ORDER BY 的排序。
+        // TODO M4 实现区间查询后，find 按索引列有序返回行，可以改成非 null。
+        return null;
     }
 
     @Override

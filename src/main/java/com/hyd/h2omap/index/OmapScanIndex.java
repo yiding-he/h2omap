@@ -39,6 +39,21 @@ public final class OmapScanIndex extends Index {
         // 行数据由 ColumnarStore 持有，本索引不另建结构。
     }
 
+    /**
+     * 必须返回 null。
+     *
+     * <p>{@code Select.getIndexSorts} 用 {@code getCreateSQL() != null}
+     * 判断一个索引能否提供行顺序（{@code org/h2/command/query/Select.java:635}）。
+     * 返回非 null 时 H2 会认为本索引已按 ORDER BY 排好序，直接跳过排序，
+     * 结果顺序就是 rowId 顺序。列扫描不给任何列顺序。
+     *
+     * <p>见 {@code org/h2/command/query/Select.java:638}。
+     */
+    @Override
+    public String getCreateSQL() {
+        return null;
+    }
+
     @Override
     public void remove(SessionLocal session, Row row) {
         // 同上。

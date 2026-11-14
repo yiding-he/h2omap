@@ -10,11 +10,13 @@ import org.h2.command.ddl.CreateTableData;
 import org.h2.engine.SessionLocal;
 import org.h2.index.Index;
 import org.h2.index.IndexType;
+import org.h2.message.DbException;
 import org.h2.result.LocalResult;
 import org.h2.result.Row;
 import org.h2.table.IndexColumn;
 import org.h2.table.TableBase;
 import org.h2.table.TableType;
+import org.h2.value.Value;
 
 import com.hyd.h2omap.engine.OmapOptions;
 import com.hyd.h2omap.index.OmapRowIdIndex;
@@ -62,8 +64,15 @@ public final class OmapTable extends TableBase {
         long rowId = store.append(row.getValueList());
         row.setKey(rowId);
         // 扫描索引不占结构，主键索引要登记新行。
-        for (Index index : indexes) {
-            index.add(session, row);
+        try {
+            for (Index index : indexes) {
+                index.add(session, row);
+            }
+        } catch (DbException e) {
+            // 没有事务：唯一约束失败时行已经写进 delta，必须自己撤回。
+            store.remove(rowId);
+            row.setKey(0);
+            throw e;
         }
     }
 
@@ -104,10 +113,22 @@ public final class OmapTable extends TableBase {
             Row oldRow = rows.currentRowForTable();
             rows.next();
             Row newRow = rows.currentRowForTable();
+            // 先在旧值失效前取到它，索引失败时靠它回退。
+            Value[] oldValues = oldRow.getValueList();
             store.update(oldRow.getKey(), newRow.getValueList());
-            for (Index index : indexes) {
-                index.remove(session, oldRow);
-                index.add(session, newRow);
+            try {
+                for (Index index : indexes) {
+                    index.remove(session, oldRow);
+                    index.add(session, newRow);
+                }
+            } catch (DbException e) {
+                // 同上：唯一约束失败时把旧像写回去。
+                store.update(oldRow.getKey(), oldValues);
+                for (Index index : indexes) {
+                    index.remove(session, newRow);
+                    index.add(session, oldRow);
+                }
+                throw e;
             }
         }
         rows.reset();
@@ -130,7 +151,15 @@ public final class OmapTable extends TableBase {
         }
         OmapRowIdIndex index = new OmapRowIdIndex(this, indexId, indexName, cols, uniqueColumnCount,
                 indexType, store);
-        // TODO 已有数据要回填进索引
+        // ALTER TABLE ADD CONSTRAINT 时表里可能已经有行，索引必须回填。
+        // H2 只在 MVTable.addIndex 里根据 needRebuild() 重建索引，
+        // 外部引擎表不会走到那段代码。
+        for (long rowId : store.collectVisibleRowIds(false)) {
+            Row row = store.materialize(rowId);
+            if (row != null) {
+                index.add(session, row);
+            }
+        }
         indexes.add(index);
         setModified();
         return index;
@@ -180,7 +209,16 @@ public final class OmapTable extends TableBase {
     }
 
     @Override
-    public boolean canGetRowCount() {
+    public boolean canGetRowCount(SessionLocal session) {
+        return true;
+    }
+
+    /**
+     * 默认实现返回 false，会让 {@code TRUNCATE TABLE} 被拒绝
+     * （{@code org/h2/command/ddl/TruncateTable.java:41}）。
+     */
+    @Override
+    public boolean canTruncate() {
         return true;
     }
 
