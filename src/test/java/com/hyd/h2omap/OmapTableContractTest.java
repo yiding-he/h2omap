@@ -265,6 +265,77 @@ class OmapTableContractTest {
     }
 
     // ------------------------------------------------------------------
+    // M1：段真正产生
+    // ------------------------------------------------------------------
+
+    /**
+     * 写满 segmentSize 就把开放段冻结，行数与扫描结果不能受影响。
+     */
+    @Test
+    void insertAcrossSegmentBoundary() throws SQLException {
+        execute(createTable("T", "ID INT, NAME VARCHAR", "\"segmentSize=2\""));
+        execute("INSERT INTO T VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')");
+        assertEquals("5", scalar("SELECT COUNT(*) FROM T"));
+        assertEquals(List.of("1/a", "2/b", "3/c", "4/d", "5/e"),
+                rows("SELECT ID, NAME FROM T ORDER BY ID"));
+        assertEquals(List.of("5/e", "4/d", "3/c", "2/b", "1/a"),
+                rows("SELECT ID, NAME FROM T ORDER BY ID DESC"));
+    }
+
+    /**
+     * 冻结后 rowId 不变，点查、更新、删除都要还能定位到冻结前的行。
+     */
+    @Test
+    void pointOperationsOnFrozenRows() throws SQLException {
+        execute(createTable("T", "ID INT PRIMARY KEY, NAME VARCHAR", "\"segmentSize=2\""));
+        execute("INSERT INTO T VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')");
+        assertEquals(List.of("2/b"), rows("SELECT ID, NAME FROM T WHERE ID = 2"));
+        execute("UPDATE T SET NAME = 'y' WHERE ID = 2");
+        assertEquals(List.of("2/y"), rows("SELECT ID, NAME FROM T WHERE ID = 2"));
+        execute("DELETE FROM T WHERE ID = 1");
+        assertEquals(List.of("2/y", "3/c", "4/d"), rows("SELECT ID, NAME FROM T ORDER BY ID"));
+        assertEquals("3", scalar("SELECT COUNT(*) FROM T"));
+        assertThrows(SQLException.class, () -> execute("INSERT INTO T VALUES (3, 'x')"));
+        assertEquals("3", scalar("SELECT COUNT(*) FROM T"));
+    }
+
+    /**
+     * 全表扫描同时遍历已冻结的段与未冻结的开放段。
+     */
+    @Test
+    void scanCoversFrozenAndOpenSegments() throws SQLException {
+        execute(createTable("T", "ID INT, NAME VARCHAR", "\"segmentSize=2\""));
+        execute("INSERT INTO T VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')");
+        execute("DELETE FROM T WHERE ID = 2");
+        execute("DELETE FROM T WHERE ID = 4");
+        assertEquals(List.of("1/a", "3/c", "5/e"),
+                rows("SELECT ID, NAME FROM T ORDER BY ID"));
+        assertEquals("3", scalar("SELECT COUNT(*) FROM T"));
+    }
+
+    /**
+     * 未特化的类型走 {@code ValueVector} 回退，同样能冻结成段。
+     */
+    @Test
+    void unsupportedTypesStillFreezeIntoSegments() throws SQLException {
+        execute(createTable("T", "TS TIMESTAMP, DEC DECIMAL(10,2), S VARCHAR", "\"segmentSize=2\""));
+        execute("INSERT INTO T VALUES "
+                + "(TIMESTAMP '2026-01-01 10:00:00', 12.34, 'a'),"
+                + "(TIMESTAMP '2026-01-02 11:00:00', 56.78, 'b'),"
+                + "(TIMESTAMP '2026-01-03 12:00:00', 90.12, 'c')");
+        assertEquals("3", scalar("SELECT COUNT(*) FROM T"));
+        assertEquals(List.of(
+                        "2026-01-01 10:00:00/12.34/a",
+                        "2026-01-02 11:00:00/56.78/b",
+                        "2026-01-03 12:00:00/90.12/c"),
+                rows("SELECT TS, DEC, S FROM T ORDER BY TS"));
+        execute("UPDATE T SET S = 'x' WHERE TS = TIMESTAMP '2026-01-01 10:00:00'");
+        execute("DELETE FROM T WHERE TS = TIMESTAMP '2026-01-02 11:00:00'");
+        assertEquals(List.of("2026-01-01 10:00:00/12.34/x", "2026-01-03 12:00:00/90.12/c"),
+                rows("SELECT TS, DEC, S FROM T ORDER BY TS"));
+    }
+
+    // ------------------------------------------------------------------
     // 兼容性限制
     // ------------------------------------------------------------------
 

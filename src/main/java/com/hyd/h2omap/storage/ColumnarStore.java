@@ -5,21 +5,25 @@ package com.hyd.h2omap.storage;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.h2.result.Row;
 import org.h2.table.Column;
 import org.h2.value.Value;
+import org.h2.value.ValueBigint;
 
 import com.hyd.h2omap.engine.OmapOptions;
 
 /**
  * 列式存储的核心容器：不可变列段加行式 delta。
  *
- * <p>写入全部落到 {@link DeltaStore}，代价与列数无关。
- * 读取按段顺序拼 result，物化推迟到 {@link #materialize(long)}。
+ * <p>新行写进当前开放段，写满即冻结成 {@link ColumnSegment}，之后开一个新段。
+ * rowId 在分配时就是最终值：段号预先分配，段内偏移就是写入顺序，
+ * 冻结不改变任何已有 rowId。
  *
  * <p>线程安全策略：单写多读。H2 的 {@code addRow} 和 {@code removeRow}
  * 没有锁契约，多个连接会并发进入，所以写锁是必须的。
@@ -30,6 +34,7 @@ public final class ColumnarStore {
 
     private final OmapOptions options;
 
+    /** 已冻结的段，按段号升序。 */
     private final List<ColumnSegment> segments = new ArrayList<>();
 
     private final DeltaStore delta = new DeltaStore();
@@ -38,9 +43,15 @@ public final class ColumnarStore {
 
     private final AtomicLong dataModificationId = new AtomicLong();
 
-    private long rowCount;
+    /** 当前开放段的行缓冲，每行 0 号元素是 rowId。 */
+    private final SegmentBuilder openSegment;
 
+    /** 下一个要分配的段号，单调递增，不回收。 */
     private int nextSegmentId;
+
+    private final Set<Long> openDeletes = new HashSet<>();
+
+    private long rowCount;
 
     public ColumnarStore(Column[] columns, OmapOptions options) {
         this.options = options;
@@ -48,6 +59,7 @@ public final class ColumnarStore {
         for (int i = 0; i < columns.length; i++) {
             valueTypes[i] = columns[i].getType().getValueType();
         }
+        this.openSegment = new SegmentBuilder();
     }
 
     // ------------------------------------------------------------------
@@ -57,10 +69,13 @@ public final class ColumnarStore {
     public long append(Value[] values) {
         lock.writeLock().lock();
         try {
-            long rowId = delta.append(values);
+            long rowId = RowId.ofSegment(nextSegmentId, openSegment.rowCount());
+            openSegment.append(withRowId(rowId, values));
             rowCount++;
             bump();
-            maybeCompact();
+            if (openSegment.rowCount() >= options.getSegmentSize()) {
+                freeze();
+            }
             return rowId;
         } finally {
             lock.writeLock().unlock();
@@ -71,7 +86,11 @@ public final class ColumnarStore {
         lock.writeLock().lock();
         try {
             if (isVisible(rowId)) {
-                delta.markDeleted(rowId);
+                if (isFrozen(rowId)) {
+                    delta.markDeleted(rowId);
+                } else {
+                    openDeletes.add(rowId);
+                }
                 rowCount--;
                 bump();
             }
@@ -86,12 +105,11 @@ public final class ColumnarStore {
     public void update(long rowId, Value[] values) {
         lock.writeLock().lock();
         try {
-            if (RowId.isDelta(rowId)) {
-                // 整体替换 DeltaRow，而不是就地改写值数组：
-                // 游标交给 H2 的 Row 直接引用那个数组，就地改写会篡改正在使用的行。
-                delta.replaceInserted(RowId.slot(rowId), values);
-            } else {
+            if (isFrozen(rowId)) {
+                // 整体替换值数组，不就地改写：已交给 H2 的 Row 可能还引用旧数组。
                 delta.markUpdated(rowId, values);
+            } else {
+                openSegment.setRow(RowId.offset(rowId), withRowId(rowId, values));
             }
             bump();
         } finally {
@@ -110,7 +128,10 @@ public final class ColumnarStore {
             long old = rowCount;
             segments.clear();
             delta.clear();
+            openSegment.clear();
+            openDeletes.clear();
             rowCount = 0;
+            // 段号不回收，清空后再分配的 rowId 不会和之前撞车。
             bump();
             return old;
         } finally {
@@ -121,26 +142,15 @@ public final class ColumnarStore {
     /**
      * 把 delta 合并进新的列段。
      *
-     * <p>TODO 实现步骤：
-     * <ol>
-     * <li>把受影响的旧段与 delta 的可见行按 rowId 顺序摊平；
-     * <li>按 {@code options.getSegmentSize()} 切成新段；
-     * <li>旧段整段丢弃，delta 清空，重建索引。
-     * </ol>
+     * <p>TODO M3 实现：合并会改变 rowId（段号与段内偏移都会变），
+     * 必须配合读游标持有的段集合快照，旧快照引用计数归零后才能回收。
      */
     public long compact() {
         lock.writeLock().lock();
         try {
-            // TODO 未实现，目前是空操作。
             return 0;
         } finally {
             lock.writeLock().unlock();
-        }
-    }
-
-    private void maybeCompact() {
-        if (delta.insertedSize() >= options.getCompactionMinRows()) {
-            // TODO 合并放到后台线程，避免阻塞写入。
         }
     }
 
@@ -159,26 +169,26 @@ public final class ColumnarStore {
         lock.readLock().lock();
         try {
             Value[] values;
-            if (RowId.isDelta(rowId)) {
-                DeltaRow row = delta.getInserted(RowId.slot(rowId));
-                if (row == null || row.isDeleted()) {
-                    return null;
-                }
-                values = row.getValues();
-            } else {
+            if (isFrozen(rowId)) {
                 if (delta.isSegmentRowDeleted(rowId)) {
                     return null;
                 }
-                DeltaRow updated = delta.getUpdated(rowId);
+                Value[] updated = delta.getUpdated(rowId);
                 if (updated != null) {
-                    values = updated.getValues();
+                    values = updated;
                 } else {
                     ColumnSegment segment = segment(RowId.segmentId(rowId));
-                    if (segment == null) {
+                    if (segment == null || RowId.offset(rowId) >= segment.getRowCount()) {
                         return null;
                     }
                     values = segment.getRow(RowId.offset(rowId));
                 }
+            } else {
+                int offset = RowId.offset(rowId);
+                if (offset >= openSegment.rowCount() || openDeletes.contains(rowId)) {
+                    return null;
+                }
+                values = openSegment.rowValues(offset);
             }
             Row row = Row.get(values, 0);
             row.setKey(rowId);
@@ -190,9 +200,6 @@ public final class ColumnarStore {
 
     /**
      * 收集所有可见行的 rowId。
-     *
-     * <p>第一版把 rowId 全物化成数组，实现最直接。
-     * 后续要换成按段流式推进，避免大表扫描时多一次 long 数组。
      *
      * @param reverse 是否倒序
      * @return rowId 数组
@@ -211,17 +218,17 @@ public final class ColumnarStore {
                         }
                     }
                 }
-                for (DeltaRow row : delta.insertedRows()) {
-                    if (!row.isDeleted()) {
-                        result[p++] = row.getRowId();
+                for (int offset = 0; offset < openSegment.rowCount(); offset++) {
+                    long rowId = RowId.ofSegment(nextSegmentId, offset);
+                    if (!openDeletes.contains(rowId)) {
+                        result[p++] = rowId;
                     }
                 }
             } else {
-                List<DeltaRow> inserted = new ArrayList<>(delta.insertedRows());
-                for (int i = inserted.size() - 1; i >= 0; i--) {
-                    DeltaRow row = inserted.get(i);
-                    if (!row.isDeleted()) {
-                        result[p++] = row.getRowId();
+                for (int offset = openSegment.rowCount() - 1; offset >= 0; offset--) {
+                    long rowId = RowId.ofSegment(nextSegmentId, offset);
+                    if (!openDeletes.contains(rowId)) {
+                        result[p++] = rowId;
                     }
                 }
                 for (int s = segments.size() - 1; s >= 0; s--) {
@@ -253,10 +260,6 @@ public final class ColumnarStore {
         return dataModificationId.get();
     }
 
-    public DeltaStore getDelta() {
-        return delta;
-    }
-
     public OmapOptions getOptions() {
         return options;
     }
@@ -266,32 +269,57 @@ public final class ColumnarStore {
         return valueTypes;
     }
 
-    // ------------------------------------------------------------------
-    // 内部
-    // ------------------------------------------------------------------
-
-    private boolean isVisible(long rowId) {
-        if (RowId.isDelta(rowId)) {
-            DeltaRow row = delta.getInserted(RowId.slot(rowId));
-            return row != null && !row.isDeleted();
-        }
-        return !delta.isSegmentRowDeleted(rowId);
-    }
-
-    private ColumnSegment segment(int segmentId) {
-        return segmentId >= 0 && segmentId < segments.size() ? segments.get(segmentId) : null;
-    }
-
-    private void bump() {
-        dataModificationId.incrementAndGet();
-    }
-
-    /** 供合并与测试使用。 */
+    /** 供测试与合并使用。 */
     List<ColumnSegment> segments() {
         return segments;
     }
 
-    int nextSegmentId() {
-        return nextSegmentId++;
+    // ------------------------------------------------------------------
+    // 内部
+    // ------------------------------------------------------------------
+
+    /** 把值数组前面加一个 rowId 元素，作为 builder 里的一行。 */
+    private static Value[] withRowId(long rowId, Value[] values) {
+        Value[] row = new Value[values.length + 1];
+        row[0] = ValueBigint.get(rowId);
+        System.arraycopy(values, 0, row, 1, values.length);
+        return row;
+    }
+
+    /** 当前开放段的段号，也就是它冻结后拿到的段号。 */
+    private void freeze() {
+        if (openSegment.rowCount() == 0) {
+            return;
+        }
+        ColumnSegment segment = ColumnSegment.build(
+                nextSegmentId, openSegment.drain(), valueTypes);
+        segments.add(segment);
+        // 段冻结后，开放段里的删除记录必须移交给 delta，否则那些行会重新可见。
+        for (long rowId : openDeletes) {
+            delta.markDeleted(rowId);
+        }
+        openDeletes.clear();
+        nextSegmentId++;
+    }
+
+    private boolean isVisible(long rowId) {
+        return !isFrozen(rowId) || !delta.isSegmentRowDeleted(rowId);
+    }
+
+    private boolean isFrozen(long rowId) {
+        return RowId.segmentId(rowId) < nextSegmentId;
+    }
+
+    private ColumnSegment segment(int segmentId) {
+        int index = segmentId - firstSegmentId();
+        return index >= 0 && index < segments.size() ? segments.get(index) : null;
+    }
+
+    private int firstSegmentId() {
+        return segments.isEmpty() ? nextSegmentId : segments.get(0).getSegmentId();
+    }
+
+    private void bump() {
+        dataModificationId.incrementAndGet();
     }
 }

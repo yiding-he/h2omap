@@ -26,14 +26,9 @@ import com.hyd.h2omap.storage.ColumnarStore;
 /**
  * 列式表。H2 的 {@code Table} 接口在这一层收口，下面全部是 OMAP 自己的结构。
  *
- * <p>骨架说明：
- * <ul>
- * <li>数据放在 {@link ColumnarStore}，由不可变列段加行式 delta 组成；
- * <li>写入路径是逐行回调，正好可以直接落到 delta；
- * <li>不加锁，不参与 H2 的事务。
- * </ul>
- *
- * <p>和 H2 的约定见 README 的“与 H2 的契约”一节。
+ * <p>数据放在 {@link ColumnarStore}，由不可变列段加行式 delta 组成。
+ * 写入路径是逐行回调，正好可以直接落进开放段。
+ * 不加锁，不参与 H2 的事务。
  */
 public final class OmapTable extends TableBase {
 
@@ -56,7 +51,7 @@ public final class OmapTable extends TableBase {
     }
 
     // ------------------------------------------------------------------
-    // 写入路径：都是逐行回调，直接进 delta，不重写列段
+    // 写入路径：逐行回调，直接进开放段，不重写已冻结的列段
     // ------------------------------------------------------------------
 
     @Override
@@ -69,7 +64,7 @@ public final class OmapTable extends TableBase {
                 index.add(session, row);
             }
         } catch (DbException e) {
-            // 没有事务：唯一约束失败时行已经写进 delta，必须自己撤回。
+            // 没有事务：唯一约束失败时行已经写进段缓冲，必须自己撤回。
             store.remove(rowId);
             row.setKey(0);
             throw e;
@@ -98,7 +93,7 @@ public final class OmapTable extends TableBase {
      *
      * <p>H2 的默认实现会把 UPDATE 结果全量物化进 {@code LocalResult}，
      * 然后两趟遍历做 remove 和 add（见 {@code table/Table.java:525}）。
-     * 这里有 delta，单趟流式处理就够。
+     * 这里有开放段与 delta，单趟流式处理就够。
      *
      * <p>{@code rows} 里每逻辑行占两个位置：先前像，后新像。
      */

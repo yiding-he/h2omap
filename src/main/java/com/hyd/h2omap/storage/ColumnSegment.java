@@ -36,10 +36,9 @@ public final class ColumnSegment {
     /**
      * 由一批行构建一个段。调用方保证 {@code rows} 不为空。
      *
-     * @param segmentId  段号
      * @param rows       行数据，每行长度等于列数
      * @param valueTypes 每列的 H2 类型码，见 {@code org.h2.value.Value}
-     * @return 新段
+     * @return 新段，段号取本批数据第一行的段号
      */
     public static ColumnSegment build(int segmentId, List<Value[]> rows, int[] valueTypes) {
         int count = rows.size();
@@ -48,9 +47,9 @@ public final class ColumnSegment {
             vectors[c] = ColumnVector.create(valueTypes[c], count);
         }
         for (int r = 0; r < count; r++) {
-            Value[] values = rows.get(r);
+            Value[] row = rows.get(r);
             for (int c = 0; c < valueTypes.length; c++) {
-                vectors[c].set(r, values[c]);
+                vectors[c].set(r, row[c + 1]);
             }
         }
         ZoneMap[] zones = new ZoneMap[valueTypes.length];
