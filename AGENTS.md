@@ -24,7 +24,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`），**不修改 H2 �
 | JDK | 构建与运行用 JDK 21.0.11；字节码目标 `maven.compiler.release=17` |
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变） |
 | 依赖 | 只有 `com.h2database:h2` 与 `junit-jupiter` |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（28 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（10 个用例）与 `src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）。改动表、索引或存储实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（33 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（10 个用例）与 `src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）。改动表、索引或存储实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/` |
 
 ## H2 侧的依据
@@ -128,6 +128,8 @@ rowId 在 `append` 时就确定，之后不变。段号在开放段创建时预�
 
 `addIndex` 在 DDL 带 `PRIMARY KEY` 或 `UNIQUE` 时会被调用。本项目用它建 rowId 点查索引，支撑 UPDATE 和 DELETE。
 
+`OmapRowIdIndex.find()` 的区间语义：`first`/`last` 是 `SearchRow`，只填了索引列，其余列为 null（null 元素表示该侧无界）；H2 在倒序时已经把两者交换（`IndexCursor.find()`），所以实现里先取正序区间，再按需 `descendingMap()`。等值查询是区间的退化形式，与区间共用同一条路径。索引条目用 `ConcurrentSkipListMap` 维护，因为 `find` 在存储锁之外迭代，而写路径并发 `put`/`remove`，`TreeMap` 会直接产生 `ConcurrentModificationException`（已由并发用例实证）。
+
 索引不进元数据：重开数据库时 H2 只重放 `CREATE TABLE ... ENGINE` 与 `ALTER TABLE ADD CONSTRAINT`，后者会让 `addIndex` 在空表上重新执行，所以持久化场景下回填实际是空操作。
 
 `Index.needRebuild()` 的返回值对外部引擎表没有行为影响：H2 只在 `MVTable.addIndex` 里读它，那段代码走不到。不要指望它触发重建。
@@ -163,7 +165,7 @@ src/main/java/com/hyd/h2omap/
 
 ## 当前状态与后续阶段
 
-M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）与 M3（合并与并发）已完成：28 个契约用例、10 个存储层用例与 3 个向量用例全部通过，生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
+M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）与 M4（索引区间查询）已完成：33 个契约用例、10 个存储层用例与 3 个向量用例全部通过，生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
 
 | 阶段 | 目标 | 状态 |
 | --- | --- | --- |
@@ -171,7 +173,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 | M1 段真正产生 | rowId 插入时确定；`append` 累积到 `segmentSize` 冻结成 `ColumnSegment`；读路径先段后 delta | 完成 |
 | M2 剪枝与流式扫描 | `OmapScanIndex.find` 用 zone map 剪枝；扫描按段惰性推进 | 完成 |
 | M3 合并与并发 | `compact()` 就地写回段；删除位图；读迭代器快照 | 完成（后台合并线程未做） |
-| M4 索引 | `OmapRowIdIndex` 区间查询；唯一约束；`addIndex` 回填的规模验证 | 未开始 |
+| M4 索引 | `OmapRowIdIndex` 区间查询；唯一约束；`addIndex` 回填的规模验证 | 完成 |
 | M5 编码与性能 | Varchar 字典编码、列裁剪物化、与 MVStore 表的量化对比 | 未开始 |
 | M6 判决点 | 给出「行式物化开销占总耗时比例」的实测结论 | 未开始 |
 
@@ -184,11 +186,12 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - 合并同步在写锁内触发（`append`/`remove`/`update` 后判断 delta 大小），不交给后台线程。
 - 读迭代器采用创建时刻快照：固定最后一个段号与开放段行数，开放段冻结后从段列表继续读，冻结后新开的段不可见。
 - zone map 比较失败（JSON、几何等不可比较的类型）时该列退化为「恒相交」，不参与剪枝；剪枝只是优化，不能让它阻止建段。
+- 主键与唯一索引用 `ConcurrentSkipListMap` 维护「索引键 → rowId」，`find` 按 `subMap`/`tailMap`/`headMap` 取区间后在存储锁之外迭代。`getCost` 沿用 `getCostRangeIndex` 且不额外加码——加码会让范围查询永远选扫描索引，区间分支不会被调用。
+- 两个索引的 `getCreateSQL()` 都保持返回 `null`：区间分支虽然按索引列有序返回，但顺序保证由 H2 的 `Select.getIndexSorts` 判断，交给扫描加排序更稳妥。
 - 性能数字只在 M5 交付，M0—M5 只要求集成测试与内部计数器断言。
 
 ## 尚未实现
 
-- `OmapRowIdIndex.find()`：区间查询，现在只支持精确匹配，其余退化成全表扫描。
 - 低基数列的字典编码。
 - 并发写的后台合并线程：现在合并同步在写锁内触发。
 - 数组列的按元素存储与剪枝：目前整值存放在 `ValueVector` 里，zone map 只能整值比较，无法按元素过滤。
