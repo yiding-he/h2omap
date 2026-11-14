@@ -37,12 +37,20 @@ public final class ValueVector implements ColumnVector {
         return index >= 0 && index < values.size() ? values.get(index) : ValueNull.INSTANCE;
     }
 
+    /**
+     * 写入第 index 个值。建段时顺序追加，合并时按段内偏移改写。
+     */
     @Override
     public void set(int index, Value value) {
-        // 段构建时按行顺序写入，所以追加即可。
-        values.add(value);
+        if (index == values.size()) {
+            values.add(value);
+        } else {
+            values.set(index, value);
+        }
         if (value == ValueNull.INSTANCE) {
             nulls.setNull(index);
+        } else {
+            nulls.clear(index);
         }
     }
 

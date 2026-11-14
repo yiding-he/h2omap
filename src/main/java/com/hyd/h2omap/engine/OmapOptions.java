@@ -8,10 +8,12 @@ import java.util.List;
 import org.h2.message.DbException;
 
 /**
- * {@code CREATE TABLE ... WITH 'key=value', ...} 里的引擎参数。
+ * {@code CREATE TABLE ... WITH "key=value", ...} 里的引擎参数。
  *
- * <p>参数按逗号分隔由 H2 解析成 {@code List<String>}，本类只负责拆出
- * {@code key=value}。未知的键直接报错，避免拼写错误被静默忽略。
+ * <p>H2 把 {@code WITH} 后面逗号分隔的每个双引号标识符当成一个参数
+ * （见 {@code org/h2/command/Parser.readTableEngineParams}），
+ * 本类只负责拆出 {@code key=value}。未知的键直接报错，
+ * 避免拼写错误被静默忽略。
  */
 public final class OmapOptions {
 

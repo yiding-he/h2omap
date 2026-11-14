@@ -10,10 +10,11 @@ import org.h2.value.ValueNull;
 import com.hyd.h2omap.vector.ColumnVector;
 
 /**
- * 每个列段每列的最小值和最大值。
+ * 单列的 min/max。扫描时用它快速跳过不可能包含目标行的段。
  *
- * <p>谓词下推的第一道筛子：查询给的下界上界和这里不相交，
- * 整段直接跳过，不用读列向量。
+ * <p>min 和 max 都为 null 表示这个 zone map 恒与任何区间相交：
+ * 全 null 的列，以及值不可比较的类型（JSON、几何等）都是这种情况，
+ * 这些列不参与剪枝。
  */
 public final class ZoneMap {
 
@@ -21,16 +22,22 @@ public final class ZoneMap {
 
     private final Value max;
 
-    public ZoneMap(Value min, Value max) {
+    private final CompareMode compareMode;
+
+    private ZoneMap(Value min, Value max, CompareMode compareMode) {
         this.min = min;
         this.max = max;
+        this.compareMode = compareMode;
     }
 
     /**
-     * 扫描一个列向量，算出 min 和 max。全为 null 时两者都是 null。
+     * 扫描一个列向量，算出 min 和 max。
+     *
+     * @param vector      列向量
+     * @param compareMode 数据库的比较模式，必须与扫描时使用的一致
+     * @return zone map；值不可比较时返回恒相交的实例
      */
-    public static ZoneMap of(ColumnVector vector) {
-        CompareMode compareMode = CompareMode.getInstance(null, 0);
+    public static ZoneMap of(ColumnVector vector, CompareMode compareMode) {
         Value min = null;
         Value max = null;
         for (int i = 0, n = vector.size(); i < n; i++) {
@@ -38,14 +45,19 @@ public final class ZoneMap {
             if (v == ValueNull.INSTANCE) {
                 continue;
             }
-            if (min == null || v.compareTo(min, null, compareMode) < 0) {
-                min = v;
-            }
-            if (max == null || v.compareTo(max, null, compareMode) > 0) {
-                max = v;
+            try {
+                if (min == null || v.compareTo(min, null, compareMode) < 0) {
+                    min = v;
+                }
+                if (max == null || v.compareTo(max, null, compareMode) > 0) {
+                    max = v;
+                }
+            } catch (RuntimeException e) {
+                // 剪枝只是优化，不能因为它让整张表无法产生段。
+                return new ZoneMap(null, null, compareMode);
             }
         }
-        return new ZoneMap(min, max);
+        return new ZoneMap(min, max, compareMode);
     }
 
     public Value getMin() {
@@ -56,15 +68,7 @@ public final class ZoneMap {
         return max;
     }
 
-    /**
-     * 判断查询区间是否可能与本段相交。null 表示该侧无界。
-     *
-     * @param low         查询下界，null 表示负无穷
-     * @param high        查询上界，null 表示正无穷
-     * @param compareMode 比较规则，来自数据库配置
-     * @return false 表示整段可以跳过
-     */
-    public boolean mayIntersect(Value low, Value high, CompareMode compareMode) {
+    public boolean mayIntersect(Value low, Value high) {
         if (low != null && max != null && max.compareTo(low, null, compareMode) < 0) {
             return false;
         }

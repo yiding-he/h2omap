@@ -40,7 +40,7 @@ public final class OmapTable extends TableBase {
 
     public OmapTable(CreateTableData data, OmapOptions options) {
         super(data);
-        this.store = new ColumnarStore(getColumns(), options);
+        this.store = new ColumnarStore(getColumns(), options, getCompareMode());
         this.scanIndex = new OmapScanIndex(this, data.id, data.tableName + "_SCAN",
                 IndexColumn.wrap(getColumns()), IndexType.createScan(false), store);
         this.indexes.add(scanIndex);

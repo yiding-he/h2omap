@@ -5,16 +5,20 @@ package com.hyd.h2omap.storage;
 
 import java.util.List;
 
+import org.h2.value.CompareMode;
 import org.h2.value.Value;
 
 import com.hyd.h2omap.stats.ZoneMap;
 import com.hyd.h2omap.vector.ColumnVector;
+import com.hyd.h2omap.vector.NullBitmap;
 
 /**
- * 不可变列段。写满就换新段，合并时整段重写，旧的直接丢掉。
+ * 列段。写满就换新段，段号与段内偏移在行的整个生命周期里都不变，
+ * 所以 H2 已经拿到的 rowId 永远有效。
  *
- * <p>不变性是整个设计的前提：只有段不可变，列向量才能用紧凑的
- * primitive 数组，zone map 也才不会失效。
+ * <p>段不是严格不可变的：合并会把 delta 的新值写回本段，并给已删除
+ * 的行打标记。这两件事都不改变 rowId，因此不需要快照。zone map 在
+ * 值或删除标记变化后重算。
  */
 public final class ColumnSegment {
 
@@ -26,21 +30,32 @@ public final class ColumnSegment {
 
     private final ZoneMap[] zoneMaps;
 
-    private ColumnSegment(int segmentId, int rowCount, ColumnVector[] columns, ZoneMap[] zoneMaps) {
+    /** 删除标记。被标记的行对读路径不可见，rowId 保留。 */
+    private final NullBitmap deleted;
+
+    private final CompareMode compareMode;
+
+    private ColumnSegment(int segmentId, int rowCount, ColumnVector[] columns, ZoneMap[] zoneMaps,
+            CompareMode compareMode) {
         this.segmentId = segmentId;
         this.rowCount = rowCount;
         this.columns = columns;
         this.zoneMaps = zoneMaps;
+        this.deleted = new NullBitmap(rowCount);
+        this.compareMode = compareMode;
     }
 
     /**
      * 由一批行构建一个段。调用方保证 {@code rows} 不为空。
      *
-     * @param rows       行数据，每行长度等于列数
-     * @param valueTypes 每列的 H2 类型码，见 {@code org.h2.value.Value}
-     * @return 新段，段号取本批数据第一行的段号
+     * @param segmentId   段号
+     * @param rows        行数据，每行长度等于列数
+     * @param valueTypes  每列的 H2 类型码，见 {@code org.h2.value.Value}
+     * @param compareMode 数据库的比较模式
+     * @return 新段
      */
-    public static ColumnSegment build(int segmentId, List<Value[]> rows, int[] valueTypes) {
+    public static ColumnSegment build(int segmentId, List<Value[]> rows, int[] valueTypes,
+            CompareMode compareMode) {
         int count = rows.size();
         ColumnVector[] vectors = new ColumnVector[valueTypes.length];
         for (int c = 0; c < valueTypes.length; c++) {
@@ -54,9 +69,9 @@ public final class ColumnSegment {
         }
         ZoneMap[] zones = new ZoneMap[valueTypes.length];
         for (int c = 0; c < valueTypes.length; c++) {
-            zones[c] = ZoneMap.of(vectors[c]);
+            zones[c] = ZoneMap.of(vectors[c], compareMode);
         }
-        return new ColumnSegment(segmentId, count, vectors, zones);
+        return new ColumnSegment(segmentId, count, vectors, zones, compareMode);
     }
 
     public int getSegmentId() {
@@ -91,6 +106,27 @@ public final class ColumnSegment {
         return zoneMaps[column];
     }
 
+    public boolean isDeleted(int offset) {
+        return deleted.isNull(offset);
+    }
+
+    /** 合并时标记某行已删除。 */
+    public void markDeleted(int offset) {
+        deleted.setNull(offset);
+    }
+
+    /** 合并时把 delta 里的新值写回本段的某一行。 */
+    public void setRow(int offset, Value[] values) {
+        for (int c = 0; c < columns.length; c++) {
+            columns[c].set(offset, values[c]);
+        }
+    }
+
+    /** 值或删除标记变化后重算某一列的 zone map。 */
+    public void rebuildZoneMap(int column) {
+        zoneMaps[column] = ZoneMap.of(columns[column], compareMode);
+    }
+
     public long getEstimatedMemory() {
         long total = 64;
         for (ColumnVector vector : columns) {
@@ -99,6 +135,6 @@ public final class ColumnSegment {
         for (ZoneMap zoneMap : zoneMaps) {
             total += zoneMap.getEstimatedMemory();
         }
-        return total;
+        return total + deleted.getEstimatedMemory();
     }
 }

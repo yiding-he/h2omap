@@ -9,6 +9,7 @@ import java.util.List;
 import org.h2.result.Row;
 import org.h2.table.Column;
 import org.h2.value.TypeInfo;
+import org.h2.value.CompareMode;
 import org.h2.value.Value;
 import org.h2.value.ValueInteger;
 import org.h2.value.ValueVarchar;
@@ -29,11 +30,17 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 class ColumnarStoreTest {
 
     private static ColumnarStore newStore(int segmentSize) {
+        return newStore(segmentSize, Integer.MAX_VALUE);
+    }
+
+    private static ColumnarStore newStore(int segmentSize, int compactionMinRows) {
         return new ColumnarStore(
                 new Column[] {
                         new Column("A", TypeInfo.getTypeInfo(Value.INTEGER)),
                         new Column("B", TypeInfo.getTypeInfo(Value.VARCHAR)) },
-                OmapOptions.from(List.of("segmentSize=" + segmentSize)));
+                OmapOptions.from(List.of("segmentSize=" + segmentSize,
+                        "compactionMinRows=" + compactionMinRows)),
+                CompareMode.getInstance(null, 0));
     }
 
     private static Value[] row(int a, String b) {
@@ -129,6 +136,78 @@ class ColumnarStoreTest {
         // 段号不回收，清空后重新分配的 rowId 不会和之前的撞车。
         assertNotEquals(before, after);
         assertEquals("3", column(store.materialize(after), 0));
+    }
+
+    /**
+     * zone map 剪枝：A 列下界为 3 时，只应命中第二段。
+     */
+    @Test
+    void zoneMapSkipsNonIntersectingSegments() {
+        ColumnarStore store = newStore(2);
+        store.append(row(1, "a"));
+        store.append(row(2, "b"));
+        long r2 = store.append(row(3, "c"));
+        long r3 = store.append(row(4, "d"));
+
+        Value[] lower = new Value[] { ValueInteger.get(3), null };
+        long[] ids = store.collectVisibleRowIds(lower, null, false);
+        assertEquals(Arrays.asList(r2, r3), Arrays.asList(ids[0], ids[1]));
+
+        long[] reversed = store.collectVisibleRowIds(lower, null, true);
+        assertEquals(Arrays.asList(r3, r2), Arrays.asList(reversed[0], reversed[1]));
+    }
+
+    /**
+     * 合并：delta 的改动写回段，rowId 不变，zone map 重算后剪枝仍然有效。
+     */
+    @Test
+    void compactWritesDeltaBackIntoSegments() {
+        ColumnarStore store = newStore(2, 2);
+        long first = store.append(row(1, "a"));
+        long second = store.append(row(2, "b"));
+        long third = store.append(row(3, "c"));
+        assertEquals(1, store.segments().size());
+
+        store.update(first, row(1, "x"));
+        store.remove(second);
+        // delta 达到 compactionMinRows，上面这次 remove 已经触发合并。
+        assertEquals(2, store.getRowCount());
+        assertEquals("x", column(store.materialize(first), 1));
+        assertNull(store.materialize(second));
+        assertEquals("3", column(store.materialize(third), 0));
+        assertEquals(first, store.materialize(first).getKey());
+
+        // 合并后 zone map 已重算：A >= 3 只命中第三行所在的段。
+        Value[] lower = new Value[] { ValueInteger.get(3), null };
+        long[] ids = store.collectVisibleRowIds(lower, null, false);
+        assertEquals(1, ids.length);
+        assertEquals(third, ids[0]);
+    }
+
+    /** 迭代器是创建时刻的快照：创建后插入的行不返回。 */
+    @Test
+    void iteratorIsSnapshotAtCreation() {
+        ColumnarStore store = newStore(2);
+        long first = store.append(row(1, "a"));
+        ColumnarStore.RowIterator iterator = store.rowIterator(null, null, false);
+        assertEquals(first, iterator.next());
+
+        store.append(row(2, "b"));
+        store.append(row(3, "c"));
+        assertEquals(-1, iterator.next());
+    }
+
+    /** 迭代器跳过创建后才被删除的行。 */
+    @Test
+    void iteratorSkipsRowsDeletedAfterCreation() {
+        ColumnarStore store = newStore(4);
+        long first = store.append(row(1, "a"));
+        long second = store.append(row(2, "b"));
+        ColumnarStore.RowIterator iterator = store.rowIterator(null, null, false);
+
+        assertEquals(first, iterator.next());
+        store.remove(second);
+        assertEquals(-1, iterator.next());
     }
 
     @Test

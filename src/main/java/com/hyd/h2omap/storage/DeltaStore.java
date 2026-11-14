@@ -56,6 +56,14 @@ public final class DeltaStore {
         return segmentDeletes.size();
     }
 
+    public Set<Map.Entry<Long, Value[]>> updatedEntries() {
+        return updated.entrySet();
+    }
+
+    public Set<Long> deletedRowIds() {
+        return segmentDeletes;
+    }
+
     public void clear() {
         updated.clear();
         segmentDeletes.clear();

@@ -335,6 +335,36 @@ class OmapTableContractTest {
                 rows("SELECT TS, DEC, S FROM T ORDER BY TS"));
     }
 
+    /**
+     * zone map 剪枝：多段表按范围条件查询，结果只含命中的行。
+     */
+    @Test
+    void zoneMapPruningReturnsOnlyMatchingRows() throws SQLException {
+        execute(createTable("T", "ID INT, V INT", "\"segmentSize=2\""));
+        execute("INSERT INTO T VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)");
+        assertEquals(List.of("3/30", "4/40"), rows("SELECT ID, V FROM T WHERE V >= 30 AND V < 50"));
+        assertEquals(List.of("6/60"), rows("SELECT ID, V FROM T WHERE V > 50"));
+        assertEquals(List.of("1/10"), rows("SELECT ID, V FROM T WHERE V = 10"));
+        assertEquals(List.of("6/60", "5/50", "4/40"),
+                rows("SELECT ID, V FROM T WHERE V >= 40 ORDER BY V DESC"));
+    }
+
+    /**
+     * delta 达到 compactionMinRows 就合并回段，之后行数、值、点查与剪枝都正确。
+     */
+    @Test
+    void compactionKeepsDataReadable() throws SQLException {
+        execute(createTable("T", "ID INT PRIMARY KEY, V INT",
+                "\"segmentSize=2\", \"compactionMinRows=2\""));
+        execute("INSERT INTO T VALUES (1, 10), (2, 20), (3, 30), (4, 40)");
+        execute("UPDATE T SET V = 11 WHERE ID = 1");
+        execute("DELETE FROM T WHERE ID = 2");
+        assertEquals("3", scalar("SELECT COUNT(*) FROM T"));
+        assertEquals(List.of("1/11", "3/30", "4/40"), rows("SELECT ID, V FROM T ORDER BY ID"));
+        assertEquals(List.of("1/11"), rows("SELECT ID, V FROM T WHERE ID = 1"));
+        assertEquals(List.of("4/40"), rows("SELECT ID, V FROM T WHERE V > 30"));
+    }
+
     // ------------------------------------------------------------------
     // 兼容性限制
     // ------------------------------------------------------------------

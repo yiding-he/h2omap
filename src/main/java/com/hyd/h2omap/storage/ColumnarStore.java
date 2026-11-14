@@ -7,23 +7,30 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.h2.result.Row;
 import org.h2.table.Column;
+import org.h2.value.CompareMode;
 import org.h2.value.Value;
 import org.h2.value.ValueBigint;
+import org.h2.value.ValueNull;
 
 import com.hyd.h2omap.engine.OmapOptions;
 
 /**
- * 列式存储的核心容器：不可变列段加行式 delta。
+ * 列式存储的核心容器：列段加行式 delta。
  *
  * <p>新行写进当前开放段，写满即冻结成 {@link ColumnSegment}，之后开一个新段。
  * rowId 在分配时就是最终值：段号预先分配，段内偏移就是写入顺序，
- * 冻结不改变任何已有 rowId。
+ * 冻结与合并都不改变任何已有 rowId。
+ *
+ * <p>delta 保存已冻结段的更新与删除。delta 攒到 {@code compactionMinRows}
+ * 就在写锁内合并回段：值写回列向量，删除写进段的删除位图，然后清空 delta。
+ * 因为 rowId 不变，读路径不需要快照。
  *
  * <p>线程安全策略：单写多读。H2 的 {@code addRow} 和 {@code removeRow}
  * 没有锁契约，多个连接会并发进入，所以写锁是必须的。
@@ -33,6 +40,8 @@ public final class ColumnarStore {
     private final int[] valueTypes;
 
     private final OmapOptions options;
+
+    private final CompareMode compareMode;
 
     /** 已冻结的段，按段号升序。 */
     private final List<ColumnSegment> segments = new ArrayList<>();
@@ -53,8 +62,9 @@ public final class ColumnarStore {
 
     private long rowCount;
 
-    public ColumnarStore(Column[] columns, OmapOptions options) {
+    public ColumnarStore(Column[] columns, OmapOptions options, CompareMode compareMode) {
         this.options = options;
+        this.compareMode = compareMode;
         this.valueTypes = new int[columns.length];
         for (int i = 0; i < columns.length; i++) {
             valueTypes[i] = columns[i].getType().getValueType();
@@ -76,6 +86,7 @@ public final class ColumnarStore {
             if (openSegment.rowCount() >= options.getSegmentSize()) {
                 freeze();
             }
+            maybeCompact();
             return rowId;
         } finally {
             lock.writeLock().unlock();
@@ -93,6 +104,7 @@ public final class ColumnarStore {
                 }
                 rowCount--;
                 bump();
+                maybeCompact();
             }
         } finally {
             lock.writeLock().unlock();
@@ -112,6 +124,7 @@ public final class ColumnarStore {
                 openSegment.setRow(RowId.offset(rowId), withRowId(rowId, values));
             }
             bump();
+            maybeCompact();
         } finally {
             lock.writeLock().unlock();
         }
@@ -140,15 +153,43 @@ public final class ColumnarStore {
     }
 
     /**
-     * 把 delta 合并进新的列段。
+     * 把 delta 的改动写回已冻结的段，然后清空 delta。
      *
-     * <p>TODO M3 实现：合并会改变 rowId（段号与段内偏移都会变），
-     * 必须配合读游标持有的段集合快照，旧快照引用计数归零后才能回收。
+     * <p>段号与段内偏移都不变，已交给 H2 的 rowId 因此仍然有效。
+     * 合并后重算被触及段的 zone map。
+     *
+     * @return 合并的改动行数
      */
     public long compact() {
         lock.writeLock().lock();
         try {
-            return 0;
+            if (delta.updatedSize() == 0 && delta.deletedSize() == 0) {
+                return 0;
+            }
+            Set<ColumnSegment> touched = new HashSet<>();
+            for (Map.Entry<Long, Value[]> entry : delta.updatedEntries()) {
+                ColumnSegment segment = segment(RowId.segmentId(entry.getKey()));
+                if (segment != null) {
+                    segment.setRow(RowId.offset(entry.getKey()), entry.getValue());
+                    touched.add(segment);
+                }
+            }
+            for (long rowId : delta.deletedRowIds()) {
+                ColumnSegment segment = segment(RowId.segmentId(rowId));
+                if (segment != null) {
+                    segment.markDeleted(RowId.offset(rowId));
+                    touched.add(segment);
+                }
+            }
+            long merged = delta.updatedSize() + delta.deletedSize();
+            delta.clear();
+            for (ColumnSegment segment : touched) {
+                for (int c = 0; c < segment.getColumnCount(); c++) {
+                    segment.rebuildZoneMap(c);
+                }
+            }
+            bump();
+            return merged;
         } finally {
             lock.writeLock().unlock();
         }
@@ -157,6 +198,32 @@ public final class ColumnarStore {
     // ------------------------------------------------------------------
     // 读
     // ------------------------------------------------------------------
+
+    /**
+     * 按段推进的可见行迭代器。每次 {@code next()} 自己取读锁，
+     * 所以游标可以在锁外长期存活。
+     *
+     * <p>迭代器是创建时刻的快照：构造时固定最后一个段号与开放段行数。
+     * 开放段在迭代期间被冻结时，迭代器改从段列表读它，rowId 不变；
+     * 冻结之后新开的段不在本次快照内。
+     */
+    public interface RowIterator {
+
+        /** 下一个可见行的 rowId，结束时返回 -1。 */
+        long next();
+    }
+
+    /**
+     * 创建一个行迭代器。
+     *
+     * @param lower   每列的下界，null 元素表示无下界；null 表示不做剪枝
+     * @param upper   每列的上界，null 元素表示无上界；null 表示不做剪枝
+     * @param reverse 是否倒序
+     * @return 迭代器
+     */
+    public RowIterator rowIterator(Value[] lower, Value[] upper, boolean reverse) {
+        return new SegmentRowIterator(lower, upper, reverse);
+    }
 
     /**
      * 物化一行。返回的 {@code Row} 已经带上 rowId，
@@ -170,19 +237,14 @@ public final class ColumnarStore {
         try {
             Value[] values;
             if (isFrozen(rowId)) {
-                if (delta.isSegmentRowDeleted(rowId)) {
+                ColumnSegment segment = segment(RowId.segmentId(rowId));
+                int offset = RowId.offset(rowId);
+                if (segment == null || offset >= segment.getRowCount()
+                        || segment.isDeleted(offset) || delta.isSegmentRowDeleted(rowId)) {
                     return null;
                 }
                 Value[] updated = delta.getUpdated(rowId);
-                if (updated != null) {
-                    values = updated;
-                } else {
-                    ColumnSegment segment = segment(RowId.segmentId(rowId));
-                    if (segment == null || RowId.offset(rowId) >= segment.getRowCount()) {
-                        return null;
-                    }
-                    values = segment.getRow(RowId.offset(rowId));
-                }
+                values = updated != null ? updated : segment.getRow(offset);
             } else {
                 int offset = RowId.offset(rowId);
                 if (offset >= openSegment.rowCount() || openDeletes.contains(rowId)) {
@@ -205,41 +267,25 @@ public final class ColumnarStore {
      * @return rowId 数组
      */
     public long[] collectVisibleRowIds(boolean reverse) {
+        return collectVisibleRowIds(null, null, reverse);
+    }
+
+    /**
+     * 收集可见行的 rowId，用 zone map 跳过不可能命中边界的段。
+     *
+     * @param lower   每列的下界，null 元素表示无下界；null 表示不做剪枝
+     * @param upper   每列的上界，null 元素表示无上界；null 表示不做剪枝
+     * @param reverse 是否倒序
+     * @return rowId 数组
+     */
+    public long[] collectVisibleRowIds(Value[] lower, Value[] upper, boolean reverse) {
         lock.readLock().lock();
         try {
             long[] result = new long[(int) Math.min(rowCount, Integer.MAX_VALUE)];
             int p = 0;
-            if (!reverse) {
-                for (ColumnSegment segment : segments) {
-                    for (int offset = 0; offset < segment.getRowCount(); offset++) {
-                        long rowId = RowId.ofSegment(segment.getSegmentId(), offset);
-                        if (!delta.isSegmentRowDeleted(rowId)) {
-                            result[p++] = rowId;
-                        }
-                    }
-                }
-                for (int offset = 0; offset < openSegment.rowCount(); offset++) {
-                    long rowId = RowId.ofSegment(nextSegmentId, offset);
-                    if (!openDeletes.contains(rowId)) {
-                        result[p++] = rowId;
-                    }
-                }
-            } else {
-                for (int offset = openSegment.rowCount() - 1; offset >= 0; offset--) {
-                    long rowId = RowId.ofSegment(nextSegmentId, offset);
-                    if (!openDeletes.contains(rowId)) {
-                        result[p++] = rowId;
-                    }
-                }
-                for (int s = segments.size() - 1; s >= 0; s--) {
-                    ColumnSegment segment = segments.get(s);
-                    for (int offset = segment.getRowCount() - 1; offset >= 0; offset--) {
-                        long rowId = RowId.ofSegment(segment.getSegmentId(), offset);
-                        if (!delta.isSegmentRowDeleted(rowId)) {
-                            result[p++] = rowId;
-                        }
-                    }
-                }
+            RowIterator iterator = rowIterator(lower, upper, reverse);
+            for (long rowId; (rowId = iterator.next()) >= 0; ) {
+                result[p++] = rowId;
             }
             return Arrays.copyOf(result, p);
         } finally {
@@ -286,13 +332,19 @@ public final class ColumnarStore {
         return row;
     }
 
+    private void maybeCompact() {
+        if (delta.updatedSize() + delta.deletedSize() >= options.getCompactionMinRows()) {
+            compact();
+        }
+    }
+
     /** 当前开放段的段号，也就是它冻结后拿到的段号。 */
     private void freeze() {
         if (openSegment.rowCount() == 0) {
             return;
         }
         ColumnSegment segment = ColumnSegment.build(
-                nextSegmentId, openSegment.drain(), valueTypes);
+                nextSegmentId, openSegment.drain(), valueTypes, compareMode);
         segments.add(segment);
         // 段冻结后，开放段里的删除记录必须移交给 delta，否则那些行会重新可见。
         for (long rowId : openDeletes) {
@@ -303,7 +355,14 @@ public final class ColumnarStore {
     }
 
     private boolean isVisible(long rowId) {
-        return !isFrozen(rowId) || !delta.isSegmentRowDeleted(rowId);
+        if (!isFrozen(rowId)) {
+            return !openDeletes.contains(rowId);
+        }
+        if (delta.isSegmentRowDeleted(rowId)) {
+            return false;
+        }
+        ColumnSegment segment = segment(RowId.segmentId(rowId));
+        return segment != null && !segment.isDeleted(RowId.offset(rowId));
     }
 
     private boolean isFrozen(long rowId) {
@@ -321,5 +380,147 @@ public final class ColumnarStore {
 
     private void bump() {
         dataModificationId.incrementAndGet();
+    }
+
+    private final class SegmentRowIterator implements RowIterator {
+
+        private final Value[] lower;
+
+        private final Value[] upper;
+
+        private final boolean reverse;
+
+        /** 创建时的开放段段号，迭代期间不变。 */
+        private final int lastSegmentId;
+
+        /** 创建时开放段的行数，用来把快照限制在创建时刻已存在的行。 */
+        private final int openRowCount;
+
+        private int segmentId;
+
+        private int offset;
+
+        /** 当前段是否已经定位到起始偏移，倒序时用于区分新段与已走完的段。 */
+        private boolean started;
+
+        SegmentRowIterator(Value[] lower, Value[] upper, boolean reverse) {
+            this.lower = lower;
+            this.upper = upper;
+            this.reverse = reverse;
+            this.lastSegmentId = nextSegmentId;
+            this.openRowCount = openSegment.rowCount();
+            this.segmentId = reverse ? lastSegmentId : firstSegmentId();
+            this.offset = reverse ? -1 : 0;
+        }
+
+        @Override
+        public long next() {
+            lock.readLock().lock();
+            try {
+                return reverse ? nextReverse() : nextForward();
+            } finally {
+                lock.readLock().unlock();
+            }
+        }
+
+        private long nextForward() {
+            while (segmentId <= lastSegmentId) {
+                boolean open = isOpen();
+                ColumnSegment segment = open ? null : segment(segmentId);
+                if (segment == null && !open) {
+                    nextSegmentForward();
+                    continue;
+                }
+                if (segment != null && !intersects(segment)) {
+                    nextSegmentForward();
+                    continue;
+                }
+                int count = countOf(open, segment);
+                while (offset < count) {
+                    long rowId = RowId.ofSegment(segmentId, offset);
+                    boolean deleted = open ? openDeletes.contains(rowId) : segment.isDeleted(offset);
+                    offset++;
+                    if (!deleted) {
+                        return rowId;
+                    }
+                }
+                nextSegmentForward();
+            }
+            return -1;
+        }
+
+        private long nextReverse() {
+            while (segmentId >= firstSegmentId()) {
+                boolean open = isOpen();
+                ColumnSegment segment = open ? null : segment(segmentId);
+                if (segment == null && !open) {
+                    nextSegmentReverse();
+                    continue;
+                }
+                if (segment != null && !intersects(segment)) {
+                    nextSegmentReverse();
+                    continue;
+                }
+                int count = countOf(open, segment);
+                if (!started) {
+                    offset = count - 1;
+                    started = true;
+                }
+                while (offset >= 0) {
+                    long rowId = RowId.ofSegment(segmentId, offset);
+                    boolean deleted = open ? openDeletes.contains(rowId) : segment.isDeleted(offset);
+                    offset--;
+                    if (!deleted) {
+                        return rowId;
+                    }
+                }
+                nextSegmentReverse();
+            }
+            return -1;
+        }
+
+        private void nextSegmentForward() {
+            segmentId++;
+            offset = 0;
+        }
+
+        private void nextSegmentReverse() {
+            segmentId--;
+            offset = -1;
+            started = false;
+        }
+
+        /** 当前段号是否仍是未冻结的开放段。 */
+        private boolean isOpen() {
+            return segmentId == lastSegmentId && segmentId == nextSegmentId;
+        }
+
+        /**
+         * 当前段要遍历的行数。创建时的开放段可能被写满并冻结，
+         * 新追加的行不属于本次快照。
+         */
+        private int countOf(boolean open, ColumnSegment segment) {
+            int available = open ? openSegment.rowCount() : segment.getRowCount();
+            return segmentId == lastSegmentId ? Math.min(available, openRowCount) : available;
+        }
+
+        private boolean intersects(ColumnSegment segment) {
+            for (int c = 0; c < valueTypes.length; c++) {
+                Value low = bound(lower, c);
+                Value high = bound(upper, c);
+                if ((low != null || high != null) && !segment.getZoneMap(c).mayIntersect(low, high)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private Value bound(Value[] bounds, int column) {
+            if (bounds == null || column >= bounds.length) {
+                return null;
+            }
+            Value v = bounds[column];
+            return v == null || v == ValueNull.INSTANCE ? null : v;
+        }
     }
 }

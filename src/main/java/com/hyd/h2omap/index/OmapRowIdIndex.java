@@ -70,7 +70,7 @@ public final class OmapRowIdIndex extends Index {
         }
         // TODO 区间查询：按索引列区间取 subMap，再交给 OmapCursor。
         //      目前退化成全表扫描。
-        return new OmapCursor(store, store.collectVisibleRowIds(reverse));
+        return new OmapCursor(store, store.rowIterator(null, null, reverse));
     }
 
     @Override

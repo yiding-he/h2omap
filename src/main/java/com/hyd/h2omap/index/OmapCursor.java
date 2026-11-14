@@ -10,66 +10,56 @@ import org.h2.result.SearchRow;
 import com.hyd.h2omap.storage.ColumnarStore;
 
 /**
- * 扫描游标。H2 的取数模型是行式的：一次推进一行，再取整行。
+ * 扫描游标。rowId 来自存储层的行迭代器，取行时按 rowId 物化。
  *
- * <p>这里的策略是迟物化。{@link #next()} 只移动 rowId 数组下标，
- * 真正拼 {@code Row} 的动作推迟到 {@link #get()}。这样没被引用的
- * 行完全不会产生装箱开销。
- *
- * <p>rowId 数组由 {@code ColumnarStore#collectVisibleRowIds} 预先算好。
- * 第一版先物化 rowId 列表，后续可以换成按段流式推进。
+ * <p>只支持正向或反向的单向推进，{@link #previous()} 不支持：
+ * H2 的 {@code IndexCursor.previous()} 本身就直接抛内部错误，不会调用到这里。
  */
 public final class OmapCursor implements Cursor {
 
     private final ColumnarStore store;
 
-    private final long[] rowIds;
-
-    private int position = -1;
+    private final ColumnarStore.RowIterator rows;
 
     private Row current;
 
-    public OmapCursor(ColumnarStore store, long[] rowIds) {
+    public OmapCursor(ColumnarStore store, ColumnarStore.RowIterator rows) {
         this.store = store;
-        this.rowIds = rowIds;
+        this.rows = rows;
     }
 
     @Override
     public Row get() {
-        if (current == null && position >= 0 && position < rowIds.length) {
-            current = store.materialize(rowIds[position]);
-        }
         return current;
     }
 
     @Override
     public SearchRow getSearchRow() {
-        return get();
+        return current;
     }
 
+    /**
+     * 推进并立刻物化。物化放在这里而不是 {@code get()}，
+     * 是为了避免「迭代器说这行可见、物化时已被删除」的空行。
+     */
     @Override
     public boolean next() {
-        int next = position + 1;
-        if (next >= rowIds.length) {
-            position = rowIds.length;
-            current = null;
-            return false;
+        while (true) {
+            long next = rows.next();
+            if (next < 0) {
+                current = null;
+                return false;
+            }
+            Row row = store.materialize(next);
+            if (row != null) {
+                current = row;
+                return true;
+            }
         }
-        position = next;
-        current = null;
-        return true;
     }
 
     @Override
     public boolean previous() {
-        int prev = position - 1;
-        if (prev < 0) {
-            position = -1;
-            current = null;
-            return false;
-        }
-        position = prev;
-        current = null;
-        return true;
+        throw new UnsupportedOperationException("previous()");
     }
 }

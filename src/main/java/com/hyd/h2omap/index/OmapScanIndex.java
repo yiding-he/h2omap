@@ -14,6 +14,8 @@ import org.h2.result.SortOrder;
 import org.h2.table.IndexColumn;
 import org.h2.table.Table;
 import org.h2.table.TableFilter;
+import org.h2.value.Value;
+import org.h2.value.ValueNull;
 
 import com.hyd.h2omap.storage.ColumnarStore;
 
@@ -61,11 +63,27 @@ public final class OmapScanIndex extends Index {
 
     @Override
     public Cursor find(SessionLocal session, SearchRow first, SearchRow last, boolean reverse) {
-        // TODO zone map 剪枝：把 first / last 翻译成每列的下界上界，
-        //      跳过 zone map 不相交的列段，只返回候选 rowId。
-        //      ColumnSegment#getZoneMap 与 ZoneMap#mayIntersect 已经就位。
-        long[] rowIds = store.collectVisibleRowIds(reverse);
-        return new OmapCursor(store, rowIds);
+        int columnCount = store.getValueTypes().length;
+        Value[] lower = bounds(first, columnCount);
+        Value[] upper = bounds(last, columnCount);
+        return new OmapCursor(store, store.rowIterator(lower, upper, reverse));
+    }
+
+    /**
+     * 把 H2 的 SearchRow 边界翻译成每列的边界数组。
+     * null 元素表示该列在这一侧无界。
+     */
+    private static Value[] bounds(SearchRow row, int columnCount) {
+        if (row == null) {
+            return null;
+        }
+        int count = Math.min(columnCount, row.getColumnCount());
+        Value[] bounds = new Value[count];
+        for (int i = 0; i < count; i++) {
+            Value v = row.getValue(i);
+            bounds[i] = v == null || v == ValueNull.INSTANCE ? null : v;
+        }
+        return bounds;
     }
 
     @Override
