@@ -10,7 +10,9 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.AfterEach;
@@ -146,6 +148,63 @@ class OmapTableContractTest {
         assertEquals("1", scalar("SELECT COUNT(*) FROM T"));
     }
 
+    @Test
+    void rowIdIndexServesRangeQueries() throws SQLException {
+        execute(createTable("T", "ID INT PRIMARY KEY, V INT", null));
+        for (int i = 1; i <= 10; i++) {
+            execute("INSERT INTO T VALUES (" + i + ", " + i * 10 + ")");
+        }
+        assertEquals(List.of("4", "5", "6", "7", "8", "9", "10"),
+                rows("SELECT ID FROM T WHERE ID > 3"));
+        assertEquals(List.of("2", "3", "4"), rows("SELECT ID FROM T WHERE ID >= 2 AND ID <= 4"));
+        assertEquals(List.of("1", "2"), rows("SELECT ID FROM T WHERE ID < 3"));
+        assertEquals(List.of("10", "9", "8", "7", "6", "5", "4"),
+                rows("SELECT ID FROM T WHERE ID > 3 ORDER BY ID DESC"));
+        assertTrue(rows("SELECT ID FROM T WHERE ID > 100").isEmpty());
+        // 结果断言走全表扫描也会通过，所以同时确认计划用的是 rowId 索引而不是扫描索引。
+        String plan = rows("EXPLAIN SELECT ID FROM T WHERE ID > 3").get(0);
+        assertTrue(!plan.contains("_SCAN"), plan);
+    }
+
+    @Test
+    void uniqueConstraintRejectsDuplicates() throws SQLException {
+        execute(createTable("T", "ID INT, V INT, CONSTRAINT U UNIQUE(V)", null));
+        execute("INSERT INTO T VALUES (1, 10)");
+        assertThrows(SQLException.class, () -> execute("INSERT INTO T VALUES (2, 10)"));
+        assertEquals("1", scalar("SELECT COUNT(*) FROM T"));
+    }
+
+    @Test
+    void uniqueConstraintAddedAfterData() throws SQLException {
+        execute(createTable("T", "ID INT, V INT", null));
+        execute("INSERT INTO T VALUES (1, 10), (2, 10)");
+        // 已有重复数据时不能建立唯一约束。
+        assertThrows(SQLException.class,
+                () -> execute("ALTER TABLE T ADD CONSTRAINT U UNIQUE(V)"));
+        execute("DELETE FROM T WHERE ID = 2");
+        execute("ALTER TABLE T ADD CONSTRAINT U UNIQUE(V)");
+        assertThrows(SQLException.class, () -> execute("INSERT INTO T VALUES (3, 10)"));
+        assertEquals(List.of("1/10"), rows("SELECT ID, V FROM T"));
+    }
+
+    @Test
+    void addIndexBackfillsAllRows() throws SQLException {
+        execute(createTable("T", "ID INT, NAME VARCHAR", null));
+        StringBuilder sql = new StringBuilder("INSERT INTO T VALUES ");
+        for (int i = 1; i <= 1000; i++) {
+            if (i > 1) {
+                sql.append(", ");
+            }
+            sql.append('(').append(i).append(", 'n").append(i).append("')");
+        }
+        execute(sql.toString());
+        execute("ALTER TABLE T ADD PRIMARY KEY(ID)");
+        assertEquals("1000", scalar("SELECT COUNT(*) FROM T"));
+        assertEquals("500/n500", scalar("SELECT ID || '/' || NAME FROM T WHERE ID = 500"));
+        assertEquals("500", scalar("SELECT COUNT(*) FROM T WHERE ID > 500"));
+        assertEquals("500", scalar("SELECT COUNT(*) FROM T WHERE ID <= 500"));
+    }
+
     // ------------------------------------------------------------------
     // 生命周期
     // ------------------------------------------------------------------
@@ -262,6 +321,45 @@ class OmapTableContractTest {
             }
         }
         assertEquals("2", scalar("SELECT COUNT(*) FROM T"));
+    }
+
+    /**
+     * 主键区间查询在存储锁之外迭代索引，写入并发进行时不允许出错。
+     *
+     * <p>索引的迭代器是弱一致的：并发插入的行可能看不到，并发删除的行
+     * 即使被迭代出来，{@code OmapCursor} 的物化也会返回 null 并跳过。
+     * 因此这里只断言无异常、无重复 rowId，不断言与并发写入的一致快照。
+     */
+    @Test
+    void rangeQueryToleratesConcurrentWrites() throws Exception {
+        execute(createTable("T", "ID INT PRIMARY KEY, V INT", null));
+        for (int i = 1; i <= 20; i++) {
+            execute("INSERT INTO T VALUES (" + i + ", " + i + ")");
+        }
+        CountDownLatch stop = new CountDownLatch(1);
+        List<String> failures = new ArrayList<>();
+        Thread writer = new Thread(() -> {
+            try (Connection c = DriverManager.getConnection("jdbc:h2:" + dbName, "sa", "");
+                    Statement s = c.createStatement()) {
+                for (int i = 0; i < 100 && stop.getCount() > 0; i++) {
+                    s.execute("INSERT INTO T VALUES (" + (100 + i) + ", 0)");
+                    s.execute("DELETE FROM T WHERE ID = " + (100 + i));
+                }
+            } catch (SQLException e) {
+                failures.add(e.getMessage());
+            }
+        });
+        writer.start();
+        try {
+            for (int round = 0; round < 10; round++) {
+                List<String> ids = rows("SELECT ID FROM T WHERE ID > 0");
+                assertEquals(ids.size(), new HashSet<>(ids).size(), "duplicate rowId: " + ids);
+            }
+        } finally {
+            stop.countDown();
+            writer.join();
+        }
+        assertTrue(failures.isEmpty(), String.join("; ", failures));
     }
 
     // ------------------------------------------------------------------
