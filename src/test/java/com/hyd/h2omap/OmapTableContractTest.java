@@ -758,7 +758,7 @@ class OmapTableContractTest {
         execute(createTable("T",
                 "ID INT PRIMARY KEY, CAT VARCHAR(10), V INT, D DOUBLE, N INT",
                 "\"segmentSize=100\", \"compactionMinRows=10\""));
-        execute("CREATE TABLE T_MV (ID INT PRIMARY KEY, CAT VARCHAR(10), V INT, D DOUBLE, N INT)");
+        execute("CREATE TABLE T_MV (ID INT PRIMARY KEY, CAT VARCHAR(10), V INT, D DOUBLE, N INT) ENGINE \"org.h2.mvstore.db.Store\"");
         for (int i = 1; i <= 250; i++) {
             String cat = (i % 5 == 0) ? "NULL" : ("'C" + (i % 3) + "'");
             String n = (i % 4 == 0) ? "NULL" : String.valueOf(i);
@@ -815,7 +815,7 @@ class OmapTableContractTest {
         execute(createTable("T",
                 "ID INT PRIMARY KEY, CAT VARCHAR(10), SUBCAT INT, V INT, D DOUBLE",
                 "\"segmentSize=80\", \"compactionMinRows=10\""));
-        execute("CREATE TABLE T_MV (ID INT PRIMARY KEY, CAT VARCHAR(10), SUBCAT INT, V INT, D DOUBLE)");
+        execute("CREATE TABLE T_MV (ID INT PRIMARY KEY, CAT VARCHAR(10), SUBCAT INT, V INT, D DOUBLE) ENGINE \"org.h2.mvstore.db.Store\"");
         for (int i = 1; i <= 260; i++) {
             String cat = (i % 7 == 0) ? "NULL" : ("'C" + (i % 3) + "'");
             String sub = (i % 11 == 0) ? "NULL" : String.valueOf(i % 4);
@@ -853,6 +853,29 @@ class OmapTableContractTest {
                 String omapSql = mvSql.replace("T_MV", "T");
                 assertEquals(collectRows(s, mvSql), collectRows(s, omapSql), "Mismatch for: " + omapSql);
             }
+        }
+    }
+
+    @Test
+    void defaultEngineUsesOmapWithoutEngineClause() throws Exception {
+        execute("CREATE TABLE T_DEFAULT (ID INT PRIMARY KEY, CAT VARCHAR(10), V INT)");
+        execute("INSERT INTO T_DEFAULT VALUES (1, 'A', 10), (2, 'A', 20), (3, 'B', 30)");
+        execute("CREATE LOCAL TEMPORARY TABLE T_TMP (ID INT PRIMARY KEY, V INT)");
+        execute("INSERT INTO T_TMP VALUES (1, 100)");
+
+        org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                ((org.h2.jdbc.JdbcConnection) conn).getSession();
+        org.h2.table.Table tDefault = session.getDatabase().getMainSchema().findTableOrView(session, "T_DEFAULT");
+        org.h2.table.Table tTmp = session.findLocalTempTable("T_TMP");
+        assertTrue(tDefault instanceof com.hyd.h2omap.table.OmapTable,
+                "actual=" + (tDefault == null ? "null" : tDefault.getClass().getName()));
+        assertFalse(tTmp instanceof com.hyd.h2omap.table.OmapTable);
+
+        try (Statement s = conn.createStatement()) {
+            assertEquals("BASE TABLE", toString(s,
+                    "SELECT TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'T_DEFAULT'"));
+            assertEquals("60", toString(s, "SELECT SUM(V) FROM T_DEFAULT"));
+            assertEquals("100", toString(s, "SELECT SUM(V) FROM T_TMP"));
         }
     }
 

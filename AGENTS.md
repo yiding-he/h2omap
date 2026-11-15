@@ -24,7 +24,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`），**不修改 H2 �
 | JDK | 构建与运行用 JDK 21.0.11；字节码目标 `maven.compiler.release=17` |
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变） |
 | 依赖 | 只有 `com.h2database:h2` 与 `junit-jupiter` |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（38 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（10 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例）。改动表、索引或存储实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（39 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（10 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例）。改动表、索引或存储实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/` |
 
 ## H2 侧的依据

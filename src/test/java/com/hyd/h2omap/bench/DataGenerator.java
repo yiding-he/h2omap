@@ -199,7 +199,9 @@ public final class DataGenerator {
         if (ENGINE_OMAP.equals(engine)) {
             ddl += " ENGINE \"" + ENGINE + "\" WITH "
                     + "\"segmentSize=" + segmentSize + "\", \"compactionMinRows=" + compactionMinRows + "\"";
-        } else if (!ENGINE_MV.equals(engine)) {
+        } else if (ENGINE_MV.equals(engine)) {
+            ddl += " ENGINE \"org.h2.mvstore.db.Store\"";
+        } else {
             throw new IllegalArgumentException("engine must be " + ENGINE_OMAP + " or " + ENGINE_MV);
         }
         try (Statement s = conn.createStatement()) {
@@ -230,7 +232,7 @@ public final class DataGenerator {
                     + "\"segmentSize=" + segmentSize + "\", \"compactionMinRows=" + compactionMinRows + "\"");
             if (mvCompare) {
                 s.execute("DROP TABLE IF EXISTS " + MV_TABLE);
-                s.execute(String.format(DDL, MV_TABLE));
+                s.execute(String.format(DDL, MV_TABLE) + " ENGINE \"org.h2.mvstore.db.Store\"");
             }
         }
     }

@@ -2,7 +2,7 @@
 
 基于 H2 的纯内存列式存储。走 JDBC，不做事务，面向 OLAP，同时要接住高频细粒度变更。
 
-本目录是独立 Maven 模块，通过 `org.h2.api.TableEngine` 接入 H2，**不修改 H2 源码**。
+本分支在 H2 `2.5.252` 基础上局部替换少数类以支持向量化下推与默认 OMAP 引擎，并通过 `maven-shade-plugin` 将修改后的类与 `h2-2.5.252` 合并为单个 Jar，消除运行时类加载顺序冲突。
 
 | 需求 | 结论 | 谁来做 |
 | --- | --- | --- |
@@ -25,11 +25,20 @@ mvn -q package
 
 ## 用法
 
-```
--- 单表指定引擎
-CREATE TABLE EVENTS(TS TIMESTAMP, HOST VARCHAR, COST DOUBLE)
+普通用户表（非 `SYS`、非临时表）默认使用 OMAP 引擎；如需显式调整 `WITH` 参数或指定走 MVStore：
+
+```sql
+-- 默认即 OMAP 引擎
+CREATE TABLE EVENTS(TS TIMESTAMP, HOST VARCHAR, COST DOUBLE);
+
+-- 显式指定参数
+CREATE TABLE EVENTS_CUSTOM(TS TIMESTAMP, HOST VARCHAR, COST DOUBLE)
   ENGINE "com.hyd.h2omap.engine.OmapTableEngine"
-  WITH "segmentSize=65536"
+  WITH "segmentSize=65536";
+
+-- 显式回退原版 MVStore 引擎
+CREATE TABLE EVENTS_MV(TS TIMESTAMP, HOST VARCHAR, COST DOUBLE)
+  ENGINE "org.h2.mvstore.db.Store";
 ```
 
 `ENGINE` 和 `WITH` 的参数都必须是双引号标识符。单引号是语法错误（`Parser.readIdentifier()` 只接受标识符），不加引号会被当成标识符并转成大写，导致 `ClassNotFoundException`。
@@ -40,15 +49,13 @@ CREATE TABLE EVENTS(TS TIMESTAMP, HOST VARCHAR, COST DOUBLE)
 
 ### 单独运行
 
-`mvn -q package` 产出的是普通 jar `target/h2omap-0.1.0-SNAPSHOT.jar`：不含 H2 依赖，也没有 `Main-Class`，因此 `java -jar` 跑不起来。要把本项目的 jar 与 H2 的 jar 一起放进 classpath，再指定 H2 自带的启动类。
+`mvn -q package` 通过 `maven-shade-plugin` 产出合并后的单 Jar `target/h2omap-0.1.0-SNAPSHOT.jar`：已内置 H2 `2.5.252` 并剔除被本项目替换的原版同名类，**部署时只需这一个 Jar，不要再额外引入 `h2-2.5.252.jar`**（避免原版 Jar 因文件名排序靠前而被优先加载）。
 
 ```bash
-# Linux / macOS；Windows 把 classpath 的分隔符 ":" 换成 ";"
-H2_JAR="$HOME/.m2/repository/com/h2database/h2/2.5.252/h2-2.5.252.jar"
-CP="target/h2omap-0.1.0-SNAPSHOT.jar:$H2_JAR"
+CP="target/h2omap-0.1.0-SNAPSHOT.jar"
 ```
 
-H2 的 jar 在执行 `mvn -q package` 时已落到本地 Maven 仓库；也可以直接从 Maven Central 取 `https://repo1.maven.org/maven2/com/h2database/h2/2.5.252/h2-2.5.252.jar`。下面三种方式的 `CP` 都是这一串。
+下面三种方式的 `CP` 都是这一串。
 
 命令行 Shell，交互或一次执行：
 

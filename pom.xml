@@ -53,6 +53,35 @@
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.3.1</version>
       </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.0</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <configuration>
+              <dependencyReducedPomLocation>${project.build.directory}/dependency-reduced-pom.xml</dependencyReducedPomLocation>
+              <filters>
+                <filter>
+                  <artifact>com.h2database:h2</artifact>
+                  <excludes>
+                    <exclude>org/h2/command/query/Select.class</exclude>
+                    <exclude>org/h2/command/query/Select$*.class</exclude>
+                    <exclude>org/h2/expression/condition/Comparison.class</exclude>
+                    <exclude>org/h2/expression/condition/Comparison$*.class</exclude>
+                    <exclude>org/h2/schema/Schema.class</exclude>
+                    <exclude>org/h2/schema/Schema$*.class</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
     </plugins>
   </build>
 
