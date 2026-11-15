@@ -14,13 +14,13 @@ import com.hyd.h2omap.table.OmapTable;
  *
  * <p>用法：
  * <pre>
- * CREATE TABLE T(...) ENGINE 'com.hyd.h2omap.engine.OmapTableEngine'
- *     WITH 'segmentSize=65536'
+ * CREATE TABLE T(...) ENGINE "com.hyd.h2omap.engine.OmapTableEngine"
+ *     WITH "segmentSize=65536"
  * </pre>
- * 或者设置成默认引擎：
- * <pre>
- * SET DEFAULT_TABLE_ENGINE 'com.hyd.h2omap.engine.OmapTableEngine'
- * </pre>
+ * {@code ENGINE} 与 {@code WITH} 后面必须是双引号标识符，单引号与不加引号的标识符都不接受。
+ * 不写 {@code ENGINE} 时，普通用户表默认走本引擎（由替换后的
+ * {@code org.h2.schema.Schema#createTable} 决定）；显式写
+ * {@code ENGINE "org.h2.mvstore.db.Store"} 则回退到 MVStore。
  *
  * <p>H2 通过 {@code org.h2.schema.Schema#createTable} 调用本类，
  * 这条路径不经过 {@code org.h2.mvstore.db.Store}，所以表数据
