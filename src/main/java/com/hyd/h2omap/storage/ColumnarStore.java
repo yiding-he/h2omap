@@ -6,6 +6,7 @@ package com.hyd.h2omap.storage;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -740,6 +741,68 @@ public final class ColumnarStore {
             }
             Value v = bounds[column];
             return v == null || v == ValueNull.INSTANCE ? null : v;
+        }
+    }
+
+    /**
+     * 向量化查询的一次性一致性快照：在极短读锁内截取不可变段数组、
+     * 被 delta 屏蔽的段内偏移以及 delta/开放段活跃行，之后锁外无锁计算。
+     */
+    public static final class VectorizedSnapshot {
+
+        public final ColumnSegment[] segments;
+        public final Map<Integer, BitSet> maskedBySegment;
+        public final List<Value[]> extraRows;
+
+        VectorizedSnapshot(ColumnSegment[] segments,
+                Map<Integer, BitSet> maskedBySegment, List<Value[]> extraRows) {
+            this.segments = segments;
+            this.maskedBySegment = maskedBySegment;
+            this.extraRows = extraRows;
+        }
+    }
+
+    public VectorizedSnapshot takeVectorizedSnapshot() {
+        lock.readLock().lock();
+        try {
+            ColumnSegment[] segs = segments.toArray(new ColumnSegment[0]);
+            Map<Integer, BitSet> masked = null;
+            List<Value[]> extra = null;
+            if (!delta.isEmpty()) {
+                masked = new HashMap<>();
+                for (long rowId : delta.deletedRowIds()) {
+                    masked.computeIfAbsent(RowId.segmentId(rowId), k -> new BitSet())
+                            .set(RowId.offset(rowId));
+                }
+                extra = new ArrayList<>(delta.updatedSize() + openSegment.rowCount());
+                for (Map.Entry<Long, Value[]> entry : delta.updatedEntries()) {
+                    long rowId = entry.getKey();
+                    masked.computeIfAbsent(RowId.segmentId(rowId), k -> new BitSet())
+                            .set(RowId.offset(rowId));
+                    extra.add(entry.getValue());
+                }
+            }
+            int openCount = openSegment.rowCount();
+            if (openCount > 0) {
+                if (extra == null) {
+                    extra = new ArrayList<>(openCount);
+                }
+                if (openDeletes.isEmpty()) {
+                    for (int r = 0; r < openCount; r++) {
+                        extra.add(openSegment.rowValues(r));
+                    }
+                } else {
+                    for (int r = 0; r < openCount; r++) {
+                        if (!openDeletes.contains(RowId.ofSegment(nextSegmentId, r))) {
+                            extra.add(openSegment.rowValues(r));
+                        }
+                    }
+                }
+            }
+            return new VectorizedSnapshot(
+                    segs, masked != null ? masked : Map.of(), extra != null ? extra : List.of());
+        } finally {
+            lock.readLock().unlock();
         }
     }
 }

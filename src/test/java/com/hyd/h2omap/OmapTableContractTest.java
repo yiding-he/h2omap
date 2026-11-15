@@ -23,6 +23,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -749,6 +751,123 @@ class OmapTableContractTest {
             assertEquals("10", toString(s, "SELECT COUNT(*) FROM T WHERE RATE = 9.5"));
             assertEquals("224", toString(s, "SELECT COUNT(*) FROM T WHERE ST IS NOT NULL"));
         }
+    }
+
+    @Test
+    void vectorizedGroupAndFilterQueriesMatchExpected() throws Exception {
+        execute(createTable("T",
+                "ID INT PRIMARY KEY, CAT VARCHAR(10), V INT, D DOUBLE, N INT",
+                "\"segmentSize=100\", \"compactionMinRows=10\""));
+        execute("CREATE TABLE T_MV (ID INT PRIMARY KEY, CAT VARCHAR(10), V INT, D DOUBLE, N INT)");
+        for (int i = 1; i <= 250; i++) {
+            String cat = (i % 5 == 0) ? "NULL" : ("'C" + (i % 3) + "'");
+            String n = (i % 4 == 0) ? "NULL" : String.valueOf(i);
+            String vals = "(" + i + ", " + cat + ", " + i + ", " + (i * 0.5) + ", " + n + ")";
+            execute("INSERT INTO T VALUES " + vals);
+            execute("INSERT INTO T_MV VALUES " + vals);
+        }
+        // 制造 delta 更新与删除以及开放段行，验证快照一致性与边界情况
+        execute("UPDATE T SET V = V + 1000 WHERE ID IN (1, 2)");
+        execute("UPDATE T_MV SET V = V + 1000 WHERE ID IN (1, 2)");
+        execute("DELETE FROM T WHERE ID = 3");
+        execute("DELETE FROM T_MV WHERE ID = 3");
+
+        try (Statement s = conn.createStatement()) {
+            // OR + AND + 算术比较 + NULL 检查
+            assertEquals(
+                    toString(s, "SELECT COUNT(*) FROM T_MV WHERE (CAT = 'C1' OR V > 200) AND N IS NOT NULL"),
+                    toString(s, "SELECT COUNT(*) FROM T WHERE (CAT = 'C1' OR V > 200) AND N IS NOT NULL"));
+            // IN / NOT IN
+            assertEquals(
+                    toString(s, "SELECT COUNT(*) FROM T_MV WHERE CAT IN ('C0', 'C1')"),
+                    toString(s, "SELECT COUNT(*) FROM T WHERE CAT IN ('C0', 'C1')"));
+            assertEquals(
+                    toString(s, "SELECT COUNT(*) FROM T_MV WHERE CAT NOT IN ('C0', 'C1')"),
+                    toString(s, "SELECT COUNT(*) FROM T WHERE CAT NOT IN ('C0', 'C1')"));
+            // 0 行命中时全局聚合返回 1 行 (0, NULL)
+            try (ResultSet rs = s.executeQuery("SELECT COUNT(*), SUM(V), MIN(V), MAX(V) FROM T WHERE V > 999999")) {
+                assertTrue(rs.next());
+                assertEquals(0L, rs.getLong(1));
+                assertNull(rs.getObject(2));
+                assertNull(rs.getObject(3));
+                assertNull(rs.getObject(4));
+            }
+            // 0 行命中时 GROUP BY 返回 0 行
+            try (ResultSet rs = s.executeQuery("SELECT CAT, COUNT(*) FROM T WHERE V > 999999 GROUP BY CAT")) {
+                assertFalse(rs.next());
+            }
+            // GROUP BY + ORDER BY + LIMIT + OFFSET + NULL 组
+            try (ResultSet rs = s.executeQuery(
+                    "SELECT CAT, COUNT(*) AS C, SUM(V) FROM T GROUP BY CAT ORDER BY C DESC LIMIT 2 OFFSET 1")) {
+                assertTrue(rs.next());
+                assertTrue(rs.next());
+                assertFalse(rs.next());
+            }
+            // HAVING 路径正确
+            assertEquals(
+                    toString(s, "SELECT COUNT(*) FROM (SELECT CAT, COUNT(*) AS C FROM T_MV GROUP BY CAT HAVING COUNT(*) > 60)"),
+                    toString(s, "SELECT COUNT(*) FROM (SELECT CAT, COUNT(*) AS C FROM T GROUP BY CAT HAVING COUNT(*) > 60)"));
+        }
+    }
+
+    @Test
+    void vectorizedAvgMultiGroupAndHavingMatchMvStore() throws Exception {
+        execute(createTable("T",
+                "ID INT PRIMARY KEY, CAT VARCHAR(10), SUBCAT INT, V INT, D DOUBLE",
+                "\"segmentSize=80\", \"compactionMinRows=10\""));
+        execute("CREATE TABLE T_MV (ID INT PRIMARY KEY, CAT VARCHAR(10), SUBCAT INT, V INT, D DOUBLE)");
+        for (int i = 1; i <= 260; i++) {
+            String cat = (i % 7 == 0) ? "NULL" : ("'C" + (i % 3) + "'");
+            String sub = (i % 11 == 0) ? "NULL" : String.valueOf(i % 4);
+            String v = (i % 13 == 0) ? "NULL" : String.valueOf(i * 3 + 1);
+            String d = (i % 17 == 0) ? "NULL" : String.valueOf(i * 0.25);
+            String vals = "(" + i + ", " + cat + ", " + sub + ", " + v + ", " + d + ")";
+            execute("INSERT INTO T VALUES " + vals);
+            execute("INSERT INTO T_MV VALUES " + vals);
+        }
+        execute("UPDATE T SET V = V + 500 WHERE ID IN (2, 4)");
+        execute("UPDATE T_MV SET V = V + 500 WHERE ID IN (2, 4)");
+        execute("DELETE FROM T WHERE ID = 5");
+        execute("DELETE FROM T_MV WHERE ID = 5");
+
+        String[] queries = {
+                // 全局 AVG（INT 与 DOUBLE）与空结果 AVG
+                "SELECT AVG(V), AVG(D), COUNT(*) FROM T_MV",
+                "SELECT AVG(V), AVG(D), COUNT(*) FROM T_MV WHERE V > 999999",
+                // 多列 GROUP BY + AVG + NULL 组
+                "SELECT CAT, SUBCAT, COUNT(*), SUM(V), AVG(V), AVG(D) FROM T_MV "
+                        + "WHERE V >= 100 GROUP BY CAT, SUBCAT ORDER BY CAT NULLS FIRST, SUBCAT NULLS FIRST",
+                // HAVING 引用未在 SELECT 中出现的聚合 + AND
+                "SELECT CAT, COUNT(*) FROM T_MV GROUP BY CAT "
+                        + "HAVING COUNT(*) > 20 AND SUM(V) > 5000 ORDER BY CAT NULLS FIRST",
+                // HAVING 分组列 + 聚合 OR 条件
+                "SELECT CAT, MAX(V) FROM T_MV GROUP BY CAT "
+                        + "HAVING CAT = 'C0' OR MAX(V) > 1000 ORDER BY CAT NULLS FIRST",
+                // 全局聚合带 HAVING（命中与未命中）
+                "SELECT COUNT(*), AVG(V) FROM T_MV HAVING COUNT(*) > 100",
+                "SELECT COUNT(*), AVG(V) FROM T_MV HAVING COUNT(*) > 999999"
+        };
+
+        try (Statement s = conn.createStatement()) {
+            for (String mvSql : queries) {
+                String omapSql = mvSql.replace("T_MV", "T");
+                assertEquals(collectRows(s, mvSql), collectRows(s, omapSql), "Mismatch for: " + omapSql);
+            }
+        }
+    }
+
+    private static String collectRows(Statement s, String sql) throws SQLException {
+        StringBuilder sb = new StringBuilder();
+        try (ResultSet rs = s.executeQuery(sql)) {
+            int cols = rs.getMetaData().getColumnCount();
+            while (rs.next()) {
+                for (int c = 1; c <= cols; c++) {
+                    sb.append(rs.getString(c)).append('|');
+                }
+                sb.append('\n');
+            }
+        }
+        return sb.toString();
     }
 
     private static String toString(Statement s, String sql) throws SQLException {

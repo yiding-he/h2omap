@@ -56,6 +56,10 @@ public final class DoubleVector implements ColumnVector {
         return nulls;
     }
 
+    public double[] rawValues() {
+        return values;
+    }
+
     @Override
     public long getEstimatedMemory() {
         return 16L + (long) values.length * Double.BYTES + nulls.getEstimatedMemory();

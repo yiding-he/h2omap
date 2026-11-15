@@ -38,6 +38,14 @@ public final class NullBitmap {
         bits[index >>> 6] &= ~(1L << index);
     }
 
+    public boolean hasNull() {
+        return hasNull;
+    }
+
+    public long[] rawBits() {
+        return bits;
+    }
+
     public long getEstimatedMemory() {
         return 16L + (long) bits.length * Long.BYTES;
     }

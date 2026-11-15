@@ -56,6 +56,10 @@ public final class IntVector implements ColumnVector {
         return nulls;
     }
 
+    public int[] rawValues() {
+        return values;
+    }
+
     @Override
     public long getEstimatedMemory() {
         return 16L + (long) values.length * Integer.BYTES + nulls.getEstimatedMemory();

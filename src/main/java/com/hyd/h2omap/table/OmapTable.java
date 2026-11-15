@@ -263,6 +263,10 @@ public final class OmapTable extends TableBase {
         // ALTER TABLE 暂不支持，改成抛异常即可。
     }
 
+    public ColumnarStore getStore() {
+        return store;
+    }
+
     @Override
     public void close(SessionLocal session) {
         // 纯内存，没有资源需要释放。

@@ -59,6 +59,10 @@ public final class VarcharVector implements ColumnVector {
         return nulls;
     }
 
+    public String[] rawValues() {
+        return values;
+    }
+
     @Override
     public long getEstimatedMemory() {
         return 16L + (long) values.length * Long.BYTES + nulls.getEstimatedMemory();

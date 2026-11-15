@@ -69,6 +69,10 @@ public final class ValueVector implements ColumnVector {
         return nulls;
     }
 
+    public List<Value> rawValues() {
+        return values;
+    }
+
     @Override
     public long getEstimatedMemory() {
         long memory = 16L + (long) values.size() * Integer.BYTES;

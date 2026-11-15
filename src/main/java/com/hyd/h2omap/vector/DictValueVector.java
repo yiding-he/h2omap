@@ -120,6 +120,18 @@ public final class DictValueVector implements ColumnVector {
         nulls.clear(index);
     }
 
+    public int[] rawCodes() {
+        return codes;
+    }
+
+    public Value[] rawDict() {
+        return dict;
+    }
+
+    public int dictSize() {
+        return dictSize;
+    }
+
     @Override
     public NullBitmap nulls() {
         return nulls;
