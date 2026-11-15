@@ -29,6 +29,10 @@ public final class VarcharVector implements ColumnVector {
         this.nulls = nulls;
     }
 
+    public static VarcharVector of(String[] values, NullBitmap nulls) {
+        return new VarcharVector(values, nulls);
+    }
+
     @Override
     public ColumnVector copy() {
         return new VarcharVector(values.clone(), nulls.copy());

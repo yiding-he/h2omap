@@ -28,6 +28,8 @@ public final class ColumnSegment {
 
     private final int segmentId;
 
+    private final int generation;
+
     private final int rowCount;
 
     private final ColumnVector[] columns;
@@ -39,9 +41,10 @@ public final class ColumnSegment {
 
     private final CompareMode compareMode;
 
-    private ColumnSegment(int segmentId, int rowCount, ColumnVector[] columns, ZoneMap[] zoneMaps,
-            NullBitmap deleted, CompareMode compareMode) {
+    private ColumnSegment(int segmentId, int generation, int rowCount, ColumnVector[] columns,
+            ZoneMap[] zoneMaps, NullBitmap deleted, CompareMode compareMode) {
         this.segmentId = segmentId;
+        this.generation = generation;
         this.rowCount = rowCount;
         this.columns = columns;
         this.zoneMaps = zoneMaps;
@@ -51,7 +54,16 @@ public final class ColumnSegment {
 
     private ColumnSegment(int segmentId, int rowCount, ColumnVector[] columns, ZoneMap[] zoneMaps,
             CompareMode compareMode) {
-        this(segmentId, rowCount, columns, zoneMaps, new NullBitmap(rowCount), compareMode);
+        this(segmentId, 0, rowCount, columns, zoneMaps, new NullBitmap(rowCount), compareMode);
+    }
+
+    public static ColumnSegment restore(int segmentId, int generation, int rowCount,
+            ColumnVector[] columns, NullBitmap deleted, CompareMode compareMode) {
+        ZoneMap[] zones = new ZoneMap[columns.length];
+        for (int c = 0; c < columns.length; c++) {
+            zones[c] = ZoneMap.of(columns[c], compareMode);
+        }
+        return new ColumnSegment(segmentId, generation, rowCount, columns, zones, deleted, compareMode);
     }
 
     /**
@@ -114,6 +126,14 @@ public final class ColumnSegment {
 
     public int getSegmentId() {
         return segmentId;
+    }
+
+    public int getGeneration() {
+        return generation;
+    }
+
+    public NullBitmap getDeleted() {
+        return deleted;
     }
 
     public int getRowCount() {
@@ -180,7 +200,8 @@ public final class ColumnSegment {
             }
         }
         if (updates == null || updates.isEmpty()) {
-            return new ColumnSegment(segmentId, rowCount, columns, zoneMaps, newDeleted, compareMode);
+            return new ColumnSegment(
+                    segmentId, generation + 1, rowCount, columns, zoneMaps, newDeleted, compareMode);
         }
 
         ColumnVector[] newColumns = null;
@@ -226,7 +247,8 @@ public final class ColumnSegment {
         }
 
         if (newColumns == null) {
-            return new ColumnSegment(segmentId, rowCount, columns, zoneMaps, newDeleted, compareMode);
+            return new ColumnSegment(segmentId, generation + 1, rowCount, columns, zoneMaps,
+                    newDeleted, compareMode);
         }
         for (int c = 0; c < columns.length; c++) {
             if (needsRebuildZone[c]) {
@@ -238,6 +260,7 @@ public final class ColumnSegment {
         }
         return new ColumnSegment(
                 segmentId,
+                generation + 1,
                 rowCount,
                 newColumns,
                 newZones != null ? newZones : zoneMaps,

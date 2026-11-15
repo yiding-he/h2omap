@@ -32,6 +32,10 @@ public final class ValueVector implements ColumnVector {
         this.nulls = nulls;
     }
 
+    public static ValueVector of(List<Value> values, NullBitmap nulls) {
+        return new ValueVector(values, nulls);
+    }
+
     @Override
     public ColumnVector copy() {
         return new ValueVector(new ArrayList<>(values), nulls.copy());

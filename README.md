@@ -25,31 +25,11 @@ mvn -q package
 
 ## 用法
 
-普通用户表（非 `SYS`、非临时表）默认使用 OMAP 引擎；如需显式调整 `WITH` 参数或指定走 MVStore：
-
-```sql
--- 默认即 OMAP 引擎
-CREATE TABLE EVENTS(TS TIMESTAMP, HOST VARCHAR, COST DOUBLE);
-
--- 显式指定参数
-CREATE TABLE EVENTS_CUSTOM(TS TIMESTAMP, HOST VARCHAR, COST DOUBLE)
-  ENGINE "com.hyd.h2omap.engine.OmapTableEngine"
-  WITH "segmentSize=65536";
-
--- 显式回退原版 MVStore 引擎
-CREATE TABLE EVENTS_MV(TS TIMESTAMP, HOST VARCHAR, COST DOUBLE)
-  ENGINE "org.h2.mvstore.db.Store";
-```
-
-`ENGINE` 和 `WITH` 的参数都必须是双引号标识符。单引号是语法错误（`Parser.readIdentifier()` 只接受标识符），不加引号会被当成标识符并转成大写，导致 `ClassNotFoundException`。
-
-使用 `ENGINE` 需要管理员权限（`command/ddl/CreateTable.java:76-78`）。
-
-表定义会随元数据持久化，数据不会。纯内存场景下这是预期行为，重启后需要重新导入。
-
 ### 单独运行
 
-`mvn -q package` 通过 `maven-shade-plugin` 产出合并后的单 Jar `target/h2omap-0.1.0-SNAPSHOT.jar`：已内置 H2 `2.5.252` 并剔除被本项目替换的原版同名类，**部署时只需这一个 Jar，不要再额外引入 `h2-2.5.252.jar`**（避免原版 Jar 因文件名排序靠前而被优先加载）。
+本项目一开始的设计目标就是单独运行而非嵌入其他 java 应用。
+
+在构建阶段， `mvn -q package` 通过 `maven-shade-plugin` 产出合并后的单 Jar `target/h2omap-0.1.0-SNAPSHOT.jar`：已内置 H2 `2.5.252` 并剔除被本项目替换的原版同名类，**部署时只需这一个 Jar，不要再额外引入 `h2-2.5.252.jar`**（避免原版 Jar 因文件名排序靠前而被优先加载）。
 
 ```bash
 CP="target/h2omap-0.1.0-SNAPSHOT.jar"
@@ -74,6 +54,14 @@ java -cp "$CP" org.h2.tools.Shell -url "jdbc:h2:tcp://localhost:19092/~/omap-dem
 
 `-ifNotExists` 必须加：H2 服务器默认禁止远程建库，不加时客户端首次访问会报 `Database "..." not found`。
 
+客户端通过 `jdbc:h2:tcp://...` 连接时，**只需在客户端引入标准 H2 驱动（`com.h2database:h2`）即可，无需引入本项目 Jar**（存储引擎与向量化执行均运行在服务端进程内）。
+
+H2 TCP 服务器默认每个连接对应一个平台线程；在 JDK 21+ 环境下若需支撑大量并发连接，可加上 `-tcpVirtualThreads true` 切换为虚拟线程：
+
+```bash
+java -cp "$CP" org.h2.tools.Server -tcp -tcpPort 19092 -tcpVirtualThreads true -ifNotExists
+```
+
 自己写的 Java 程序：
 
 ```bash
@@ -81,10 +69,33 @@ javac -cp "$CP" -d out Demo.java
 java -cp "$CP:out" Demo
 ```
 
-两个容易踩的点：
+注意：
 
-- 引擎类由 H2 反射加载，本项目的 jar 不在 classpath 时报 `Class "com.hyd.h2omap.engine.OmapTableEngine" not found`（SQL 错误码 90086），不是引擎实现本身出错。
-- `jdbc:h2:mem:名字` 只在当前进程内有效，进程退出即消失；`jdbc:h2:~/名字` 会落盘，但 OMAP 表的数据不随元数据持久化，重启后仍需重新导入。
+- `jdbc:h2:mem:名字` 只在当前进程内有效，进程退出即消失（除非建表时显式指定 `WITH "backupDir=/path"`）；`jdbc:h2:~/名字` 为文件模式库，会在磁盘保存表定义（`.mv.db`）和 OMAP 表数据（`<databasePath>.omap/`，即 WAL 与列段快照），重启后自动将表数据恢复到内存。如果不想在重启后自动恢复某张表的数据，可以在建表语句中使用参数 `WITH "backup=false"`。
+
+### 建表语句
+
+普通用户表（非 `SYS`、非临时表）默认使用 OMAP 引擎；如需显式调整 `WITH` 参数或指定走 MVStore：
+
+```sql
+-- 默认即 OMAP 引擎
+CREATE TABLE EVENTS(TS TIMESTAMP, HOST VARCHAR, COST DOUBLE);
+
+-- 显式指定参数
+CREATE TABLE EVENTS_CUSTOM(TS TIMESTAMP, HOST VARCHAR, COST DOUBLE)
+  ENGINE "com.hyd.h2omap.engine.OmapTableEngine"
+  WITH "segmentSize=65536";
+
+-- 显式回退原版 MVStore 引擎
+CREATE TABLE EVENTS_MV(TS TIMESTAMP, HOST VARCHAR, COST DOUBLE)
+  ENGINE "org.h2.mvstore.db.Store";
+```
+
+`ENGINE` 和 `WITH` 的参数都必须是双引号标识符。单引号是语法错误（`Parser.readIdentifier()` 只接受标识符），不加引号会被当成标识符并转成大写，导致 `ClassNotFoundException`。
+
+使用 `ENGINE` 需要管理员权限（`command/ddl/CreateTable.java:76-78`）。
+
+表定义随 H2 元数据（`.mv.db`）持久化；在文件模式库（如 `jdbc:h2:/path/to/db`）下，OMAP 表数据默认同步写入 `<databasePath>.omap/<schema>_<table>/`（WAL + 增量列段快照），重启后自动加载回内存。纯内存模式（`jdbc:h2:mem:...`）默认不写盘；可通过 `WITH "backup=false"` 关闭持久化，或通过 `WITH "backupDir=/path"`、`WITH "syncIntervalMs=200"` 调整存储路径与 WAL 刷盘间隔。
 
 ## 已知限制
 

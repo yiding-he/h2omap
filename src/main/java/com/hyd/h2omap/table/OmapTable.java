@@ -3,6 +3,8 @@
  */
 package com.hyd.h2omap.table;
 
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
@@ -22,6 +24,7 @@ import org.h2.value.Value;
 import com.hyd.h2omap.engine.OmapOptions;
 import com.hyd.h2omap.index.OmapRowIdIndex;
 import com.hyd.h2omap.index.OmapScanIndex;
+import com.hyd.h2omap.persistence.OmapPersistence;
 import com.hyd.h2omap.storage.ColumnarStore;
 
 /**
@@ -41,12 +44,44 @@ public final class OmapTable extends TableBase {
 
     private final AtomicLong lastModificationId = new AtomicLong();
 
+    private final OmapPersistence persistence;
+
     public OmapTable(CreateTableData data, OmapOptions options) {
         super(data);
         this.store = new ColumnarStore(getColumns(), options, getCompareMode());
         this.scanIndex = new OmapScanIndex(this, data.id, data.tableName + "_SCAN",
                 IndexColumn.wrap(getColumns()), IndexType.createScan(false), store);
         this.indexes.add(scanIndex);
+        this.persistence = initPersistence(data, options);
+        if (this.persistence != null) {
+            if (this.persistence.hasExistingData()) {
+                this.persistence.recover(store);
+                syncLastModificationIdWithDatabase();
+            } else {
+                this.persistence.initEmptyWal();
+            }
+            this.store.setPersistence(this.persistence);
+        }
+    }
+
+    private OmapPersistence initPersistence(CreateTableData data, OmapOptions options) {
+        Path dir = null;
+        if (options.getBackupDir() != null) {
+            dir = Paths.get(options.getBackupDir());
+        } else if (Boolean.FALSE.equals(options.getBackup())) {
+            return null;
+        } else if (database.isPersistent() || Boolean.TRUE.equals(options.getBackup())) {
+            String dbPath = database.getDatabasePath();
+            if (dbPath == null) {
+                throw DbException.getInvalidValueException(
+                        "OMAP parameter backupDir", "required when backup=true on mem database");
+            }
+            dir = Paths.get(dbPath + ".omap", data.schema.getName() + "_" + data.tableName);
+        }
+        if (dir == null) {
+            return null;
+        }
+        return new OmapPersistence(dir, database, getCompareMode(), options.getSyncIntervalMs());
     }
 
     public ColumnarStore getColumnarStore() {
@@ -269,6 +304,25 @@ public final class OmapTable extends TableBase {
 
     @Override
     public void close(SessionLocal session) {
-        // 纯内存，没有资源需要释放。
+        if (persistence != null) {
+            persistence.close();
+        }
+    }
+
+    @Override
+    public void removeIndexOrTransferOwnership(SessionLocal session, Index index) {
+        if (index instanceof OmapRowIdIndex) {
+            indexes.remove(index);
+            return;
+        }
+        super.removeIndexOrTransferOwnership(session, index);
+    }
+
+    @Override
+    public void removeChildrenAndResources(SessionLocal session) {
+        super.removeChildrenAndResources(session);
+        if (persistence != null) {
+            persistence.deleteDirectory();
+        }
     }
 }

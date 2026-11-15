@@ -47,6 +47,10 @@ public final class SegmentBuilder {
         return drained;
     }
 
+    public List<Value[]> rawRows() {
+        return rows;
+    }
+
     public void clear() {
         rows.clear();
     }

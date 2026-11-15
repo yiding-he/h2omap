@@ -26,6 +26,10 @@ public final class LongVector implements ColumnVector {
         this.nulls = nulls;
     }
 
+    public static LongVector of(long[] values, NullBitmap nulls) {
+        return new LongVector(values, nulls);
+    }
+
     @Override
     public ColumnVector copy() {
         return new LongVector(values.clone(), nulls.copy());

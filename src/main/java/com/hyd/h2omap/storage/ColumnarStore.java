@@ -23,6 +23,7 @@ import org.h2.value.ValueBigint;
 import org.h2.value.ValueNull;
 
 import com.hyd.h2omap.engine.OmapOptions;
+import com.hyd.h2omap.persistence.OmapPersistence;
 
 /**
  * 列式存储的核心容器：列段加行式 delta。
@@ -67,6 +68,8 @@ public final class ColumnarStore {
 
     private long rowCount;
 
+    private volatile OmapPersistence persistence;
+
     public ColumnarStore(Column[] columns, OmapOptions options, CompareMode compareMode) {
         this.options = options;
         this.compareMode = compareMode;
@@ -77,6 +80,10 @@ public final class ColumnarStore {
         this.openSegment = new SegmentBuilder();
     }
 
+    public void setPersistence(OmapPersistence persistence) {
+        this.persistence = persistence;
+    }
+
     // ------------------------------------------------------------------
     // 写
     // ------------------------------------------------------------------
@@ -84,14 +91,20 @@ public final class ColumnarStore {
     public long append(Value[] values) {
         long rowId;
         boolean needCompact;
+        boolean froze = false;
         lock.writeLock().lock();
         try {
             rowId = RowId.ofSegment(nextSegmentId, openSegment.rowCount());
             openSegment.append(withRowId(rowId, values));
             rowCount++;
             bump();
+            OmapPersistence p = persistence;
+            if (p != null) {
+                p.logInsert(rowId, values);
+            }
             if (openSegment.rowCount() >= options.getSegmentSize()) {
                 freeze();
+                froze = true;
             }
             needCompact = shouldCompact();
         } finally {
@@ -99,6 +112,8 @@ public final class ColumnarStore {
         }
         if (needCompact) {
             compact();
+        } else if (froze && persistence != null) {
+            checkpoint();
         }
         return rowId;
     }
@@ -115,6 +130,10 @@ public final class ColumnarStore {
                 }
                 rowCount--;
                 bump();
+                OmapPersistence p = persistence;
+                if (p != null) {
+                    p.logDelete(rowId);
+                }
                 needCompact = shouldCompact();
             }
         } finally {
@@ -139,6 +158,10 @@ public final class ColumnarStore {
                 openSegment.setRow(RowId.offset(rowId), withRowId(rowId, values));
             }
             bump();
+            OmapPersistence p = persistence;
+            if (p != null) {
+                p.logUpdate(rowId, values);
+            }
             needCompact = shouldCompact();
         } finally {
             lock.writeLock().unlock();
@@ -164,6 +187,10 @@ public final class ColumnarStore {
             rowCount = 0;
             // 段号不回收，清空后再分配的 rowId 不会和之前撞车。
             bump();
+            OmapPersistence p = persistence;
+            if (p != null) {
+                p.logTruncate(nextSegmentId);
+            }
             return old;
         } finally {
             lock.writeLock().unlock();
@@ -179,6 +206,7 @@ public final class ColumnarStore {
      * @return 合并的改动行数
      */
     public long compact() {
+        long compactedCount;
         synchronized (compactMonitor) {
             Map<Integer, ColumnSegment> baseSegments = new HashMap<>();
             Map<Integer, List<Map.Entry<Integer, Value[]>>> updatesBySeg = new HashMap<>();
@@ -251,11 +279,166 @@ public final class ColumnarStore {
                 }
                 delta.rebuildDirtySegments();
                 bump();
-                return (long) updateSnap.size() + deleteSnap.size();
+                compactedCount = (long) updateSnap.size() + deleteSnap.size();
             } finally {
                 lock.writeLock().unlock();
             }
         }
+        if (persistence != null && compactedCount >= Math.max(1024, options.getCompactionMinRows())) {
+            checkpoint();
+        }
+        return compactedCount;
+    }
+
+    /**
+     * 执行一次增量段快照 Checkpoint（将未写盘的新/改段及当前开放段/delta 写盘，并截断旧 WAL）。
+     */
+    public void checkpoint() {
+        OmapPersistence p = persistence;
+        if (p == null) {
+            return;
+        }
+        List<ColumnSegment> segsSnap;
+        int nextSegIdSnap;
+        long newWalSeq;
+        List<Value[]> openRowsSnap;
+        Set<Long> openDeletesSnap;
+        Map<Long, Value[]> deltaUpdatedSnap;
+        Set<Long> deltaDeletesSnap;
+        lock.writeLock().lock();
+        try {
+            segsSnap = new ArrayList<>(segments);
+            nextSegIdSnap = nextSegmentId;
+            openRowsSnap = new ArrayList<>(openSegment.rawRows());
+            openDeletesSnap = new HashSet<>(openDeletes);
+            deltaUpdatedSnap = new HashMap<>(delta.rawUpdated());
+            deltaDeletesSnap = new HashSet<>(delta.deletedRowIds());
+            newWalSeq = p.rotateWal();
+        } finally {
+            lock.writeLock().unlock();
+        }
+        p.writeCheckpoint(segsSnap, nextSegIdSnap, newWalSeq,
+                openRowsSnap, openDeletesSnap, deltaUpdatedSnap, deltaDeletesSnap);
+    }
+
+    // ------------------------------------------------------------------
+    // 持久化恢复（仅在开库阶段单线程调用）
+    // ------------------------------------------------------------------
+
+    public void restoreFromPersistence(List<ColumnSegment> restoredSegments, int restoredNextSegId,
+            List<Value[]> openRows, Set<Long> restoredOpenDeletes,
+            Map<Long, Value[]> restoredDeltaUpdated, Set<Long> restoredDeltaDeletes) {
+        lock.writeLock().lock();
+        try {
+            segments.clear();
+            segments.addAll(restoredSegments);
+            nextSegmentId = restoredNextSegId;
+            openSegment.clear();
+            for (Value[] row : openRows) {
+                openSegment.append(row);
+            }
+            openDeletes.clear();
+            openDeletes.addAll(restoredOpenDeletes);
+            delta.clear();
+            for (Map.Entry<Long, Value[]> e : restoredDeltaUpdated.entrySet()) {
+                delta.markUpdated(e.getKey(), e.getValue());
+            }
+            for (long rowId : restoredDeltaDeletes) {
+                delta.markDeleted(rowId);
+            }
+            recomputeRowCount();
+            bump();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    public void replayInsert(long rowId, Value[] values) {
+        lock.writeLock().lock();
+        try {
+            int segId = RowId.segmentId(rowId);
+            while (nextSegmentId < segId) {
+                nextSegmentId = segId;
+            }
+            openSegment.append(withRowId(rowId, values));
+            rowCount++;
+            bump();
+            if (openSegment.rowCount() >= options.getSegmentSize()) {
+                freeze();
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    public void replayUpdate(long rowId, Value[] values) {
+        lock.writeLock().lock();
+        try {
+            if (isFrozen(rowId)) {
+                delta.markUpdated(rowId, values);
+            } else {
+                openSegment.setRow(RowId.offset(rowId), withRowId(rowId, values));
+            }
+            bump();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    public void replayDelete(long rowId) {
+        lock.writeLock().lock();
+        try {
+            if (isVisible(rowId)) {
+                if (isFrozen(rowId)) {
+                    delta.markDeleted(rowId);
+                } else {
+                    openDeletes.add(rowId);
+                }
+                rowCount--;
+                bump();
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    public void replayTruncate(int restoredNextSegId) {
+        lock.writeLock().lock();
+        try {
+            segments.clear();
+            delta.clear();
+            openSegment.clear();
+            openDeletes.clear();
+            nextSegmentId = restoredNextSegId;
+            rowCount = 0;
+            bump();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    private void recomputeRowCount() {
+        long count = 0;
+        for (ColumnSegment seg : segments) {
+            int rc = seg.getRowCount();
+            if (seg.getDeleted().hasNull()) {
+                for (int i = 0; i < rc; i++) {
+                    if (!seg.isDeleted(i)) {
+                        count++;
+                    }
+                }
+            } else {
+                count += rc;
+            }
+        }
+        for (long rowId : delta.deletedRowIds()) {
+            ColumnSegment seg = segment(RowId.segmentId(rowId));
+            if (seg != null && !seg.isDeleted(RowId.offset(rowId))) {
+                count--;
+            }
+        }
+        count += openSegment.rowCount() - openDeletes.size();
+        this.rowCount = Math.max(0, count);
     }
 
     // ------------------------------------------------------------------
@@ -767,9 +950,25 @@ public final class ColumnarStore {
         try {
             ColumnSegment[] segs = segments.toArray(new ColumnSegment[0]);
             Map<Integer, BitSet> masked = null;
+            for (ColumnSegment seg : segs) {
+                if (seg.getDeleted().hasNull()) {
+                    if (masked == null) {
+                        masked = new HashMap<>();
+                    }
+                    BitSet bs = masked.computeIfAbsent(seg.getSegmentId(), k -> new BitSet());
+                    int rc = seg.getRowCount();
+                    for (int r = 0; r < rc; r++) {
+                        if (seg.isDeleted(r)) {
+                            bs.set(r);
+                        }
+                    }
+                }
+            }
             List<Value[]> extra = null;
             if (!delta.isEmpty()) {
-                masked = new HashMap<>();
+                if (masked == null) {
+                    masked = new HashMap<>();
+                }
                 for (long rowId : delta.deletedRowIds()) {
                     masked.computeIfAbsent(RowId.segmentId(rowId), k -> new BitSet())
                             .set(RowId.offset(rowId));

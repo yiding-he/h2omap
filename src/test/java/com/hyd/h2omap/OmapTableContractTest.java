@@ -242,9 +242,9 @@ class OmapTableContractTest {
         }
         try (Connection second = DriverManager.getConnection(url, "sa", "")) {
             try (Statement s = second.createStatement()) {
-                assertEquals("0", toString(s, "SELECT COUNT(*) FROM T"));
+                assertEquals("2", toString(s, "SELECT COUNT(*) FROM T"));
                 s.execute("INSERT INTO T VALUES (5)");
-                assertEquals("5", toString(s, "SELECT ID FROM T"));
+                assertEquals("3", toString(s, "SELECT COUNT(*) FROM T"));
             }
         }
     }
@@ -606,12 +606,13 @@ class OmapTableContractTest {
         }
         try (Connection second = DriverManager.getConnection(url, "sa", "")) {
             try (Statement s = second.createStatement()) {
-                assertEquals("0", toString(s, "SELECT COUNT(*) FROM T"));
+                assertEquals("2", toString(s, "SELECT COUNT(*) FROM T"));
+                assertEquals("1/a", toString(s, "SELECT ID || '/' || NAME FROM T WHERE ID = 1"));
                 s.execute("INSERT INTO T VALUES (7, 'g'), (8, 'h')");
                 assertEquals("8/h", toString(s, "SELECT ID || '/' || NAME FROM T WHERE ID = 8"));
                 try (ResultSet rs = s.executeQuery("SELECT ID FROM T ORDER BY ID")) {
                     assertTrue(rs.next());
-                    assertEquals("7", rs.getString(1));
+                    assertEquals("1", rs.getString(1));
                 }
             }
         }
@@ -876,6 +877,66 @@ class OmapTableContractTest {
                     "SELECT TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'T_DEFAULT'"));
             assertEquals("60", toString(s, "SELECT SUM(V) FROM T_DEFAULT"));
             assertEquals("100", toString(s, "SELECT SUM(V) FROM T_TMP"));
+        }
+    }
+
+    @Test
+    void persistenceCheckpointWalAndDropCleanup(@TempDir Path dir) throws Exception {
+        Path dbFile = dir.resolve("omap_persist");
+        String url = "jdbc:h2:" + dbFile;
+        String expectedAll;
+        String expectedGroup;
+
+        try (Connection c1 = DriverManager.getConnection(url, "sa", "");
+                Statement s = c1.createStatement()) {
+            s.execute("CREATE TABLE T (ID BIGINT PRIMARY KEY, CAT VARCHAR, V DOUBLE, TAGS INT ARRAY) "
+                    + "ENGINE \"" + ENGINE + "\" WITH \"segmentSize=4\", \"compactionMinRows=2\"");
+            for (int i = 1; i <= 14; i++) {
+                s.execute("INSERT INTO T VALUES (" + i + ", 'c" + (i % 3) + "', " + (i * 1.5)
+                        + ", ARRAY[" + i + ", " + (i + 1) + "])");
+            }
+            // 更新已冻结段（触发 compact）+ 删除已冻结段与开放段行
+            s.execute("UPDATE T SET V = 999.5, CAT = 'upd' WHERE ID IN (2, 6)");
+            s.execute("DELETE FROM T WHERE ID IN (3, 14)");
+            // 写入开放段新行（仅在 WAL 中，未冻结成段）
+            s.execute("INSERT INTO T VALUES (15, 'c0', 22.5, ARRAY[15, 16])");
+            s.execute("INSERT INTO T VALUES (16, NULL, NULL, NULL)");
+
+            // 再建一张显式关闭备份的表
+            s.execute("CREATE TABLE T_NOBACKUP (ID INT PRIMARY KEY) ENGINE \"" + ENGINE
+                    + "\" WITH \"backup=false\"");
+            s.execute("INSERT INTO T_NOBACKUP VALUES (100), (200)");
+
+            expectedAll = collectRows(s, "SELECT ID, CAT, V, TAGS FROM T ORDER BY ID");
+            expectedGroup = collectRows(s,
+                    "SELECT CAT, COUNT(*), SUM(V) FROM T GROUP BY CAT ORDER BY CAT");
+        }
+
+        // 确认备份目录已生成 manifest 与段文件
+        Path tableBackupDir = dir.resolve("omap_persist.omap").resolve("PUBLIC_T");
+        assertTrue(java.nio.file.Files.exists(tableBackupDir.resolve("manifest.dat")));
+
+        // 模拟进程重启后重新打开数据库
+        try (Connection c2 = DriverManager.getConnection(url, "sa", "");
+                Statement s = c2.createStatement()) {
+            assertEquals("0", toString(s, "SELECT COUNT(*) FROM T_NOBACKUP"));
+            assertEquals(expectedAll, collectRows(s, "SELECT ID, CAT, V, TAGS FROM T ORDER BY ID"));
+            assertEquals(expectedGroup, collectRows(s,
+                    "SELECT CAT, COUNT(*), SUM(V) FROM T GROUP BY CAT ORDER BY CAT"));
+            // 主键索引在重启后已回填完成
+            assertEquals("upd/999.5", toString(s, "SELECT CAT || '/' || V FROM T WHERE ID = 6"));
+
+            // 重启后继续写入并 TRUNCATE，再重启验证 TRUNCATE 持久化
+            s.execute("INSERT INTO T VALUES (17, 'c1', 1.0, ARRAY[17])");
+            assertEquals("15", toString(s, "SELECT COUNT(*) FROM T"));
+            s.execute("TRUNCATE TABLE T");
+        }
+
+        try (Connection c3 = DriverManager.getConnection(url, "sa", "");
+                Statement s = c3.createStatement()) {
+            assertEquals("0", toString(s, "SELECT COUNT(*) FROM T"));
+            s.execute("DROP TABLE T");
+            assertFalse(java.nio.file.Files.exists(tableBackupDir));
         }
     }
 

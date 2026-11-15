@@ -26,6 +26,10 @@ public final class IntVector implements ColumnVector {
         this.nulls = nulls;
     }
 
+    public static IntVector of(int[] values, NullBitmap nulls) {
+        return new IntVector(values, nulls);
+    }
+
     @Override
     public ColumnVector copy() {
         return new IntVector(values.clone(), nulls.copy());

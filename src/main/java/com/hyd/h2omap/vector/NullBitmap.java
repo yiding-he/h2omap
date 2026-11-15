@@ -21,6 +21,10 @@ public final class NullBitmap {
         this.hasNull = hasNull;
     }
 
+    public static NullBitmap of(long[] bits, boolean hasNull) {
+        return new NullBitmap(bits, hasNull);
+    }
+
     public NullBitmap copy() {
         return new NullBitmap(bits.clone(), hasNull);
     }

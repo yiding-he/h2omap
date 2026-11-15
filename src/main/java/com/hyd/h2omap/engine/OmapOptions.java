@@ -23,16 +23,27 @@ public final class OmapOptions {
     /** delta 攒到多少行之后触发合并。 */
     public static final int DEFAULT_COMPACTION_MIN_ROWS = 16384;
 
+    /** 后台 WAL 刷盘间隔（毫秒）。 */
+    public static final int DEFAULT_SYNC_INTERVAL_MS = 200;
+
     private final int segmentSize;
     private final int compactionMinRows;
+    private final Boolean backup;
+    private final String backupDir;
+    private final int syncIntervalMs;
 
-    private OmapOptions(int segmentSize, int compactionMinRows) {
+    private OmapOptions(int segmentSize, int compactionMinRows,
+            Boolean backup, String backupDir, int syncIntervalMs) {
         this.segmentSize = segmentSize;
         this.compactionMinRows = compactionMinRows;
+        this.backup = backup;
+        this.backupDir = backupDir;
+        this.syncIntervalMs = syncIntervalMs;
     }
 
     public static OmapOptions defaults() {
-        return new OmapOptions(DEFAULT_SEGMENT_SIZE, DEFAULT_COMPACTION_MIN_ROWS);
+        return new OmapOptions(DEFAULT_SEGMENT_SIZE, DEFAULT_COMPACTION_MIN_ROWS,
+                null, null, DEFAULT_SYNC_INTERVAL_MS);
     }
 
     /**
@@ -47,6 +58,9 @@ public final class OmapOptions {
         }
         int segmentSize = DEFAULT_SEGMENT_SIZE;
         int compactionMinRows = DEFAULT_COMPACTION_MIN_ROWS;
+        Boolean backup = null;
+        String backupDir = null;
+        int syncIntervalMs = DEFAULT_SYNC_INTERVAL_MS;
         for (String param : params) {
             String text = param == null ? "" : param.trim();
             if (text.isEmpty()) {
@@ -65,14 +79,29 @@ public final class OmapOptions {
             case "compactionMinRows":
                 compactionMinRows = parseInt(key, value);
                 break;
+            case "backup":
+                if ("true".equalsIgnoreCase(value)) {
+                    backup = Boolean.TRUE;
+                } else if ("false".equalsIgnoreCase(value)) {
+                    backup = Boolean.FALSE;
+                } else {
+                    throw DbException.getInvalidValueException("OMAP parameter " + key, value);
+                }
+                break;
+            case "backupDir":
+                backupDir = value.isEmpty() ? null : value;
+                break;
+            case "syncIntervalMs":
+                syncIntervalMs = parseInt(key, value);
+                break;
             default:
                 throw DbException.getInvalidValueException("OMAP parameter name", key);
             }
         }
-        if (segmentSize <= 0 || compactionMinRows <= 0) {
+        if (segmentSize <= 0 || compactionMinRows <= 0 || syncIntervalMs <= 0) {
             throw DbException.getInvalidValueException("OMAP parameter", params.toString());
         }
-        return new OmapOptions(segmentSize, compactionMinRows);
+        return new OmapOptions(segmentSize, compactionMinRows, backup, backupDir, syncIntervalMs);
     }
 
     private static int parseInt(String key, String value) {
@@ -89,5 +118,17 @@ public final class OmapOptions {
 
     public int getCompactionMinRows() {
         return compactionMinRows;
+    }
+
+    public Boolean getBackup() {
+        return backup;
+    }
+
+    public String getBackupDir() {
+        return backupDir;
+    }
+
+    public int getSyncIntervalMs() {
+        return syncIntervalMs;
     }
 }

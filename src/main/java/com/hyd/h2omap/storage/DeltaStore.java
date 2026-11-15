@@ -72,6 +72,10 @@ public final class DeltaStore {
         return updated.entrySet();
     }
 
+    public Map<Long, Value[]> rawUpdated() {
+        return updated;
+    }
+
     public Set<Long> deletedRowIds() {
         return segmentDeletes;
     }

@@ -74,6 +74,10 @@ public final class DictValueVector implements ColumnVector {
                 codes, dictList.toArray(new Value[0]), dictList.size(), null, nulls);
     }
 
+    public static DictValueVector of(int[] codes, Value[] dict, NullBitmap nulls) {
+        return new DictValueVector(codes, dict, dict.length, null, nulls);
+    }
+
     @Override
     public ColumnVector copy() {
         return new DictValueVector(
