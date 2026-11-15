@@ -56,12 +56,6 @@ java -cp "$CP" org.h2.tools.Shell -url "jdbc:h2:tcp://localhost:19092/~/omap-dem
 
 客户端通过 `jdbc:h2:tcp://...` 连接时，**只需在客户端引入标准 H2 驱动（`com.h2database:h2`）即可，无需引入本项目 Jar**（存储引擎与向量化执行均运行在服务端进程内）。
 
-H2 TCP 服务器默认每个连接对应一个平台线程；在 JDK 21+ 环境下若需支撑大量并发连接，可加上 `-tcpVirtualThreads true` 切换为虚拟线程：
-
-```bash
-java -cp "$CP" org.h2.tools.Server -tcp -tcpPort 19092 -tcpVirtualThreads true -ifNotExists
-```
-
 自己写的 Java 程序：
 
 ```bash
