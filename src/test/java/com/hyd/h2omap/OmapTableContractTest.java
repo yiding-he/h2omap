@@ -719,6 +719,38 @@ class OmapTableContractTest {
         return result;
     }
 
+    @Test
+    void lowCardinalityNumericDictionaryAndCompaction() throws Exception {
+        execute(createTable("T",
+                "ID INT PRIMARY KEY, ST TINYINT, CODE INT, AMT BIGINT, RATE DOUBLE",
+                "\"segmentSize=100\", \"compactionMinRows=5\""));
+        for (int i = 1; i <= 250; i++) {
+            if (i % 10 == 0) {
+                execute("INSERT INTO T VALUES (" + i + ", NULL, NULL, NULL, NULL)");
+            } else {
+                int k = i % 3;
+                execute("INSERT INTO T VALUES (" + i + ", " + k + ", " + (1000 + k)
+                        + ", " + (100000L + k) + ", " + (0.25 * k) + ")");
+            }
+        }
+        // 前两段已冻结并启用 DictValueVector
+        try (Statement s = conn.createStatement()) {
+            assertEquals("225", toString(s, "SELECT COUNT(*) FROM T WHERE ST IS NOT NULL"));
+            assertEquals("75", toString(s, "SELECT COUNT(*) FROM T WHERE CODE = 1001"));
+            assertEquals("75", toString(s, "SELECT COUNT(*) FROM T WHERE AMT = 100002"));
+            assertEquals("75", toString(s, "SELECT COUNT(*) FROM T WHERE RATE = 0.5"));
+
+            // 更新触发 compact() 并写入字典中原本不存在的新数值与 NULL
+            execute("UPDATE T SET CODE = 9999, AMT = 999999, RATE = 9.5 WHERE ID BETWEEN 1 AND 10");
+            execute("UPDATE T SET ST = NULL WHERE ID = 1");
+
+            assertEquals("10", toString(s, "SELECT COUNT(*) FROM T WHERE CODE = 9999"));
+            assertEquals("10", toString(s, "SELECT COUNT(*) FROM T WHERE AMT = 999999"));
+            assertEquals("10", toString(s, "SELECT COUNT(*) FROM T WHERE RATE = 9.5"));
+            assertEquals("224", toString(s, "SELECT COUNT(*) FROM T WHERE ST IS NOT NULL"));
+        }
+    }
+
     private static String toString(Statement s, String sql) throws SQLException {
         try (ResultSet rs = s.executeQuery(sql)) {
             assertTrue(rs.next());

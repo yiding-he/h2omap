@@ -12,6 +12,7 @@ import org.h2.value.ValueNull;
 
 import com.hyd.h2omap.stats.ZoneMap;
 import com.hyd.h2omap.vector.ColumnVector;
+import com.hyd.h2omap.vector.DictValueVector;
 import com.hyd.h2omap.vector.DictVarcharVector;
 import com.hyd.h2omap.vector.NullBitmap;
 
@@ -77,6 +78,13 @@ public final class ColumnSegment {
                     prebuilt[c] = true;
                     continue;
                 }
+            } else if (isNumericDictCandidate(type)) {
+                DictValueVector dictVec = DictValueVector.tryBuild(rows, c + 1, maxDict);
+                if (dictVec != null) {
+                    vectors[c] = dictVec;
+                    prebuilt[c] = true;
+                    continue;
+                }
             }
             vectors[c] = ColumnVector.create(type, count);
         }
@@ -93,6 +101,15 @@ public final class ColumnSegment {
             zones[c] = ZoneMap.of(vectors[c], compareMode);
         }
         return new ColumnSegment(segmentId, count, vectors, zones, compareMode);
+    }
+
+    private static boolean isNumericDictCandidate(int type) {
+        return type == Value.TINYINT
+                || type == Value.SMALLINT
+                || type == Value.INTEGER
+                || type == Value.BIGINT
+                || type == Value.REAL
+                || type == Value.DOUBLE;
     }
 
     public int getSegmentId() {
