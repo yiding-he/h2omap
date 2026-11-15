@@ -561,10 +561,16 @@ public final class ColumnarStore {
     public long[] collectVisibleRowIds(Value[] lower, Value[] upper, boolean reverse) {
         lock.readLock().lock();
         try {
-            long[] result = new long[(int) Math.min(rowCount, Integer.MAX_VALUE)];
+            // rowCount 是估计值，恢复后的 delta 可能让它与迭代器可见行数不一致，
+            // 所以按估计值起步并在超出时扩容，不能假定两者相等。
+            int initial = (int) Math.min(Math.max(rowCount, 16), 1 << 24);
+            long[] result = new long[initial];
             int p = 0;
             RowIterator iterator = rowIterator(lower, upper, reverse);
             for (long rowId; (rowId = iterator.next()) >= 0; ) {
+                if (p == result.length) {
+                    result = Arrays.copyOf(result, (int) Math.min((long) result.length * 2, Integer.MAX_VALUE));
+                }
                 result[p++] = rowId;
             }
             return Arrays.copyOf(result, p);
@@ -839,9 +845,11 @@ public final class ColumnarStore {
                     continue;
                 }
                 int count = countOf(open, segment);
+                boolean hasDelta = !open && delta.hasSegmentDelta(segmentId);
                 while (offset < count) {
                     long rowId = RowId.ofSegment(segmentId, offset);
-                    boolean deleted = open ? openDeletes.contains(rowId) : segment.isDeleted(offset);
+                    boolean deleted = open ? openDeletes.contains(rowId)
+                            : segment.isDeleted(offset) || (hasDelta && delta.isSegmentRowDeleted(rowId));
                     offset++;
                     if (!deleted) {
                         return rowId;
@@ -871,7 +879,9 @@ public final class ColumnarStore {
                 }
                 while (offset >= 0) {
                     long rowId = RowId.ofSegment(segmentId, offset);
-                    boolean deleted = open ? openDeletes.contains(rowId) : segment.isDeleted(offset);
+                    boolean deleted = open ? openDeletes.contains(rowId)
+                            : segment.isDeleted(offset)
+                                    || (delta.hasSegmentDelta(segmentId) && delta.isSegmentRowDeleted(rowId));
                     offset--;
                     if (!deleted) {
                         return rowId;

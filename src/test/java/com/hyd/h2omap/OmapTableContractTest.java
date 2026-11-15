@@ -618,6 +618,29 @@ class OmapTableContractTest {
         }
     }
 
+    /**
+     * 段冻结后被删除的行只存在 delta 里，重开数据库时索引回填必须跳过它们：
+     * 回填越界会让主键索引静默丢失，之后重复主键就不再被拒绝。
+     */
+    @Test
+    void primaryKeySurvivesRestartAfterDeletingFrozenRows(@TempDir Path dir) throws SQLException {
+        String url = "jdbc:h2:" + dir.resolve("restartpkdel");
+        try (Connection first = DriverManager.getConnection(url, "sa", "")) {
+            try (Statement s = first.createStatement()) {
+                s.execute(createTable("T", "ID INT PRIMARY KEY, NAME VARCHAR", "\"segmentSize=2\""));
+                s.execute("INSERT INTO T VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')");
+                s.execute("DELETE FROM T WHERE ID IN (1, 3)");
+            }
+        }
+        try (Connection second = DriverManager.getConnection(url, "sa", "")) {
+            try (Statement s = second.createStatement()) {
+                assertEquals("3", toString(s, "SELECT COUNT(*) FROM T"));
+                assertEquals("2/b", toString(s, "SELECT ID || '/' || NAME FROM T WHERE ID = 2"));
+                assertThrows(SQLException.class, () -> s.execute("INSERT INTO T VALUES (2, 'dup')"));
+            }
+        }
+    }
+
     @Test
     void scalarSubqueryReusesResultAndInvalidatesOnWrite() throws SQLException {
         execute(createTable("T", "ID INT PRIMARY KEY, V INT", null));

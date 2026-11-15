@@ -3,6 +3,7 @@
  */
 package com.hyd.h2omap.storage;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
@@ -224,5 +225,29 @@ class ColumnarStoreTest {
         long[] reversed = store.collectVisibleRowIds(true);
         assertEquals(Arrays.asList(r4, r3, r2, r1, r0),
                 Arrays.asList(reversed[0], reversed[1], reversed[2], reversed[3], reversed[4]));
+    }
+
+    /** 已冻结段内被 delta 删除的行不得计入 rowId 收集结果，且与批量迭代器一致。 */
+    @Test
+    void collectVisibleRowIdsSkipsRowsDeletedFromFrozenSegments() {
+        ColumnarStore store = newStore(2);
+        long r0 = store.append(row(1, "a"));
+        long r1 = store.append(row(2, "b"));
+        long r2 = store.append(row(3, "c"));
+        assertEquals(1, store.segments().size());
+        store.remove(r0);
+
+        long[] ids = store.collectVisibleRowIds(false);
+        assertEquals(Arrays.asList(r1, r2), Arrays.asList(ids[0], ids[1]));
+
+        List<Long> viaBatch = new ArrayList<>();
+        ColumnarStore.RowIterator iterator = store.rowIterator(null, null, false);
+        Row[] buffer = new Row[8];
+        for (int n; (n = iterator.nextBatch(store, buffer)) > 0; ) {
+            for (int i = 0; i < n; i++) {
+                viaBatch.add(buffer[i].getKey());
+            }
+        }
+        assertEquals(viaBatch, Arrays.asList(ids[0], ids[1]));
     }
 }
