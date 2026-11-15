@@ -11,6 +11,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -360,6 +361,118 @@ class OmapTableContractTest {
             stop.countDown();
             writer.join();
         }
+        assertTrue(failures.isEmpty(), String.join("; ", failures));
+    }
+
+    /**
+     * 多线程并发扫描查询与高频写入/合并（Copy-On-Compact）并行：
+     * 验证各读线程互不干扰、无异常，且同一行内不同列不会发生跨版本撕裂。
+     */
+    @Test
+    void concurrentScanQueriesWithCompaction() throws Exception {
+        execute(createTable("T", "ID INT PRIMARY KEY, CAT VARCHAR, VAL INT",
+                "\"segmentSize=50\", \"compactionMinRows=20\""));
+        try (PreparedStatement ps = conn.prepareStatement("INSERT INTO T VALUES (?, ?, ?)")) {
+            for (int i = 1; i <= 2000; i++) {
+                ps.setInt(1, i);
+                ps.setString(2, "C0");
+                ps.setInt(3, i);
+                ps.addBatch();
+            }
+            ps.executeBatch();
+        }
+
+        int readerCount = 4;
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch stopWriter = new CountDownLatch(1);
+        List<String> failures = Collections.synchronizedList(new ArrayList<>());
+
+        Thread writer = new Thread(() -> {
+            try (Connection c = DriverManager.getConnection("jdbc:h2:" + dbName, "sa", "");
+                    PreparedStatement upd = c.prepareStatement(
+                            "UPDATE T SET CAT = ?, VAL = ? WHERE ID = ?");
+                    Statement s = c.createStatement()) {
+                start.await();
+                for (int round = 1; round <= 40 && stopWriter.getCount() > 0; round++) {
+                    String cat = "C" + (round % 5);
+                    for (int id = 1; id <= 30; id++) {
+                        upd.setString(1, cat);
+                        upd.setInt(2, round * 100000 + id);
+                        upd.setInt(3, id);
+                        upd.addBatch();
+                    }
+                    upd.executeBatch();
+                    s.execute("INSERT INTO T VALUES (" + (2000 + round) + ", '" + cat + "', "
+                            + (round * 100000 + 2000 + round) + ")");
+                    s.execute("DELETE FROM T WHERE ID = " + (2000 + round));
+                }
+            } catch (Exception e) {
+                failures.add("writer: " + e.getMessage());
+            }
+        });
+
+        List<Thread> readers = new ArrayList<>();
+        for (int r = 0; r < readerCount; r++) {
+            final int readerId = r;
+            Thread reader = new Thread(() -> {
+                try (Connection c = DriverManager.getConnection("jdbc:h2:" + dbName, "sa", "");
+                        Statement s = c.createStatement()) {
+                    start.await();
+                    for (int iter = 0; iter < 30; iter++) {
+                        if (readerId == 0) {
+                            try (ResultSet rs = s.executeQuery(
+                                    "SELECT ID, CAT, VAL FROM T WHERE VAL >= 0 ORDER BY ID DESC")) {
+                                while (rs.next()) {
+                                    int id = rs.getInt(1);
+                                    String cat = rs.getString(2);
+                                    int val = rs.getInt(3);
+                                    int version = val / 100000;
+                                    int encodedId = val % 100000;
+                                    if (encodedId != id || !("C" + (version % 5)).equals(cat)) {
+                                        failures.add("row tear id=" + id + " cat=" + cat + " val=" + val);
+                                        break;
+                                    }
+                                }
+                            }
+                        } else if (readerId == 1) {
+                            try (ResultSet rs = s.executeQuery(
+                                    "SELECT COUNT(*), SUM(VAL) FROM T WHERE CAT = 'C0' AND VAL > 0")) {
+                                assertTrue(rs.next());
+                                assertTrue(rs.getLong(1) >= 0);
+                            }
+                        } else if (readerId == 2) {
+                            try (ResultSet rs = s.executeQuery(
+                                    "SELECT CAT, COUNT(*) FROM T GROUP BY CAT ORDER BY CAT")) {
+                                long total = 0;
+                                while (rs.next()) {
+                                    total += rs.getLong(2);
+                                }
+                                assertTrue(total >= 2000);
+                            }
+                        } else {
+                            try (ResultSet rs = s.executeQuery(
+                                    "SELECT COUNT(*) FROM T WHERE CAT IN ('C0', 'C1', 'C2', 'C3', 'C4')")) {
+                                assertTrue(rs.next());
+                                assertTrue(rs.getLong(1) >= 2000);
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    failures.add("reader-" + readerId + ": " + e.getMessage());
+                }
+            });
+            readers.add(reader);
+            reader.start();
+        }
+
+        writer.start();
+        start.countDown();
+        for (Thread reader : readers) {
+            reader.join();
+        }
+        stopWriter.countDown();
+        writer.join();
+
         assertTrue(failures.isEmpty(), String.join("; ", failures));
     }
 
