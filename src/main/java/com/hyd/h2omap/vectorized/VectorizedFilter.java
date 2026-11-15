@@ -16,6 +16,7 @@ import org.h2.expression.ExpressionColumn;
 import org.h2.expression.H2ExpressionAccess;
 import org.h2.expression.Operation1;
 import org.h2.expression.ValueExpression;
+import org.h2.expression.condition.CompareLike;
 import org.h2.expression.condition.Comparison;
 import org.h2.expression.condition.ConditionAndOr;
 import org.h2.expression.condition.ConditionAndOrN;
@@ -29,6 +30,7 @@ import org.h2.value.CompareMode;
 import org.h2.value.Value;
 import org.h2.value.ValueArray;
 import org.h2.value.ValueNull;
+import org.h2.value.ValueTimestamp;
 
 import com.hyd.h2omap.stats.ZoneMap;
 import com.hyd.h2omap.storage.ColumnSegment;
@@ -39,6 +41,8 @@ import com.hyd.h2omap.vector.DoubleVector;
 import com.hyd.h2omap.vector.IntVector;
 import com.hyd.h2omap.vector.LongVector;
 import com.hyd.h2omap.vector.NullBitmap;
+import com.hyd.h2omap.vector.TimestampVector;
+import com.hyd.h2omap.vector.VarcharVector;
 
 /**
  * 将 H2 单表过滤条件编译为可在 {@link ColumnSegment} 原始数组上运行的向量化过滤树。
@@ -192,7 +196,68 @@ public final class VectorizedFilter {
             }
             return new InNode(col, H2ConditionAccess.isInNot(expr), vals);
         }
+        if (expr instanceof CompareLike) {
+            return compileLike((CompareLike) expr, filter, session);
+        }
         return null;
+    }
+
+    private static Node compileLike(CompareLike like, TableFilter filter, SessionLocal session) {
+        if (like.isWhenConditionOperand() || like.getSubexpressionCount() > 3) {
+            return null;
+        }
+        Expression left = like.getSubexpression(0);
+        int col = resolveColumn(left, filter);
+        if (col < 0) {
+            return null;
+        }
+        int colType = filter.getTable().getColumn(col).getType().getValueType();
+        if (colType != Value.VARCHAR && colType != Value.CHAR) {
+            return null;
+        }
+        Expression right = like.getSubexpression(1);
+        if (!right.isConstant()) {
+            return null;
+        }
+        Value patVal = right.getValue(session);
+        if (patVal == null || patVal == ValueNull.INSTANCE) {
+            return null;
+        }
+        char escapeChar = '\\';
+        if (like.getSubexpressionCount() == 3) {
+            Expression escExpr = like.getSubexpression(2);
+            if (!escExpr.isConstant()) {
+                return null;
+            }
+            Value escVal = escExpr.getValue(session);
+            if (escVal == null || escVal == ValueNull.INSTANCE) {
+                return null;
+            }
+            String escStr = escVal.getString();
+            escapeChar = escStr.isEmpty() ? (char) 0 : escStr.charAt(0);
+        } else {
+            String defEsc = session.getDatabase().getSettings().defaultEscape;
+            escapeChar = (defEsc == null || defEsc.isEmpty()) ? (char) 0 : defEsc.charAt(0);
+        }
+        String leftSql = left.getUnenclosedSQL(new StringBuilder(), 0).toString();
+        String fullSql = like.getUnenclosedSQL(new StringBuilder(), 0).toString();
+        String opPart = fullSql.length() > leftSql.length() ? fullSql.substring(leftSql.length()) : "";
+        boolean negate;
+        if (opPart.startsWith(" NOT LIKE ")) {
+            negate = true;
+        } else if (opPart.startsWith(" LIKE ")) {
+            negate = false;
+        } else {
+            // ILIKE / REGEXP 等其他形态交回 H2 原路径
+            return null;
+        }
+        String pattern = patVal.getString();
+        try {
+            like.test(pattern, "", escapeChar);
+        } catch (RuntimeException e) {
+            return null;
+        }
+        return new LikeNode(col, like, pattern, escapeChar, negate);
     }
 
     private static boolean collectAndNodes(Expression expr, TableFilter filter,
@@ -472,6 +537,9 @@ public final class VectorizedFilter {
             if (vec instanceof DoubleVector) {
                 return filterDouble((DoubleVector) vec, sel, selCount, fullRange);
             }
+            if (vec instanceof TimestampVector) {
+                return filterTimestamp((TimestampVector) vec, sel, selCount, fullRange);
+            }
             if (vec instanceof DictVarcharVector) {
                 DictVarcharVector dv = (DictVarcharVector) vec;
                 return filterDict(dv.rawCodes(), dv.rawDict(), dv.dictSize(), sel, selCount, fullRange,
@@ -667,6 +735,64 @@ public final class VectorizedFilter {
 
         private boolean matchDouble(double v, double target) {
             int cmp = Double.compare(v, target);
+            return matchCompare(cmp, cmpType);
+        }
+
+        private int filterTimestamp(TimestampVector vec, int[] sel, int selCount, boolean fullRange) {
+            if (!(constant instanceof ValueTimestamp)) {
+                return filterGeneric(vec, sel, selCount, fullRange, null, null);
+            }
+            ValueTimestamp ts = (ValueTimestamp) constant;
+            long targetDate = ts.getDateValue();
+            long targetNanos = ts.getTimeNanos();
+            long[] dates = vec.rawDateValues();
+            long[] nanos = vec.rawTimeNanos();
+            NullBitmap nulls = vec.nulls();
+            boolean hasNull = nulls.hasNull();
+            int out = 0;
+            if (fullRange) {
+                if (!hasNull) {
+                    for (int i = 0; i < selCount; i++) {
+                        if (matchTimestamp(dates[i], nanos[i], targetDate, targetNanos)) {
+                            sel[out++] = i;
+                        }
+                    }
+                } else {
+                    long[] bits = nulls.rawBits();
+                    for (int i = 0; i < selCount; i++) {
+                        if ((bits[i >>> 6] & (1L << i)) == 0
+                                && matchTimestamp(dates[i], nanos[i], targetDate, targetNanos)) {
+                            sel[out++] = i;
+                        }
+                    }
+                }
+            } else {
+                if (!hasNull) {
+                    for (int i = 0; i < selCount; i++) {
+                        int idx = sel[i];
+                        if (matchTimestamp(dates[idx], nanos[idx], targetDate, targetNanos)) {
+                            sel[out++] = idx;
+                        }
+                    }
+                } else {
+                    long[] bits = nulls.rawBits();
+                    for (int i = 0; i < selCount; i++) {
+                        int idx = sel[i];
+                        if ((bits[idx >>> 6] & (1L << idx)) == 0
+                                && matchTimestamp(dates[idx], nanos[idx], targetDate, targetNanos)) {
+                            sel[out++] = idx;
+                        }
+                    }
+                }
+            }
+            return out;
+        }
+
+        private boolean matchTimestamp(long d, long n, long targetDate, long targetNanos) {
+            int cmp = Long.compare(d, targetDate);
+            if (cmp == 0) {
+                cmp = Long.compare(n, targetNanos);
+            }
             return matchCompare(cmp, cmpType);
         }
 
@@ -991,6 +1117,115 @@ public final class VectorizedFilter {
         public boolean evalRow(Value[] row, SessionLocal session, CompareMode compareMode) {
             Value v = row[col];
             return v != ValueNull.INSTANCE && matchCard(v);
+        }
+    }
+
+    private static final class LikeNode implements Node {
+        private final int col;
+        private final CompareLike like;
+        private final String pattern;
+        private final char escapeChar;
+        private final boolean negate;
+
+        LikeNode(int col, CompareLike like, String pattern, char escapeChar, boolean negate) {
+            this.col = col;
+            this.like = like;
+            this.pattern = pattern;
+            this.escapeChar = escapeChar;
+            this.negate = negate;
+        }
+
+        private boolean matchString(String s) {
+            return like.test(pattern, s, escapeChar) ^ negate;
+        }
+
+        @Override
+        public int filterSegment(ColumnSegment segment, int[] sel, int selCount, boolean fullRange,
+                BitSet masked, SessionLocal session, CompareMode compareMode) {
+            ColumnVector vec = segment.getColumn(col);
+            int out = 0;
+            if (vec instanceof DictVarcharVector) {
+                DictVarcharVector dv = (DictVarcharVector) vec;
+                int dictSize = dv.dictSize();
+                Value[] dict = dv.rawDict();
+                boolean[] dictMatched = new boolean[dictSize];
+                synchronized (like) {
+                    for (int d = 0; d < dictSize; d++) {
+                        dictMatched[d] = matchString(dict[d].getString());
+                    }
+                }
+                int[] codes = dv.rawCodes();
+                if (fullRange) {
+                    for (int i = 0; i < selCount; i++) {
+                        int c = codes[i];
+                        if (c >= 0 && dictMatched[c]) {
+                            sel[out++] = i;
+                        }
+                    }
+                } else {
+                    for (int i = 0; i < selCount; i++) {
+                        int idx = sel[i];
+                        int c = codes[idx];
+                        if (c >= 0 && dictMatched[c]) {
+                            sel[out++] = idx;
+                        }
+                    }
+                }
+                return out;
+            }
+            if (vec instanceof VarcharVector) {
+                VarcharVector vv = (VarcharVector) vec;
+                String[] vals = vv.rawValues();
+                NullBitmap nulls = vv.nulls();
+                boolean hasNull = nulls.hasNull();
+                synchronized (like) {
+                    if (fullRange) {
+                        for (int i = 0; i < selCount; i++) {
+                            if ((!hasNull || !nulls.isNull(i)) && vals[i] != null && matchString(vals[i])) {
+                                sel[out++] = i;
+                            }
+                        }
+                    } else {
+                        for (int i = 0; i < selCount; i++) {
+                            int idx = sel[i];
+                            if ((!hasNull || !nulls.isNull(idx)) && vals[idx] != null && matchString(vals[idx])) {
+                                sel[out++] = idx;
+                            }
+                        }
+                    }
+                }
+                return out;
+            }
+            synchronized (like) {
+                if (fullRange) {
+                    for (int i = 0; i < selCount; i++) {
+                        Value v = vec.get(i);
+                        if (v != ValueNull.INSTANCE && matchString(v.getString())) {
+                            sel[out++] = i;
+                        }
+                    }
+                } else {
+                    for (int i = 0; i < selCount; i++) {
+                        int idx = sel[i];
+                        Value v = vec.get(idx);
+                        if (v != ValueNull.INSTANCE && matchString(v.getString())) {
+                            sel[out++] = idx;
+                        }
+                    }
+                }
+            }
+            return out;
+        }
+
+        @Override
+        public boolean evalRow(Value[] row, SessionLocal session, CompareMode compareMode) {
+            Value v = row[col];
+            if (v == ValueNull.INSTANCE) {
+                return false;
+            }
+            synchronized (like) {
+                return matchString(v.getString());
+            }
         }
     }
 }

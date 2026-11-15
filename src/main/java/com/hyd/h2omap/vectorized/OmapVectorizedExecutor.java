@@ -9,12 +9,16 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.h2.engine.SessionLocal;
+import org.h2.expression.BinaryOperation;
 import org.h2.expression.Expression;
 import org.h2.expression.ExpressionColumn;
+import org.h2.expression.H2ExpressionAccess;
 import org.h2.expression.aggregate.Aggregate;
 import org.h2.expression.aggregate.AggregateType;
 import org.h2.expression.aggregate.H2AggregateAccess;
@@ -33,6 +37,7 @@ import org.h2.value.ValueDouble;
 import org.h2.value.ValueNull;
 import org.h2.value.ValueNumeric;
 
+import com.hyd.h2omap.index.OmapScanIndex;
 import com.hyd.h2omap.storage.ColumnSegment;
 import com.hyd.h2omap.storage.ColumnarStore;
 import com.hyd.h2omap.table.OmapTable;
@@ -54,6 +59,166 @@ import com.hyd.h2omap.vector.NullBitmap;
 public final class OmapVectorizedExecutor {
 
     private OmapVectorizedExecutor() {
+    }
+
+    public static boolean tryExecuteFlat(
+            SessionLocal session,
+            TableFilter tableFilter,
+            Expression condition,
+            List<Expression> expressions,
+            int resultColumnCount,
+            long maxRows,
+            LocalResult result) {
+        if (!(tableFilter.getTable() instanceof OmapTable)) {
+            return false;
+        }
+        // 主键/唯一索引点查或范围查找走 OmapRowIdIndex 更快，不走全表向量化扫描
+        if (tableFilter.getIndex() != null && !(tableFilter.getIndex() instanceof OmapScanIndex)) {
+            return false;
+        }
+        if (expressions == null || expressions.isEmpty()) {
+            return false;
+        }
+
+        int outLen = Math.max(resultColumnCount, expressions.size());
+        int[] projCols = new int[outLen];
+        Value[] projConsts = new Value[outLen];
+        for (int i = 0; i < outLen; i++) {
+            Expression e = i < expressions.size() ? expressions.get(i) : null;
+            if (e == null) {
+                projCols[i] = -1;
+                projConsts[i] = ValueNull.INSTANCE;
+                continue;
+            }
+            if (e instanceof ExpressionColumn) {
+                ExpressionColumn ec = (ExpressionColumn) e;
+                if (ec.getTableFilter() != tableFilter) {
+                    return false;
+                }
+                projCols[i] = ec.getColumn().getColumnId();
+            } else if (e.isConstant()) {
+                projCols[i] = -1;
+                projConsts[i] = e.getValue(session);
+            } else {
+                return false;
+            }
+        }
+
+        VectorizedFilter filter = null;
+        if (condition != null) {
+            filter = VectorizedFilter.compile(condition, tableFilter, session);
+            if (filter == null) {
+                return false;
+            }
+        }
+
+        if (maxRows == 0) {
+            return true;
+        }
+
+        OmapTable table = (OmapTable) tableFilter.getTable();
+        ColumnarStore.VectorizedSnapshot snap = table.getStore().takeVectorizedSnapshot();
+        CompareMode compareMode = table.getCompareMode();
+        long emitted = 0;
+
+        // 统计被引用到的非重复列，只物化这些列向量
+        int[] uniqueProjCols = new int[outLen];
+        int uniqueCount = 0;
+        int[] projToUnique = new int[outLen];
+        for (int i = 0; i < outLen; i++) {
+            int col = projCols[i];
+            if (col < 0) {
+                projToUnique[i] = -1;
+                continue;
+            }
+            int found = -1;
+            for (int u = 0; u < uniqueCount; u++) {
+                if (uniqueProjCols[u] == col) {
+                    found = u;
+                    break;
+                }
+            }
+            if (found < 0) {
+                found = uniqueCount;
+                uniqueProjCols[uniqueCount++] = col;
+            }
+            projToUnique[i] = found;
+        }
+        ColumnVector[] colVecs = new ColumnVector[uniqueCount];
+
+        int[] sel = null;
+        for (ColumnSegment seg : snap.segments) {
+            int rowCount = seg.getRowCount();
+            if (rowCount == 0) {
+                continue;
+            }
+            BitSet masked = snap.maskedBySegment.get(seg.getSegmentId());
+            if (masked != null && masked.cardinality() >= rowCount) {
+                continue;
+            }
+
+            if (filter == null) {
+                for (int u = 0; u < uniqueCount; u++) {
+                    colVecs[u] = seg.getColumn(uniqueProjCols[u]);
+                }
+                for (int i = 0; i < rowCount; i++) {
+                    if (masked != null && masked.get(i)) {
+                        continue;
+                    }
+                    Value[] row = new Value[outLen];
+                    for (int c = 0; c < outLen; c++) {
+                        int u = projToUnique[c];
+                        row[c] = u >= 0 ? colVecs[u].get(i) : projConsts[c];
+                    }
+                    result.addRow(row);
+                    emitted++;
+                    if (maxRows > 0 && emitted >= maxRows) {
+                        return true;
+                    }
+                }
+                continue;
+            }
+
+            if (sel == null || sel.length < rowCount) {
+                sel = new int[rowCount];
+            }
+            int selCount = filter.filterSegment(seg, sel, masked, session, compareMode);
+            if (selCount == 0) {
+                continue;
+            }
+            for (int u = 0; u < uniqueCount; u++) {
+                colVecs[u] = seg.getColumn(uniqueProjCols[u]);
+            }
+            for (int k = 0; k < selCount; k++) {
+                int idx = sel[k];
+                Value[] row = new Value[outLen];
+                for (int c = 0; c < outLen; c++) {
+                    int u = projToUnique[c];
+                    row[c] = u >= 0 ? colVecs[u].get(idx) : projConsts[c];
+                }
+                result.addRow(row);
+                emitted++;
+                if (maxRows > 0 && emitted >= maxRows) {
+                    return true;
+                }
+            }
+        }
+
+        for (Value[] srcRow : snap.extraRows) {
+            if (filter == null || filter.evalRow(srcRow, session, compareMode)) {
+                Value[] row = new Value[outLen];
+                for (int c = 0; c < outLen; c++) {
+                    int col = projCols[c];
+                    row[c] = col >= 0 ? srcRow[col] : projConsts[c];
+                }
+                result.addRow(row);
+                emitted++;
+                if (maxRows > 0 && emitted >= maxRows) {
+                    return true;
+                }
+            }
+        }
+        return true;
     }
 
     public static boolean tryExecuteGroup(
@@ -114,10 +279,7 @@ public final class OmapVectorizedExecutor {
                 return false;
             }
             Aggregate agg = (Aggregate) expr;
-            if (agg.isDistinct()) {
-                return false;
-            }
-            AggSpec spec = parseAggregate(agg, tableFilter, i);
+            AggSpec spec = parseAggregate(agg, tableFilter, i, session);
             if (spec == null) {
                 return false;
             }
@@ -160,12 +322,13 @@ public final class OmapVectorizedExecutor {
         return expressions.size() > resultColumnCount + expectedExtra;
     }
 
-    private static AggSpec parseAggregate(Aggregate agg, TableFilter filter, int outIdx) {
+    private static AggSpec parseAggregate(Aggregate agg, TableFilter filter, int outIdx, SessionLocal session) {
         AggregateType type = agg.getAggregateType();
         Expression[] args = H2AggregateAccess.getArgs(agg);
+        boolean distinct = agg.isDistinct();
         switch (type) {
         case COUNT_ALL:
-            return new AggSpec(type, -1, outIdx, agg.getType());
+            return distinct ? null : new AggSpec(type, -1, outIdx, agg.getType(), false);
         case AVG: {
             int rt = agg.getType().getValueType();
             if (rt != Value.DOUBLE && rt != Value.NUMERIC) {
@@ -176,22 +339,82 @@ public final class OmapVectorizedExecutor {
         case COUNT:
         case SUM:
         case MIN:
-        case MAX:
+        case MAX: {
+            if (distinct && type != AggregateType.COUNT) {
+                return null;
+            }
             if (args.length != 1) {
                 return null;
             }
             Expression arg = args[0].getNonAliasExpression();
-            if (!(arg instanceof ExpressionColumn)) {
-                return null;
+            if (arg instanceof ExpressionColumn) {
+                ExpressionColumn ec = (ExpressionColumn) arg;
+                if (ec.getTableFilter() != filter) {
+                    return null;
+                }
+                return new AggSpec(type, ec.getColumn().getColumnId(), outIdx, agg.getType(), distinct);
             }
-            ExpressionColumn ec = (ExpressionColumn) arg;
-            if (ec.getTableFilter() != filter) {
-                return null;
+            if (!distinct && arg instanceof BinaryOperation) {
+                return parseArithAggregate(type, (BinaryOperation) arg, filter, outIdx, agg.getType(), session);
             }
-            return new AggSpec(type, ec.getColumn().getColumnId(), outIdx, agg.getType());
+            return null;
+        }
         default:
             return null;
         }
+    }
+
+    private static AggSpec parseArithAggregate(AggregateType type, BinaryOperation bin, TableFilter filter,
+            int outIdx, TypeInfo resultType, SessionLocal session) {
+        BinaryOperation.OpType op = bin.getOperationType();
+        if (op != BinaryOperation.OpType.PLUS
+                && op != BinaryOperation.OpType.MINUS
+                && op != BinaryOperation.OpType.MULTIPLY) {
+            return null;
+        }
+        Expression left = H2ExpressionAccess.getLeft(bin);
+        Expression right = H2ExpressionAccess.getRight(bin);
+        if (left instanceof ExpressionColumn && right.isConstant()) {
+            ExpressionColumn ec = (ExpressionColumn) left;
+            if (ec.getTableFilter() != filter || !isNumericType(ec.getType().getValueType())) {
+                return null;
+            }
+            Value c = right.getValue(session);
+            if (c == null || c == ValueNull.INSTANCE || !isNumericType(c.getValueType())) {
+                return null;
+            }
+            return new AggSpec(type, ec.getColumn().getColumnId(), -1, op, true, c, outIdx, resultType);
+        }
+        if (right instanceof ExpressionColumn && left.isConstant()) {
+            ExpressionColumn ec = (ExpressionColumn) right;
+            if (ec.getTableFilter() != filter || !isNumericType(ec.getType().getValueType())) {
+                return null;
+            }
+            Value c = left.getValue(session);
+            if (c == null || c == ValueNull.INSTANCE || !isNumericType(c.getValueType())) {
+                return null;
+            }
+            return new AggSpec(type, ec.getColumn().getColumnId(), -1, op, false, c, outIdx, resultType);
+        }
+        if (left instanceof ExpressionColumn && right instanceof ExpressionColumn) {
+            ExpressionColumn lc = (ExpressionColumn) left;
+            ExpressionColumn rc = (ExpressionColumn) right;
+            if (lc.getTableFilter() != filter || rc.getTableFilter() != filter) {
+                return null;
+            }
+            if (!isNumericType(lc.getType().getValueType()) || !isNumericType(rc.getType().getValueType())) {
+                return null;
+            }
+            return new AggSpec(type, lc.getColumn().getColumnId(), rc.getColumn().getColumnId(),
+                    op, true, null, outIdx, resultType);
+        }
+        return null;
+    }
+
+    private static boolean isNumericType(int valueType) {
+        return valueType == Value.TINYINT || valueType == Value.SMALLINT
+                || valueType == Value.INTEGER || valueType == Value.BIGINT
+                || valueType == Value.REAL || valueType == Value.DOUBLE;
     }
 
     private static void executeGlobal(
@@ -585,14 +808,47 @@ public final class OmapVectorizedExecutor {
     private static final class AggSpec {
         final AggregateType type;
         final int col;
+        final int rightCol;
+        final BinaryOperation.OpType arithOp;
+        final boolean colOnLeft;
+        final Value arithConst;
         final int outIdx;
         final TypeInfo resultType;
+        final boolean distinct;
 
-        AggSpec(AggregateType type, int col, int outIdx, TypeInfo resultType) {
+        AggSpec(AggregateType type, int col, int outIdx, TypeInfo resultType, boolean distinct) {
+            this(type, col, -1, null, true, null, outIdx, resultType, distinct);
+        }
+
+        AggSpec(AggregateType type, int col, int rightCol, BinaryOperation.OpType arithOp,
+                boolean colOnLeft, Value arithConst, int outIdx, TypeInfo resultType) {
+            this(type, col, rightCol, arithOp, colOnLeft, arithConst, outIdx, resultType, false);
+        }
+
+        private AggSpec(AggregateType type, int col, int rightCol, BinaryOperation.OpType arithOp,
+                boolean colOnLeft, Value arithConst, int outIdx, TypeInfo resultType, boolean distinct) {
             this.type = type;
             this.col = col;
+            this.rightCol = rightCol;
+            this.arithOp = arithOp;
+            this.colOnLeft = colOnLeft;
+            this.arithConst = arithConst;
             this.outIdx = outIdx;
             this.resultType = resultType;
+            this.distinct = distinct;
+        }
+
+        boolean sameKey(AggSpec other) {
+            if (type != other.type || col != other.col || rightCol != other.rightCol
+                    || arithOp != other.arithOp || colOnLeft != other.colOnLeft
+                    || distinct != other.distinct
+                    || resultType.getValueType() != other.resultType.getValueType()) {
+                return false;
+            }
+            if (arithConst == null && other.arithConst == null) {
+                return true;
+            }
+            return arithConst != null && arithConst.equals(other.arithConst);
         }
     }
 
@@ -604,6 +860,7 @@ public final class OmapVectorizedExecutor {
         BigDecimal decimalSum;
         boolean hasValue;
         Value bestVal;
+        Set<Value> distinctSet;
 
         AggState(AggSpec spec) {
             this.spec = spec;
@@ -613,6 +870,14 @@ public final class OmapVectorizedExecutor {
                 SessionLocal session, CompareMode compareMode) {
             if (spec.type == AggregateType.COUNT_ALL) {
                 count += segCount;
+                return;
+            }
+            if (spec.distinct) {
+                accumulateDistinctSegment(seg, null, segCount, true);
+                return;
+            }
+            if (spec.arithOp != null) {
+                accumulateArithSegment(seg, null, segCount, true, session, compareMode);
                 return;
             }
             ColumnVector vec = seg.getColumn(spec.col);
@@ -700,6 +965,14 @@ public final class OmapVectorizedExecutor {
                 count += selCount;
                 return;
             }
+            if (spec.distinct) {
+                accumulateDistinctSegment(seg, sel, selCount, false);
+                return;
+            }
+            if (spec.arithOp != null) {
+                accumulateArithSegment(seg, sel, selCount, false, session, compareMode);
+                return;
+            }
             ColumnVector vec = seg.getColumn(spec.col);
             if (spec.type == AggregateType.COUNT) {
                 NullBitmap nulls = vec.nulls();
@@ -781,9 +1054,243 @@ public final class OmapVectorizedExecutor {
             }
         }
 
+        private void accumulateDistinctSegment(ColumnSegment seg, int[] sel, int selCount, boolean full) {
+            if (distinctSet == null) {
+                distinctSet = new HashSet<>();
+            }
+            ColumnVector vec = seg.getColumn(spec.col);
+            if (vec instanceof DictVarcharVector) {
+                DictVarcharVector dv = (DictVarcharVector) vec;
+                int dictSize = dv.dictSize();
+                boolean[] seen = new boolean[dictSize];
+                int[] codes = dv.rawCodes();
+                if (full) {
+                    for (int i = 0; i < selCount; i++) {
+                        int c = codes[i];
+                        if (c >= 0) {
+                            seen[c] = true;
+                        }
+                    }
+                } else {
+                    for (int i = 0; i < selCount; i++) {
+                        int c = codes[sel[i]];
+                        if (c >= 0) {
+                            seen[c] = true;
+                        }
+                    }
+                }
+                Value[] dict = dv.rawDict();
+                for (int d = 0; d < dictSize; d++) {
+                    if (seen[d]) {
+                        distinctSet.add(dict[d]);
+                    }
+                }
+                return;
+            }
+            if (vec instanceof DictValueVector) {
+                DictValueVector dv = (DictValueVector) vec;
+                int dictSize = dv.dictSize();
+                boolean[] seen = new boolean[dictSize];
+                int[] codes = dv.rawCodes();
+                if (full) {
+                    for (int i = 0; i < selCount; i++) {
+                        int c = codes[i];
+                        if (c >= 0) {
+                            seen[c] = true;
+                        }
+                    }
+                } else {
+                    for (int i = 0; i < selCount; i++) {
+                        int c = codes[sel[i]];
+                        if (c >= 0) {
+                            seen[c] = true;
+                        }
+                    }
+                }
+                Value[] dict = dv.rawDict();
+                for (int d = 0; d < dictSize; d++) {
+                    if (seen[d]) {
+                        distinctSet.add(dict[d]);
+                    }
+                }
+                return;
+            }
+            NullBitmap nulls = vec.nulls();
+            boolean hasNull = nulls.hasNull();
+            if (full) {
+                for (int i = 0; i < selCount; i++) {
+                    if (!hasNull || !nulls.isNull(i)) {
+                        distinctSet.add(vec.get(i));
+                    }
+                }
+            } else {
+                for (int i = 0; i < selCount; i++) {
+                    int idx = sel[i];
+                    if (!hasNull || !nulls.isNull(idx)) {
+                        distinctSet.add(vec.get(idx));
+                    }
+                }
+            }
+        }
+
+        private void accumulateArithSegment(ColumnSegment seg, int[] sel, int selCount, boolean full,
+                SessionLocal session, CompareMode compareMode) {
+            ColumnVector leftVec = seg.getColumn(spec.col);
+            ColumnVector rightVec = spec.rightCol >= 0 ? seg.getColumn(spec.rightCol) : null;
+            int rt = spec.resultType.getValueType();
+            if ((spec.type == AggregateType.SUM || spec.type == AggregateType.AVG)
+                    && rightVec == null && rt == Value.BIGINT && leftVec instanceof IntVector) {
+                IntVector iv = (IntVector) leftVec;
+                int[] vals = iv.rawValues();
+                NullBitmap nulls = iv.nulls();
+                boolean hasNull = nulls.hasNull();
+                long c = spec.arithConst.getLong();
+                long s = 0;
+                long cnt = 0;
+                for (int i = 0; i < selCount; i++) {
+                    int idx = full ? i : sel[i];
+                    if (!hasNull || !nulls.isNull(idx)) {
+                        s += evalLongOp(vals[idx], c);
+                        cnt++;
+                    }
+                }
+                longSum += s;
+                count += cnt;
+                if (cnt > 0) {
+                    hasValue = true;
+                }
+                return;
+            }
+            if ((spec.type == AggregateType.SUM || spec.type == AggregateType.AVG)
+                    && rightVec == null && rt == Value.DOUBLE && leftVec instanceof DoubleVector) {
+                DoubleVector dv = (DoubleVector) leftVec;
+                double[] vals = dv.rawValues();
+                NullBitmap nulls = dv.nulls();
+                boolean hasNull = nulls.hasNull();
+                double c = spec.arithConst.getDouble();
+                double s = 0;
+                long cnt = 0;
+                for (int i = 0; i < selCount; i++) {
+                    int idx = full ? i : sel[i];
+                    if (!hasNull || !nulls.isNull(idx)) {
+                        s += evalDoubleOp(vals[idx], c);
+                        cnt++;
+                    }
+                }
+                doubleSum += s;
+                count += cnt;
+                if (cnt > 0) {
+                    hasValue = true;
+                }
+                return;
+            }
+            for (int i = 0; i < selCount; i++) {
+                int idx = full ? i : sel[i];
+                Value lv = leftVec.get(idx);
+                if (lv == ValueNull.INSTANCE) {
+                    continue;
+                }
+                Value rv = rightVec != null ? rightVec.get(idx) : spec.arithConst;
+                if (rv == ValueNull.INSTANCE) {
+                    continue;
+                }
+                accumulateValue(evalArithValue(lv, rv), session, compareMode);
+            }
+        }
+
+        private long evalLongOp(long colVal, long constVal) {
+            long l = spec.colOnLeft ? colVal : constVal;
+            long r = spec.colOnLeft ? constVal : colVal;
+            switch (spec.arithOp) {
+            case PLUS:
+                return l + r;
+            case MINUS:
+                return l - r;
+            case MULTIPLY:
+                return l * r;
+            default:
+                return 0L;
+            }
+        }
+
+        private double evalDoubleOp(double colVal, double constVal) {
+            double l = spec.colOnLeft ? colVal : constVal;
+            double r = spec.colOnLeft ? constVal : colVal;
+            switch (spec.arithOp) {
+            case PLUS:
+                return l + r;
+            case MINUS:
+                return l - r;
+            case MULTIPLY:
+                return l * r;
+            default:
+                return 0.0d;
+            }
+        }
+
+        private Value evalArithValue(Value colVal, Value otherVal) {
+            Value l = spec.colOnLeft ? colVal : otherVal;
+            Value r = spec.colOnLeft ? otherVal : colVal;
+            int rt = spec.resultType.getValueType();
+            if (rt == Value.DOUBLE) {
+                return ValueDouble.get(evalDoubleOpRaw(l.getDouble(), r.getDouble()));
+            }
+            if (rt == Value.NUMERIC) {
+                BigDecimal ld = l.getBigDecimal();
+                BigDecimal rd = r.getBigDecimal();
+                switch (spec.arithOp) {
+                case PLUS:
+                    return ValueNumeric.get(ld.add(rd));
+                case MINUS:
+                    return ValueNumeric.get(ld.subtract(rd));
+                case MULTIPLY:
+                    return ValueNumeric.get(ld.multiply(rd));
+                default:
+                    return ValueNull.INSTANCE;
+                }
+            }
+            long lv = l.getLong();
+            long rv = r.getLong();
+            switch (spec.arithOp) {
+            case PLUS:
+                return ValueBigint.get(lv + rv);
+            case MINUS:
+                return ValueBigint.get(lv - rv);
+            case MULTIPLY:
+                return ValueBigint.get(lv * rv);
+            default:
+                return ValueNull.INSTANCE;
+            }
+        }
+
+        private double evalDoubleOpRaw(double l, double r) {
+            switch (spec.arithOp) {
+            case PLUS:
+                return l + r;
+            case MINUS:
+                return l - r;
+            case MULTIPLY:
+                return l * r;
+            default:
+                return 0.0d;
+            }
+        }
+
         void accumulateAt(ColumnSegment seg, int idx, SessionLocal session, CompareMode compareMode) {
             if (spec.type == AggregateType.COUNT_ALL) {
                 count++;
+                return;
+            }
+            if (spec.arithOp != null) {
+                Value lv = seg.getColumn(spec.col).get(idx);
+                if (lv == ValueNull.INSTANCE) {
+                    return;
+                }
+                Value rv = spec.rightCol >= 0 ? seg.getColumn(spec.rightCol).get(idx) : spec.arithConst;
+                if (rv == ValueNull.INSTANCE) {
+                    return;
+                }
+                accumulateValue(evalArithValue(lv, rv), session, compareMode);
                 return;
             }
             accumulateValue(seg.getColumn(spec.col).get(idx), session, compareMode);
@@ -794,11 +1301,30 @@ public final class OmapVectorizedExecutor {
                 count++;
                 return;
             }
+            if (spec.arithOp != null) {
+                Value lv = row[spec.col];
+                if (lv == ValueNull.INSTANCE) {
+                    return;
+                }
+                Value rv = spec.rightCol >= 0 ? row[spec.rightCol] : spec.arithConst;
+                if (rv == ValueNull.INSTANCE) {
+                    return;
+                }
+                accumulateValue(evalArithValue(lv, rv), session, compareMode);
+                return;
+            }
             accumulateValue(row[spec.col], session, compareMode);
         }
 
         private void accumulateValue(Value v, SessionLocal session, CompareMode compareMode) {
             if (v == ValueNull.INSTANCE) {
+                return;
+            }
+            if (spec.distinct) {
+                if (distinctSet == null) {
+                    distinctSet = new HashSet<>();
+                }
+                distinctSet.add(v);
                 return;
             }
             count++;
@@ -834,6 +1360,15 @@ public final class OmapVectorizedExecutor {
         }
 
         void merge(AggState other, SessionLocal session, CompareMode compareMode) {
+            if (spec.distinct) {
+                if (other.distinctSet != null && !other.distinctSet.isEmpty()) {
+                    if (distinctSet == null) {
+                        distinctSet = new HashSet<>();
+                    }
+                    distinctSet.addAll(other.distinctSet);
+                }
+                return;
+            }
             count += other.count;
             if (!other.hasValue) {
                 return;
@@ -864,6 +1399,9 @@ public final class OmapVectorizedExecutor {
         }
 
         Value result(SessionLocal session) {
+            if (spec.distinct) {
+                return ValueBigint.get(distinctSet != null ? distinctSet.size() : 0L);
+            }
             if (spec.type == AggregateType.COUNT_ALL || spec.type == AggregateType.COUNT) {
                 return ValueBigint.get(count);
             }
@@ -943,11 +1481,11 @@ public final class OmapVectorizedExecutor {
             Expression right = cmp.getSubexpression(1).getNonAliasExpression();
             if (right.isConstant()) {
                 return buildHavingComparison(left, cmpType, right.getValue(session),
-                        tableFilter, groupKeyCols, aggList);
+                        tableFilter, groupKeyCols, aggList, session);
             }
             if (left.isConstant()) {
                 return buildHavingComparison(right, flipCmp(cmpType), left.getValue(session),
-                        tableFilter, groupKeyCols, aggList);
+                        tableFilter, groupKeyCols, aggList, session);
             }
             return null;
         }
@@ -960,24 +1498,21 @@ public final class OmapVectorizedExecutor {
             Value constant,
             TableFilter tableFilter,
             int[] groupKeyCols,
-            List<AggSpec> aggList) {
+            List<AggSpec> aggList,
+            SessionLocal compileSession) {
         if (constant == ValueNull.INSTANCE) {
             return (groupKeys, aggVals, session, compareMode) -> false;
         }
         if (target instanceof Aggregate) {
             Aggregate agg = (Aggregate) target;
-            if (agg.isDistinct()) {
-                return null;
-            }
-            AggSpec spec = parseAggregate(agg, tableFilter, -1);
+            AggSpec spec = parseAggregate(agg, tableFilter, -1, compileSession);
             if (spec == null) {
                 return null;
             }
             int aggIdx = -1;
             for (int i = 0; i < aggList.size(); i++) {
                 AggSpec existing = aggList.get(i);
-                if (existing.type == spec.type && existing.col == spec.col
-                        && existing.resultType.getValueType() == spec.resultType.getValueType()) {
+                if (existing.sameKey(spec)) {
                     aggIdx = i;
                     break;
                 }

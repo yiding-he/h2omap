@@ -872,6 +872,8 @@ public class Select extends Query {
                 }
             } else if (isDistinctQuery) {
                 queryDistinct(to, offset, limit, withTies, quickOffset == QuickOffset.YES);
+            } else if (tryVectorizedFlat(result, offset, limit, withTies, fetchPercent)) {
+                vectorized = true;
             } else {
                 lazyResult = queryFlat(columnCount, to, offset, limit, withTies, quickOffset);
             }
@@ -894,6 +896,26 @@ public class Select extends Query {
             return finishResult(result, offset, fetch, fetchPercent, target);
         }
         return null;
+    }
+
+    private boolean tryVectorizedFlat(LocalResult result, long offset, long limit,
+            boolean withTies, boolean fetchPercent) {
+        if (result == null || filters.size() != 1 || forUpdate != null
+                || isWindowQuery || distinct || distinctExpressions != null
+                || qualifyIndex >= 0 || withTies) {
+            return false;
+        }
+        long maxRows = -1L;
+        if (sort == null && !fetchPercent && limit >= 0) {
+            if (offset > 0) {
+                long sum = limit + offset;
+                maxRows = sum < 0 ? Long.MAX_VALUE : sum;
+            } else {
+                maxRows = limit;
+            }
+        }
+        return com.hyd.h2omap.vectorized.OmapVectorizedExecutor.tryExecuteFlat(
+                session, topTableFilter, condition, expressions, resultColumnCount, maxRows, result);
     }
 
     private boolean tryVectorizedGroup(LocalResult result) {

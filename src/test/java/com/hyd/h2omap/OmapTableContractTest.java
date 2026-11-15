@@ -940,6 +940,99 @@ class OmapTableContractTest {
         }
     }
 
+    @Test
+    void vectorizedFlatLikeTimestampCountDistinctAndArithAggMatchMvStore() throws SQLException {
+        try (Connection c = DriverManager.getConnection("jdbc:h2:mem:vec_ext;DB_CLOSE_DELAY=-1");
+                Statement s = c.createStatement()) {
+            s.execute("CREATE TABLE T (ID BIGINT PRIMARY KEY, CAT VARCHAR, TXT VARCHAR, "
+                    + "IV INT, LV BIGINT, DV DOUBLE, TS TIMESTAMP) "
+                    + "ENGINE \"com.hyd.h2omap.engine.OmapTableEngine\" "
+                    + "WITH \"segmentSize=8\", \"compactionMinRows=100\"");
+            s.execute("CREATE TABLE T_MV (ID BIGINT PRIMARY KEY, CAT VARCHAR, TXT VARCHAR, "
+                    + "IV INT, LV BIGINT, DV DOUBLE, TS TIMESTAMP) "
+                    + "ENGINE \"org.h2.mvstore.db.Store\"");
+
+            for (int i = 1; i <= 30; i++) {
+                String cat = (i % 6 == 0) ? "NULL" : ("'cat_" + (i % 3) + "'");
+                String txt = (i % 7 == 0) ? "NULL" : ("'item_" + (i * 13) + (i % 2 == 0 ? "_ab" : "_xy") + "'");
+                String iv = (i % 5 == 0) ? "NULL" : String.valueOf(i * 10);
+                String lv = String.valueOf(i * 100L);
+                String dv = (i % 4 == 0) ? "NULL" : String.valueOf(i * 1.5);
+                String ts = (i % 8 == 0) ? "NULL"
+                        : ("TIMESTAMP '2026-01-01 00:00:" + String.format("%02d", i) + ".123456'");
+                String vals = i + ", " + cat + ", " + txt + ", " + iv + ", " + lv + ", " + dv + ", " + ts;
+                s.execute("INSERT INTO T VALUES (" + vals + ")");
+                s.execute("INSERT INTO T_MV VALUES (" + vals + ")");
+            }
+            // 更新与删除制造段内覆盖与屏蔽
+            s.execute("UPDATE T SET IV = 999, CAT = 'cat_upd' WHERE ID IN (2, 18)");
+            s.execute("UPDATE T_MV SET IV = 999, CAT = 'cat_upd' WHERE ID IN (2, 18)");
+            s.execute("DELETE FROM T WHERE ID IN (3, 25)");
+            s.execute("DELETE FROM T_MV WHERE ID IN (3, 25)");
+
+            String[] queries = {
+                    // 1. queryFlat 列裁剪投影 + ORDER BY + LIMIT/OFFSET
+                    "SELECT ID, CAT, TS FROM %s WHERE IV >= 50 ORDER BY ID DESC LIMIT 8 OFFSET 2",
+                    // 2. queryFlat 常量投影 + 主键点查
+                    "SELECT 'tag', ID, TXT FROM %s WHERE ID = 18",
+                    // 3. TIMESTAMP 范围过滤（TimestampVector）
+                    "SELECT ID, TS FROM %s WHERE TS >= TIMESTAMP '2026-01-01 00:00:10.000000' "
+                            + "AND TS < TIMESTAMP '2026-01-01 00:00:22.000000' ORDER BY ID",
+                    "SELECT COUNT(*) FROM %s WHERE TS IS NULL",
+                    // 4. LIKE / NOT LIKE（DictVarcharVector 与 VarcharVector）
+                    "SELECT ID, CAT FROM %s WHERE CAT LIKE 'cat\\_%%' ESCAPE '\\' ORDER BY ID",
+                    "SELECT ID, TXT FROM %s WHERE TXT LIKE '%%\\_ab' ESCAPE '\\' ORDER BY ID",
+                    "SELECT ID, CAT FROM %s WHERE CAT NOT LIKE '%%upd%%' ORDER BY ID",
+                    // 5. COUNT(DISTINCT col) 全局 + GROUP BY + HAVING
+                    "SELECT COUNT(DISTINCT CAT), COUNT(DISTINCT TXT), COUNT(DISTINCT IV) FROM %s",
+                    "SELECT CAT, COUNT(DISTINCT IV), COUNT(DISTINCT TS) FROM %s "
+                            + "GROUP BY CAT HAVING COUNT(DISTINCT IV) >= 2 ORDER BY CAT NULLS FIRST",
+                    // 6. 聚合内嵌算术表达式
+                    "SELECT SUM(IV * 2), SUM(IV + LV), AVG(DV - 1.5), MIN(100 - IV), MAX(IV * 3) FROM %s",
+                    "SELECT CAT, SUM(IV * 2), AVG(IV + 10.0) FROM %s "
+                            + "WHERE TS IS NOT NULL GROUP BY CAT ORDER BY CAT NULLS FIRST"
+            };
+
+            for (String template : queries) {
+                String expected = collectRows(s, String.format(template, "T_MV"));
+                String actual = collectRows(s, String.format(template, "T"));
+                assertEquals(expected, actual, "Mismatch on query: " + template);
+            }
+
+            // 无 ORDER BY 的 LIMIT 早停测试：验证恰好返回 5 行且满足过滤条件
+            String flatLimit = collectRows(s,
+                    "SELECT ID, IV FROM T WHERE IV >= 100 LIMIT 5 OFFSET 2");
+            assertEquals(5, flatLimit.split("\n").length);
+        }
+    }
+
+    @Test
+    void timestampVectorSurvivesRestartAndCompaction() throws Exception {
+        Path dir = java.nio.file.Files.createTempDirectory("h2omap_ts_persist_");
+        String url = "jdbc:h2:" + dir.resolve("ts_db").toAbsolutePath() + ";DB_CLOSE_DELAY=-1";
+        String expectedBefore;
+        try (Connection c1 = DriverManager.getConnection(url, "sa", "");
+                Statement s = c1.createStatement()) {
+            s.execute("CREATE TABLE T (ID BIGINT PRIMARY KEY, TS TIMESTAMP) "
+                    + "WITH \"segmentSize=4\", \"compactionMinRows=2\"");
+            for (int i = 1; i <= 10; i++) {
+                String ts = (i == 5) ? "NULL"
+                        : ("TIMESTAMP '2026-06-01 12:00:" + String.format("%02d", i) + ".654321'");
+                s.execute("INSERT INTO T VALUES (" + i + ", " + ts + ")");
+            }
+            s.execute("UPDATE T SET TS = TIMESTAMP '2026-06-01 12:00:59.999999' WHERE ID = 2");
+            s.execute("DELETE FROM T WHERE ID = 3");
+            expectedBefore = collectRows(s,
+                    "SELECT ID, TS FROM T WHERE TS >= TIMESTAMP '2026-06-01 12:00:04.000000' ORDER BY ID");
+        }
+        try (Connection c2 = DriverManager.getConnection(url, "sa", "");
+                Statement s = c2.createStatement()) {
+            String actualAfter = collectRows(s,
+                    "SELECT ID, TS FROM T WHERE TS >= TIMESTAMP '2026-06-01 12:00:04.000000' ORDER BY ID");
+            assertEquals(expectedBefore, actualAfter);
+        }
+    }
+
     private static String collectRows(Statement s, String sql) throws SQLException {
         StringBuilder sb = new StringBuilder();
         try (ResultSet rs = s.executeQuery(sql)) {

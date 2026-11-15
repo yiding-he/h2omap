@@ -23,6 +23,7 @@ import com.hyd.h2omap.vector.DoubleVector;
 import com.hyd.h2omap.vector.IntVector;
 import com.hyd.h2omap.vector.LongVector;
 import com.hyd.h2omap.vector.NullBitmap;
+import com.hyd.h2omap.vector.TimestampVector;
 import com.hyd.h2omap.vector.ValueVector;
 import com.hyd.h2omap.vector.VarcharVector;
 
@@ -40,6 +41,7 @@ final class ValueCodec {
     private static final byte VEC_DICT_VARCHAR = 5;
     private static final byte VEC_DICT_VALUE = 6;
     private static final byte VEC_VALUE = 7;
+    private static final byte VEC_TIMESTAMP = 8;
 
     private final ValueDataType valueType;
     private final WriteBuffer writeBuffer = new WriteBuffer(4096);
@@ -151,6 +153,16 @@ final class ValueCodec {
             for (int code : codes) {
                 out.writeInt(code);
             }
+        } else if (vec instanceof TimestampVector tv) {
+            out.writeByte(VEC_TIMESTAMP);
+            writeNullBitmap(out, tv.nulls());
+            long[] dates = tv.rawDateValues();
+            long[] nanos = tv.rawTimeNanos();
+            out.writeInt(dates.length);
+            for (int i = 0; i < dates.length; i++) {
+                out.writeLong(dates[i]);
+                out.writeLong(nanos[i]);
+            }
         } else if (vec instanceof ValueVector vv) {
             out.writeByte(VEC_VALUE);
             writeNullBitmap(out, vv.nulls());
@@ -230,6 +242,16 @@ final class ValueCodec {
                 codes[i] = in.readInt();
             }
             return DictValueVector.of(codes, dict, nulls);
+        }
+        case VEC_TIMESTAMP: {
+            int len = in.readInt();
+            long[] dates = new long[len];
+            long[] nanos = new long[len];
+            for (int i = 0; i < len; i++) {
+                dates[i] = in.readLong();
+                nanos[i] = in.readLong();
+            }
+            return TimestampVector.of(dates, nanos, nulls);
         }
         case VEC_VALUE: {
             int len = in.readInt();
