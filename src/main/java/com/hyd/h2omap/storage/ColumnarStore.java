@@ -52,6 +52,8 @@ public final class ColumnarStore {
 
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
+    private final Object compactMonitor = new Object();
+
     private final AtomicLong dataModificationId = new AtomicLong();
 
     /** 当前开放段的行缓冲，每行 0 号元素是 rowId。 */
@@ -79,23 +81,29 @@ public final class ColumnarStore {
     // ------------------------------------------------------------------
 
     public long append(Value[] values) {
+        long rowId;
+        boolean needCompact;
         lock.writeLock().lock();
         try {
-            long rowId = RowId.ofSegment(nextSegmentId, openSegment.rowCount());
+            rowId = RowId.ofSegment(nextSegmentId, openSegment.rowCount());
             openSegment.append(withRowId(rowId, values));
             rowCount++;
             bump();
             if (openSegment.rowCount() >= options.getSegmentSize()) {
                 freeze();
             }
-            maybeCompact();
-            return rowId;
+            needCompact = shouldCompact();
         } finally {
             lock.writeLock().unlock();
         }
+        if (needCompact) {
+            compact();
+        }
+        return rowId;
     }
 
     public void remove(long rowId) {
+        boolean needCompact = false;
         lock.writeLock().lock();
         try {
             if (isVisible(rowId)) {
@@ -106,10 +114,13 @@ public final class ColumnarStore {
                 }
                 rowCount--;
                 bump();
-                maybeCompact();
+                needCompact = shouldCompact();
             }
         } finally {
             lock.writeLock().unlock();
+        }
+        if (needCompact) {
+            compact();
         }
     }
 
@@ -117,6 +128,7 @@ public final class ColumnarStore {
      * 更新。行位置不变，值以 delta 里的新像为准。
      */
     public void update(long rowId, Value[] values) {
+        boolean needCompact = false;
         lock.writeLock().lock();
         try {
             if (isFrozen(rowId)) {
@@ -126,9 +138,12 @@ public final class ColumnarStore {
                 openSegment.setRow(RowId.offset(rowId), withRowId(rowId, values));
             }
             bump();
-            maybeCompact();
+            needCompact = shouldCompact();
         } finally {
             lock.writeLock().unlock();
+        }
+        if (needCompact) {
+            compact();
         }
     }
 
@@ -163,48 +178,82 @@ public final class ColumnarStore {
      * @return 合并的改动行数
      */
     public long compact() {
-        lock.writeLock().lock();
-        try {
-            if (delta.updatedSize() == 0 && delta.deletedSize() == 0) {
-                return 0;
-            }
+        synchronized (compactMonitor) {
+            Map<Integer, ColumnSegment> baseSegments = new HashMap<>();
             Map<Integer, List<Map.Entry<Integer, Value[]>>> updatesBySeg = new HashMap<>();
             Map<Integer, List<Integer>> deletesBySeg = new HashMap<>();
-            Set<Integer> touchedIds = new HashSet<>();
+            List<Map.Entry<Long, Value[]>> updateSnap = new ArrayList<>();
+            List<Long> deleteSnap = new ArrayList<>();
 
-            for (Map.Entry<Long, Value[]> entry : delta.updatedEntries()) {
-                int segId = RowId.segmentId(entry.getKey());
-                if (segment(segId) != null) {
-                    updatesBySeg.computeIfAbsent(segId, k -> new ArrayList<>())
-                            .add(new AbstractMap.SimpleImmutableEntry<>(
-                                    RowId.offset(entry.getKey()), entry.getValue()));
-                    touchedIds.add(segId);
+            lock.writeLock().lock();
+            try {
+                if (delta.updatedSize() == 0 && delta.deletedSize() == 0) {
+                    return 0;
                 }
-            }
-            for (long rowId : delta.deletedRowIds()) {
-                int segId = RowId.segmentId(rowId);
-                if (segment(segId) != null) {
-                    deletesBySeg.computeIfAbsent(segId, k -> new ArrayList<>())
-                            .add(RowId.offset(rowId));
-                    touchedIds.add(segId);
+                for (Map.Entry<Long, Value[]> entry : delta.updatedEntries()) {
+                    long rowId = entry.getKey();
+                    int segId = RowId.segmentId(rowId);
+                    ColumnSegment seg = segment(segId);
+                    if (seg != null) {
+                        baseSegments.putIfAbsent(segId, seg);
+                        updatesBySeg.computeIfAbsent(segId, k -> new ArrayList<>())
+                                .add(new AbstractMap.SimpleImmutableEntry<>(
+                                        RowId.offset(rowId), entry.getValue()));
+                        updateSnap.add(new AbstractMap.SimpleImmutableEntry<>(
+                                rowId, entry.getValue()));
+                    }
                 }
+                for (long rowId : delta.deletedRowIds()) {
+                    int segId = RowId.segmentId(rowId);
+                    ColumnSegment seg = segment(segId);
+                    if (seg != null) {
+                        baseSegments.putIfAbsent(segId, seg);
+                        deletesBySeg.computeIfAbsent(segId, k -> new ArrayList<>())
+                                .add(RowId.offset(rowId));
+                        deleteSnap.add(rowId);
+                    }
+                }
+            } finally {
+                lock.writeLock().unlock();
             }
 
-            long merged = delta.updatedSize() + delta.deletedSize();
-            delta.clear();
+            if (baseSegments.isEmpty()) {
+                return 0;
+            }
 
-            int firstId = firstSegmentId();
-            for (int segId : touchedIds) {
-                int index = segId - firstId;
-                ColumnSegment oldSeg = segments.get(index);
-                ColumnSegment newSeg = oldSeg.applyDelta(
+            Map<Integer, ColumnSegment> builtSegments = new HashMap<>(baseSegments.size());
+            for (Map.Entry<Integer, ColumnSegment> entry : baseSegments.entrySet()) {
+                int segId = entry.getKey();
+                ColumnSegment newSeg = entry.getValue().applyDelta(
                         deletesBySeg.get(segId), updatesBySeg.get(segId));
-                segments.set(index, newSeg);
+                builtSegments.put(segId, newSeg);
             }
-            bump();
-            return merged;
-        } finally {
-            lock.writeLock().unlock();
+
+            lock.writeLock().lock();
+            try {
+                int firstId = firstSegmentId();
+                for (Map.Entry<Integer, ColumnSegment> entry : builtSegments.entrySet()) {
+                    int segId = entry.getKey();
+                    int index = segId - firstId;
+                    if (index >= 0 && index < segments.size()
+                            && segments.get(index) == baseSegments.get(segId)) {
+                        segments.set(index, entry.getValue());
+                    } else {
+                        return 0;
+                    }
+                }
+                for (Map.Entry<Long, Value[]> entry : updateSnap) {
+                    delta.removeUpdatedIfSame(entry.getKey(), entry.getValue());
+                }
+                for (long rowId : deleteSnap) {
+                    delta.removeDeleted(rowId);
+                }
+                delta.rebuildDirtySegments();
+                bump();
+                return (long) updateSnap.size() + deleteSnap.size();
+            } finally {
+                lock.writeLock().unlock();
+            }
         }
     }
 
@@ -379,10 +428,8 @@ public final class ColumnarStore {
         return row;
     }
 
-    private void maybeCompact() {
-        if (delta.updatedSize() + delta.deletedSize() >= options.getCompactionMinRows()) {
-            compact();
-        }
+    private boolean shouldCompact() {
+        return delta.updatedSize() + delta.deletedSize() >= options.getCompactionMinRows();
     }
 
     /** 当前开放段的段号，也就是它冻结后拿到的段号。 */

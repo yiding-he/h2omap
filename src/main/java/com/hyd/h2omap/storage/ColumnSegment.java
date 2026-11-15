@@ -8,6 +8,7 @@ import java.util.Map;
 
 import org.h2.value.CompareMode;
 import org.h2.value.Value;
+import org.h2.value.ValueNull;
 
 import com.hyd.h2omap.stats.ZoneMap;
 import com.hyd.h2omap.vector.ColumnVector;
@@ -152,8 +153,11 @@ public final class ColumnSegment {
      * 保证旧段在并发读线程的 {@link LazyOmapRow} 持有期间不被原地改写。
      */
     public ColumnSegment applyDelta(List<Integer> deletedOffsets, List<Map.Entry<Integer, Value[]>> updates) {
-        NullBitmap newDeleted = this.deleted.copy();
-        if (deletedOffsets != null) {
+        NullBitmap newDeleted;
+        if (deletedOffsets == null || deletedOffsets.isEmpty()) {
+            newDeleted = this.deleted;
+        } else {
+            newDeleted = this.deleted.copy();
             for (int off : deletedOffsets) {
                 newDeleted.setNull(off);
             }
@@ -161,22 +165,67 @@ public final class ColumnSegment {
         if (updates == null || updates.isEmpty()) {
             return new ColumnSegment(segmentId, rowCount, columns, zoneMaps, newDeleted, compareMode);
         }
-        ColumnVector[] newColumns = new ColumnVector[columns.length];
-        for (int c = 0; c < columns.length; c++) {
-            newColumns[c] = columns[c].copy();
-        }
+
+        ColumnVector[] newColumns = null;
+        ZoneMap[] newZones = null;
+        boolean[] needsRebuildZone = new boolean[columns.length];
+
         for (Map.Entry<Integer, Value[]> entry : updates) {
             int off = entry.getKey();
             Value[] values = entry.getValue();
-            for (int c = 0; c < newColumns.length; c++) {
-                newColumns[c].set(off, values[c]);
+            for (int c = 0; c < columns.length; c++) {
+                ColumnVector currentVec = newColumns != null && newColumns[c] != null
+                        ? newColumns[c]
+                        : columns[c];
+                Value oldVal = currentVec.get(off);
+                Value newVal = values[c];
+                if (oldVal == newVal
+                        || (oldVal != ValueNull.INSTANCE
+                                && newVal != ValueNull.INSTANCE
+                                && oldVal.equals(newVal))) {
+                    continue;
+                }
+                if (newColumns == null) {
+                    newColumns = columns.clone();
+                }
+                if (newColumns[c] == columns[c]) {
+                    newColumns[c] = columns[c].copy();
+                }
+                newColumns[c].set(off, newVal);
+
+                if (!needsRebuildZone[c]) {
+                    ZoneMap baseZm = newZones != null ? newZones[c] : zoneMaps[c];
+                    ZoneMap updatedZm = baseZm.tryUpdate(oldVal, newVal);
+                    if (updatedZm == null) {
+                        needsRebuildZone[c] = true;
+                    } else if (updatedZm != baseZm) {
+                        if (newZones == null) {
+                            newZones = zoneMaps.clone();
+                        }
+                        newZones[c] = updatedZm;
+                    }
+                }
             }
         }
-        ZoneMap[] newZones = new ZoneMap[newColumns.length];
-        for (int c = 0; c < newColumns.length; c++) {
-            newZones[c] = ZoneMap.of(newColumns[c], compareMode);
+
+        if (newColumns == null) {
+            return new ColumnSegment(segmentId, rowCount, columns, zoneMaps, newDeleted, compareMode);
         }
-        return new ColumnSegment(segmentId, rowCount, newColumns, newZones, newDeleted, compareMode);
+        for (int c = 0; c < columns.length; c++) {
+            if (needsRebuildZone[c]) {
+                if (newZones == null) {
+                    newZones = zoneMaps.clone();
+                }
+                newZones[c] = ZoneMap.of(newColumns[c], compareMode);
+            }
+        }
+        return new ColumnSegment(
+                segmentId,
+                rowCount,
+                newColumns,
+                newZones != null ? newZones : zoneMaps,
+                newDeleted,
+                compareMode);
     }
 
     public long getEstimatedMemory() {

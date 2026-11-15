@@ -81,4 +81,26 @@ public final class DeltaStore {
         segmentDeletes.clear();
         dirtySegments.clear();
     }
+
+    /** 仅当当前值引用与快照一致时移除（防止误删锁外构建期间的新更新）。 */
+    public void removeUpdatedIfSame(long rowId, Value[] expected) {
+        if (updated.get(rowId) == expected) {
+            updated.remove(rowId);
+        }
+    }
+
+    public void removeDeleted(long rowId) {
+        segmentDeletes.remove(rowId);
+    }
+
+    /** 精确清理部分条目后重算脏段集合。 */
+    public void rebuildDirtySegments() {
+        dirtySegments.clear();
+        for (long rowId : updated.keySet()) {
+            dirtySegments.add(RowId.segmentId(rowId));
+        }
+        for (long rowId : segmentDeletes) {
+            dirtySegments.add(RowId.segmentId(rowId));
+        }
+    }
 }

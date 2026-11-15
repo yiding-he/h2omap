@@ -5,18 +5,23 @@ package com.hyd.h2omap.bench;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 
 /**
  * 多线程并发查询基准：100 万行 OMAP 表，每条查询均命中超过 50% 的记录。
  *
- * <p>命令行：{@code java com.hyd.h2omap.bench.ConcurrentQueryBench [threads] [rows] [rounds] [url]}。
+ * <p>命令行：{@code java com.hyd.h2omap.bench.ConcurrentQueryBench [threads] [rows] [rounds] [withWriter] [engine] [url]}。
  */
 public final class ConcurrentQueryBench {
 
@@ -37,19 +42,26 @@ public final class ConcurrentQueryBench {
         int threads = Math.max(1, args.length > 0 ? Integer.parseInt(args[0]) : 1);
         int rows = args.length > 1 ? Integer.parseInt(args[1]) : 1_000_000;
         int rounds = Math.max(1, args.length > 2 ? Integer.parseInt(args[2]) : 5);
-        String url = args.length > 3 ? args[3]
+        boolean withWriter = args.length > 3 && Boolean.parseBoolean(args[3]);
+        String engine = args.length > 4 ? args[4] : DataGenerator.ENGINE_OMAP;
+        String url = args.length > 5 ? args[5]
                 : "jdbc:h2:mem:omapconcurrent;DB_CLOSE_DELAY=-1;QUERY_CACHE_SIZE=0";
 
+        int compactionMinRows = withWriter ? 1 : DataGenerator.DEFAULT_COMPACTION_MIN_ROWS;
         try (Connection setupConn = DriverManager.getConnection(url, "sa", "")) {
-            DataGenerator.generate(setupConn, rows, false);
+            DataGenerator.generateSingle(setupConn, rows, engine,
+                    DataGenerator.DEFAULT_SEGMENT_SIZE, compactionMinRows);
             warmupAndVerify(setupConn, rows);
         }
 
         AtomicLongArray totalNanos = new AtomicLongArray(QUERIES.length);
         List<Throwable> errors = new ArrayList<>();
-        CountDownLatch ready = new CountDownLatch(threads);
+        int totalWorkers = threads + (withWriter ? 1 : 0);
+        CountDownLatch ready = new CountDownLatch(totalWorkers);
         CountDownLatch start = new CountDownLatch(1);
-        List<Thread> workers = new ArrayList<>(threads);
+        AtomicBoolean stopWriter = new AtomicBoolean(false);
+        AtomicLong writerRounds = new AtomicLong(0);
+        List<Thread> readers = new ArrayList<>(threads);
 
         for (int t = 0; t < threads; t++) {
             Thread worker = new Thread(() -> {
@@ -74,15 +86,71 @@ public final class ConcurrentQueryBench {
                     }
                 }
             }, "bench-reader-" + t);
-            workers.add(worker);
+            readers.add(worker);
             worker.start();
+        }
+
+        Thread writer = null;
+        if (withWriter) {
+            writer = new Thread(() -> {
+                String insertSql = "INSERT INTO T VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                String updateSql = "UPDATE T SET INT_COL = ? WHERE ID = ?";
+                String deleteSql = "DELETE FROM T WHERE ID = ?";
+                try (Connection c = DriverManager.getConnection(url, "sa", "");
+                        PreparedStatement ins = c.prepareStatement(insertSql);
+                        PreparedStatement upd = c.prepareStatement(updateSql);
+                        PreparedStatement del = c.prepareStatement(deleteSql)) {
+                    Timestamp ts = Timestamp.valueOf(LocalDateTime.of(2026, 6, 15, 0, 0));
+                    Object[] intArr = new Integer[] { 1, 2 };
+                    Object[] strArr = new String[] { "a", "b" };
+                    ready.countDown();
+                    start.await();
+
+                    long step = 0;
+                    long half = Math.max(1, rows / 2);
+                    while (!stopWriter.get()) {
+                        step++;
+                        long newId = rows + step;
+                        ins.setLong(1, newId);
+                        ins.setString(2, "C" + (step % 10));
+                        ins.setString(3, "user-" + newId);
+                        ins.setInt(4, (int) (500_000 + (step % 500_000)));
+                        ins.setDouble(5, 100.0);
+                        ins.setTimestamp(6, ts);
+                        ins.setInt(7, 42);
+                        ins.setObject(8, intArr);
+                        ins.setObject(9, strArr);
+                        ins.executeUpdate();
+
+                        long updId = ((step - 1) % half) + 1;
+                        upd.setInt(1, (int) (500_000 + (step % 500_000)));
+                        upd.setLong(2, updId);
+                        upd.executeUpdate();
+
+                        long delId = half + ((step - 1) % half) + 1;
+                        del.setLong(1, delId);
+                        del.executeUpdate();
+
+                        writerRounds.incrementAndGet();
+                    }
+                } catch (Throwable ex) {
+                    synchronized (errors) {
+                        errors.add(ex);
+                    }
+                }
+            }, "bench-writer");
+            writer.start();
         }
 
         ready.await();
         long wallStart = System.nanoTime();
         start.countDown();
-        for (Thread worker : workers) {
-            worker.join();
+        for (Thread reader : readers) {
+            reader.join();
+        }
+        stopWriter.set(true);
+        if (writer != null) {
+            writer.join();
         }
         long wallMs = (System.nanoTime() - wallStart) / 1_000_000;
 
@@ -96,15 +164,16 @@ public final class ConcurrentQueryBench {
             long nanos = totalNanos.get(q);
             sumAllNanos += nanos;
             double avgMs = nanos / 1_000_000.0 / totalExecutions;
-            System.out.printf("threads=%d q%d avg_ms=%.2f : %s%n",
-                    threads, q + 1, avgMs, QUERIES[q]);
+            System.out.printf("engine=%s threads=%d writer=%s q%d avg_ms=%.2f : %s%n",
+                    engine, threads, withWriter, q + 1, avgMs, QUERIES[q]);
         }
         long totalQueryCount = totalExecutions * QUERIES.length;
         double overallAvgMs = sumAllNanos / 1_000_000.0 / totalQueryCount;
         double qps = totalQueryCount * 1000.0 / Math.max(1L, wallMs);
-        System.out.printf("SUMMARY threads=%d rows=%d rounds=%d total_queries=%d wall_ms=%d "
-                + "overall_avg_ms=%.2f qps=%.1f%n",
-                threads, rows, rounds, totalQueryCount, wallMs, overallAvgMs, qps);
+        System.out.printf("SUMMARY engine=%s threads=%d writer=%s writer_rounds=%d rows=%d rounds=%d "
+                + "total_queries=%d wall_ms=%d overall_avg_ms=%.2f qps=%.1f%n",
+                engine, threads, withWriter, writerRounds.get(), rows, rounds,
+                totalQueryCount, wallMs, overallAvgMs, qps);
     }
 
     private static void warmupAndVerify(Connection conn, int rows) throws SQLException {
@@ -124,7 +193,6 @@ public final class ConcurrentQueryBench {
                     }
                 }
             }
-            // 第二轮预热确保 JIT 稳定
             for (String sql : QUERIES) {
                 try (ResultSet rs = s.executeQuery(sql)) {
                     rs.next();

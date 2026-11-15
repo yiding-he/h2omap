@@ -145,6 +145,20 @@ public final class DataGenerator {
         generate(conn, rows, mvCompare, DEFAULT_SEGMENT_SIZE, DEFAULT_COMPACTION_MIN_ROWS);
     }
 
+    /** 按指定引擎建单张表 {@code T} 并灌入数据。 */
+    public static void generateSingle(Connection conn, int rows, String engine,
+            int segmentSize, int compactionMinRows) throws SQLException {
+        boolean autoCommit = conn.getAutoCommit();
+        conn.setAutoCommit(false);
+        try {
+            createOneTable(conn, engine, segmentSize, compactionMinRows);
+            insert(conn, OMAP_TABLE, rows);
+            conn.commit();
+        } finally {
+            conn.setAutoCommit(autoCommit);
+        }
+    }
+
     /**
      * 单引擎：预热后清空重插，再跑查询。
      *

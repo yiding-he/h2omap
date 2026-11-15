@@ -68,6 +68,42 @@ public final class ZoneMap {
         return max;
     }
 
+    /**
+     * 尝试 O(1) 增量更新 zone map。
+     *
+     * @return 更新后的 zone map（未改变边界时返回 {@code this}）；返回 {@code null} 表示需要全列重算
+     */
+    public ZoneMap tryUpdate(Value oldVal, Value newVal) {
+        if (min == null || max == null) {
+            // 原先全 null 或不可比较：若新值非 null 则需要重算（不可比较类型会在 of() 中继续返回恒相交）
+            return newVal == ValueNull.INSTANCE ? this : null;
+        }
+        try {
+            if (oldVal != ValueNull.INSTANCE
+                    && (oldVal.compareTo(min, null, compareMode) == 0
+                            || oldVal.compareTo(max, null, compareMode) == 0)) {
+                // 旧值位于区间边界，修改后边界可能收窄，必须全列重算
+                return null;
+            }
+            if (newVal == ValueNull.INSTANCE) {
+                return this;
+            }
+            Value nextMin = min;
+            Value nextMax = max;
+            if (newVal.compareTo(min, null, compareMode) < 0) {
+                nextMin = newVal;
+            }
+            if (newVal.compareTo(max, null, compareMode) > 0) {
+                nextMax = newVal;
+            }
+            return nextMin == min && nextMax == max
+                    ? this
+                    : new ZoneMap(nextMin, nextMax, compareMode);
+        } catch (RuntimeException e) {
+            return new ZoneMap(null, null, compareMode);
+        }
+    }
+
     public boolean mayIntersect(Value low, Value high) {
         if (low != null && max != null && max.compareTo(low, null, compareMode) < 0) {
             return false;
