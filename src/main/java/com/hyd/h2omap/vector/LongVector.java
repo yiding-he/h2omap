@@ -21,6 +21,16 @@ public final class LongVector implements ColumnVector {
         this.nulls = new NullBitmap(capacity);
     }
 
+    private LongVector(long[] values, NullBitmap nulls) {
+        this.values = values;
+        this.nulls = nulls;
+    }
+
+    @Override
+    public ColumnVector copy() {
+        return new LongVector(values.clone(), nulls.copy());
+    }
+
     @Override
     public int size() {
         return values.length;

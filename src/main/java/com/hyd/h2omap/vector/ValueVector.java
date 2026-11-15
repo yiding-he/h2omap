@@ -27,6 +27,16 @@ public final class ValueVector implements ColumnVector {
         this.nulls = new NullBitmap(capacity);
     }
 
+    private ValueVector(List<Value> values, NullBitmap nulls) {
+        this.values = values;
+        this.nulls = nulls;
+    }
+
+    @Override
+    public ColumnVector copy() {
+        return new ValueVector(new ArrayList<>(values), nulls.copy());
+    }
+
     @Override
     public int size() {
         return values.size();

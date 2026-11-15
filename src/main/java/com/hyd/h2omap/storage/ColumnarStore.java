@@ -3,8 +3,10 @@
  */
 package com.hyd.h2omap.storage;
 
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -166,27 +168,38 @@ public final class ColumnarStore {
             if (delta.updatedSize() == 0 && delta.deletedSize() == 0) {
                 return 0;
             }
-            Set<ColumnSegment> touched = new HashSet<>();
+            Map<Integer, List<Map.Entry<Integer, Value[]>>> updatesBySeg = new HashMap<>();
+            Map<Integer, List<Integer>> deletesBySeg = new HashMap<>();
+            Set<Integer> touchedIds = new HashSet<>();
+
             for (Map.Entry<Long, Value[]> entry : delta.updatedEntries()) {
-                ColumnSegment segment = segment(RowId.segmentId(entry.getKey()));
-                if (segment != null) {
-                    segment.setRow(RowId.offset(entry.getKey()), entry.getValue());
-                    touched.add(segment);
+                int segId = RowId.segmentId(entry.getKey());
+                if (segment(segId) != null) {
+                    updatesBySeg.computeIfAbsent(segId, k -> new ArrayList<>())
+                            .add(new AbstractMap.SimpleImmutableEntry<>(
+                                    RowId.offset(entry.getKey()), entry.getValue()));
+                    touchedIds.add(segId);
                 }
             }
             for (long rowId : delta.deletedRowIds()) {
-                ColumnSegment segment = segment(RowId.segmentId(rowId));
-                if (segment != null) {
-                    segment.markDeleted(RowId.offset(rowId));
-                    touched.add(segment);
+                int segId = RowId.segmentId(rowId);
+                if (segment(segId) != null) {
+                    deletesBySeg.computeIfAbsent(segId, k -> new ArrayList<>())
+                            .add(RowId.offset(rowId));
+                    touchedIds.add(segId);
                 }
             }
+
             long merged = delta.updatedSize() + delta.deletedSize();
             delta.clear();
-            for (ColumnSegment segment : touched) {
-                for (int c = 0; c < segment.getColumnCount(); c++) {
-                    segment.rebuildZoneMap(c);
-                }
+
+            int firstId = firstSegmentId();
+            for (int segId : touchedIds) {
+                int index = segId - firstId;
+                ColumnSegment oldSeg = segments.get(index);
+                ColumnSegment newSeg = oldSeg.applyDelta(
+                        deletesBySeg.get(segId), updatesBySeg.get(segId));
+                segments.set(index, newSeg);
             }
             bump();
             return merged;
@@ -272,10 +285,13 @@ public final class ColumnarStore {
                         return null;
                     }
                     Value[] updated = delta.getUpdated(rowId);
-                    values = updated != null ? updated : segment.getRow(offset);
-                } else {
-                    values = segment.getRow(offset);
+                    if (updated != null) {
+                        Row row = Row.get(updated, 0);
+                        row.setKey(rowId);
+                        return row;
+                    }
                 }
+                return new LazyOmapRow(segment, offset, rowId);
             } else {
                 int offset = RowId.offset(rowId);
                 if (offset >= openSegment.rowCount() || openDeletes.contains(rowId)) {
@@ -497,19 +513,19 @@ public final class ColumnarStore {
                             continue;
                         }
                         long rowId = RowId.ofSegment(segmentId, currentOffset);
-                        Value[] values;
                         if (hasDelta) {
                             if (delta.isSegmentRowDeleted(rowId)) {
                                 continue;
                             }
                             Value[] updated = delta.getUpdated(rowId);
-                            values = updated != null ? updated : segment.getRow(currentOffset);
-                        } else {
-                            values = segment.getRow(currentOffset);
+                            if (updated != null) {
+                                Row row = Row.get(updated, 0);
+                                row.setKey(rowId);
+                                buffer[filled++] = row;
+                                continue;
+                            }
                         }
-                        Row row = Row.get(values, 0);
-                        row.setKey(rowId);
-                        buffer[filled++] = row;
+                        buffer[filled++] = new LazyOmapRow(segment, currentOffset, rowId);
                     }
                 }
                 if (offset >= count) {
@@ -557,19 +573,19 @@ public final class ColumnarStore {
                             continue;
                         }
                         long rowId = RowId.ofSegment(segmentId, currentOffset);
-                        Value[] values;
                         if (hasDelta) {
                             if (delta.isSegmentRowDeleted(rowId)) {
                                 continue;
                             }
                             Value[] updated = delta.getUpdated(rowId);
-                            values = updated != null ? updated : segment.getRow(currentOffset);
-                        } else {
-                            values = segment.getRow(currentOffset);
+                            if (updated != null) {
+                                Row row = Row.get(updated, 0);
+                                row.setKey(rowId);
+                                buffer[filled++] = row;
+                                continue;
+                            }
                         }
-                        Row row = Row.get(values, 0);
-                        row.setKey(rowId);
-                        buffer[filled++] = row;
+                        buffer[filled++] = new LazyOmapRow(segment, currentOffset, rowId);
                     }
                 }
                 if (offset < 0) {

@@ -21,6 +21,16 @@ public final class IntVector implements ColumnVector {
         this.nulls = new NullBitmap(capacity);
     }
 
+    private IntVector(int[] values, NullBitmap nulls) {
+        this.values = values;
+        this.nulls = nulls;
+    }
+
+    @Override
+    public ColumnVector copy() {
+        return new IntVector(values.clone(), nulls.copy());
+    }
+
     @Override
     public int size() {
         return values.length;

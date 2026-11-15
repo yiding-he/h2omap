@@ -21,6 +21,16 @@ public final class DoubleVector implements ColumnVector {
         this.nulls = new NullBitmap(capacity);
     }
 
+    private DoubleVector(double[] values, NullBitmap nulls) {
+        this.values = values;
+        this.nulls = nulls;
+    }
+
+    @Override
+    public ColumnVector copy() {
+        return new DoubleVector(values.clone(), nulls.copy());
+    }
+
     @Override
     public int size() {
         return values.length;

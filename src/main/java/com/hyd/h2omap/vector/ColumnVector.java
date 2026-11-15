@@ -28,6 +28,9 @@ public interface ColumnVector {
     /** 估算内存占用，给统计和合并阈值用。 */
     long getEstimatedMemory();
 
+    /** 返回当前向量的独立副本，供 Copy-On-Compact 使用。 */
+    ColumnVector copy();
+
     /**
      * 按 H2 的类型码创建向量。
      *

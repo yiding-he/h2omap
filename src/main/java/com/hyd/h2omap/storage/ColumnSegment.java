@@ -4,12 +4,14 @@
 package com.hyd.h2omap.storage;
 
 import java.util.List;
+import java.util.Map;
 
 import org.h2.value.CompareMode;
 import org.h2.value.Value;
 
 import com.hyd.h2omap.stats.ZoneMap;
 import com.hyd.h2omap.vector.ColumnVector;
+import com.hyd.h2omap.vector.DictVarcharVector;
 import com.hyd.h2omap.vector.NullBitmap;
 
 /**
@@ -36,13 +38,18 @@ public final class ColumnSegment {
     private final CompareMode compareMode;
 
     private ColumnSegment(int segmentId, int rowCount, ColumnVector[] columns, ZoneMap[] zoneMaps,
-            CompareMode compareMode) {
+            NullBitmap deleted, CompareMode compareMode) {
         this.segmentId = segmentId;
         this.rowCount = rowCount;
         this.columns = columns;
         this.zoneMaps = zoneMaps;
-        this.deleted = new NullBitmap(rowCount);
+        this.deleted = deleted;
         this.compareMode = compareMode;
+    }
+
+    private ColumnSegment(int segmentId, int rowCount, ColumnVector[] columns, ZoneMap[] zoneMaps,
+            CompareMode compareMode) {
+        this(segmentId, rowCount, columns, zoneMaps, new NullBitmap(rowCount), compareMode);
     }
 
     /**
@@ -57,14 +64,27 @@ public final class ColumnSegment {
     public static ColumnSegment build(int segmentId, List<Value[]> rows, int[] valueTypes,
             CompareMode compareMode) {
         int count = rows.size();
+        int maxDict = Math.min(4096, Math.max(64, count / 4));
         ColumnVector[] vectors = new ColumnVector[valueTypes.length];
+        boolean[] prebuilt = new boolean[valueTypes.length];
         for (int c = 0; c < valueTypes.length; c++) {
-            vectors[c] = ColumnVector.create(valueTypes[c], count);
+            int type = valueTypes[c];
+            if (type == Value.CHAR || type == Value.VARCHAR) {
+                DictVarcharVector dictVec = DictVarcharVector.tryBuild(rows, c + 1, maxDict);
+                if (dictVec != null) {
+                    vectors[c] = dictVec;
+                    prebuilt[c] = true;
+                    continue;
+                }
+            }
+            vectors[c] = ColumnVector.create(type, count);
         }
         for (int r = 0; r < count; r++) {
             Value[] row = rows.get(r);
             for (int c = 0; c < valueTypes.length; c++) {
-                vectors[c].set(r, row[c + 1]);
+                if (!prebuilt[c]) {
+                    vectors[c].set(r, row[c + 1]);
+                }
             }
         }
         ZoneMap[] zones = new ZoneMap[valueTypes.length];
@@ -125,6 +145,38 @@ public final class ColumnSegment {
     /** 值或删除标记变化后重算某一列的 zone map。 */
     public void rebuildZoneMap(int column) {
         zoneMaps[column] = ZoneMap.of(columns[column], compareMode);
+    }
+
+    /**
+     * Copy-On-Compact：基于当前段生成应用了 delta 更新与删除的新段实例，
+     * 保证旧段在并发读线程的 {@link LazyOmapRow} 持有期间不被原地改写。
+     */
+    public ColumnSegment applyDelta(List<Integer> deletedOffsets, List<Map.Entry<Integer, Value[]>> updates) {
+        NullBitmap newDeleted = this.deleted.copy();
+        if (deletedOffsets != null) {
+            for (int off : deletedOffsets) {
+                newDeleted.setNull(off);
+            }
+        }
+        if (updates == null || updates.isEmpty()) {
+            return new ColumnSegment(segmentId, rowCount, columns, zoneMaps, newDeleted, compareMode);
+        }
+        ColumnVector[] newColumns = new ColumnVector[columns.length];
+        for (int c = 0; c < columns.length; c++) {
+            newColumns[c] = columns[c].copy();
+        }
+        for (Map.Entry<Integer, Value[]> entry : updates) {
+            int off = entry.getKey();
+            Value[] values = entry.getValue();
+            for (int c = 0; c < newColumns.length; c++) {
+                newColumns[c].set(off, values[c]);
+            }
+        }
+        ZoneMap[] newZones = new ZoneMap[newColumns.length];
+        for (int c = 0; c < newColumns.length; c++) {
+            newZones[c] = ZoneMap.of(newColumns[c], compareMode);
+        }
+        return new ColumnSegment(segmentId, rowCount, newColumns, newZones, newDeleted, compareMode);
     }
 
     public long getEstimatedMemory() {

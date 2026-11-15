@@ -10,15 +10,27 @@ public final class NullBitmap {
 
     private final long[] bits;
 
+    private boolean hasNull;
+
     public NullBitmap(int capacity) {
         this.bits = new long[(capacity + 63) >>> 6];
     }
 
+    private NullBitmap(long[] bits, boolean hasNull) {
+        this.bits = bits;
+        this.hasNull = hasNull;
+    }
+
+    public NullBitmap copy() {
+        return new NullBitmap(bits.clone(), hasNull);
+    }
+
     public boolean isNull(int index) {
-        return (bits[index >>> 6] & (1L << index)) != 0;
+        return hasNull && (bits[index >>> 6] & (1L << index)) != 0;
     }
 
     public void setNull(int index) {
+        hasNull = true;
         bits[index >>> 6] |= 1L << index;
     }
 
