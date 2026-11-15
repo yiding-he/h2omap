@@ -17,6 +17,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * 多线程并发查询基准：100 万行 OMAP 表，每条查询均命中超过 50% 的记录。
@@ -46,6 +47,7 @@ public final class ConcurrentQueryBench {
         String engine = args.length > 4 ? args[4] : DataGenerator.ENGINE_OMAP;
         String url = args.length > 5 ? args[5]
                 : "jdbc:h2:mem:omapconcurrent;DB_CLOSE_DELAY=-1;QUERY_CACHE_SIZE=0";
+        int writerRatePerSec = args.length > 6 ? Integer.parseInt(args[6]) : 0;
 
         int compactionMinRows = withWriter ? 1 : DataGenerator.DEFAULT_COMPACTION_MIN_ROWS;
         try (Connection setupConn = DriverManager.getConnection(url, "sa", "")) {
@@ -108,6 +110,8 @@ public final class ConcurrentQueryBench {
 
                     long step = 0;
                     long half = Math.max(1, rows / 2);
+                    long intervalNanos = writerRatePerSec > 0 ? 1_000_000_000L / writerRatePerSec : 0L;
+                    long nextDeadline = intervalNanos > 0 ? System.nanoTime() + intervalNanos : 0L;
                     while (!stopWriter.get()) {
                         step++;
                         long newId = rows + step;
@@ -132,6 +136,13 @@ public final class ConcurrentQueryBench {
                         del.executeUpdate();
 
                         writerRounds.incrementAndGet();
+                        if (intervalNanos > 0) {
+                            long waitNanos = nextDeadline - System.nanoTime();
+                            if (waitNanos > 0) {
+                                LockSupport.parkNanos(waitNanos);
+                            }
+                            nextDeadline += intervalNanos;
+                        }
                     }
                 } catch (Throwable ex) {
                     synchronized (errors) {
