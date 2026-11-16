@@ -689,6 +689,89 @@ class OmapTableContractTest {
     }
 
     // ------------------------------------------------------------------
+    // 子查询与常量边界
+    // ------------------------------------------------------------------
+
+    /**
+     * 不相关子查询折成常量后，结果必须与 MVStore 等价查询一致。
+     *
+     * <p>覆盖下推入口把 {@code WHERE} 里的子查询当常量编译的三条路径：
+     * 子查询带聚合、子查询自带 {@code WHERE}、{@code IN} 里的子查询。
+     */
+    @Test
+    void uncorrelatedSubqueryFoldsIntoConstantPredicate() throws SQLException {
+        execute(createTable("T", "ID INT PRIMARY KEY, V INT, TAG VARCHAR", "\"segmentSize=4\""));
+        execute("CREATE TABLE M(ID INT PRIMARY KEY, V INT, TAG VARCHAR)"
+                + " ENGINE \"org.h2.mvstore.db.Store\"");
+        String insert = "INSERT INTO %s SELECT X, X * 10, 'k' || MOD(X, 3) FROM SYSTEM_RANGE(1, 40)";
+        execute(String.format(insert, "T"));
+        execute(String.format(insert, "M"));
+
+        String[] queries = {
+                "SELECT COUNT(*) FROM %1$s WHERE V > (SELECT AVG(V) FROM %1$s)",
+                "SELECT COUNT(*) FROM %1$s WHERE V < (SELECT AVG(V) FROM %1$s WHERE TAG = 'k1')",
+                "SELECT COUNT(*) FROM %1$s WHERE TAG IN (SELECT TAG FROM %1$s WHERE V >= 300)",
+                "SELECT COUNT(*) FROM %1$s WHERE V >= (SELECT MAX(V) FROM %1$s WHERE TAG = 'k2')",
+        };
+        for (String query : queries) {
+            assertEquals(rows(String.format(query, "M")), rows(String.format(query, "T")),
+                    query);
+        }
+    }
+
+    /**
+     * 引用外层列的关联子查询不得折成常量，结果必须与 MVStore 一致。
+     *
+     * <p>外层列出现在子查询的 {@code WHERE} 与嵌套子查询里各测一次。
+     */
+    @Test
+    void correlatedSubqueryIsNotFoldedIntoConstant() throws SQLException {
+        execute(createTable("T", "ID INT PRIMARY KEY, V INT, TAG VARCHAR", "\"segmentSize=4\""));
+        execute("CREATE TABLE M(ID INT PRIMARY KEY, V INT, TAG VARCHAR)"
+                + " ENGINE \"org.h2.mvstore.db.Store\"");
+        String insert = "INSERT INTO %s SELECT X, X * 10, 'k' || MOD(X, 3) FROM SYSTEM_RANGE(1, 40)";
+        execute(String.format(insert, "T"));
+        execute(String.format(insert, "M"));
+
+        String[] queries = {
+                "SELECT COUNT(*) FROM %1$s WHERE V > (SELECT AVG(Q.V) FROM %1$s Q WHERE Q.TAG = %1$s.TAG)",
+                "SELECT COUNT(*) FROM %1$s WHERE V > (SELECT MAX(Q.V) FROM %1$s Q"
+                        + " WHERE Q.TAG = %1$s.TAG AND Q.V < %1$s.V + 50)",
+                "SELECT COUNT(*) FROM %1$s WHERE EXISTS (SELECT 1 FROM %1$s Q"
+                        + " WHERE Q.TAG = %1$s.TAG AND Q.V > %1$s.V)",
+        };
+        for (String query : queries) {
+            assertEquals(rows(String.format(query, "M")), rows(String.format(query, "T")),
+                    query);
+        }
+    }
+
+    /**
+     * 整型列与带小数的常量比较时，常量必须收敛到整数边界而不是四舍五入。
+     */
+    @Test
+    void fractionalConstantKeepsComparisonBoundary() throws SQLException {
+        execute(createTable("T", "ID INT PRIMARY KEY, V INT", "\"segmentSize=4\""));
+        execute("CREATE TABLE M(ID INT PRIMARY KEY, V INT) ENGINE \"org.h2.mvstore.db.Store\"");
+        execute("INSERT INTO T VALUES (1, 1), (2, 2), (3, 3)");
+        execute("INSERT INTO M VALUES (1, 1), (2, 2), (3, 3)");
+
+        String[] queries = {
+                "SELECT COUNT(*) FROM %s WHERE V > 1.5",
+                "SELECT COUNT(*) FROM %s WHERE V < 1.5",
+                "SELECT COUNT(*) FROM %s WHERE V >= 1.5",
+                "SELECT COUNT(*) FROM %s WHERE V <= 1.5",
+                "SELECT COUNT(*) FROM %s WHERE V = 2.5",
+                "SELECT COUNT(*) FROM %s WHERE V <> 2.5",
+                "SELECT COUNT(*) FROM %s WHERE V > (SELECT AVG(V) FROM %s)",
+        };
+        for (String query : queries) {
+            assertEquals(rows(String.format(query, "M", "M")), rows(String.format(query, "T", "T")),
+                    query);
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 工具
     // ------------------------------------------------------------------
 

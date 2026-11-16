@@ -311,6 +311,15 @@ public class Select extends Query {
         return condition;
     }
 
+    /**
+     * 返回本查询的过滤表列表，供向量化入口判定子查询是否引用外层列。
+     *
+     * @return 过滤表列表
+     */
+    public List<TableFilter> getTableFilters() {
+        return filters;
+    }
+
     private LazyResult queryGroupSorted(int columnCount, ResultTarget result, long offset, boolean quickOffset) {
         LazyResultGroupSorted lazyResult = new LazyResultGroupSorted(expressionArray, columnCount);
         skipOffset(lazyResult, offset, quickOffset);

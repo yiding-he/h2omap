@@ -3,18 +3,23 @@
  */
 package com.hyd.h2omap.vectorized;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import org.h2.command.query.Query;
+import org.h2.command.query.Select;
 import org.h2.engine.SessionLocal;
 import org.h2.expression.BinaryOperation;
 import org.h2.expression.Expression;
 import org.h2.expression.ExpressionColumn;
 import org.h2.expression.H2ExpressionAccess;
 import org.h2.expression.Operation1;
+import org.h2.expression.Subquery;
 import org.h2.expression.ValueExpression;
 import org.h2.expression.condition.CompareLike;
 import org.h2.expression.condition.Comparison;
@@ -27,9 +32,11 @@ import org.h2.expression.condition.NullPredicate;
 import org.h2.expression.function.CardinalityExpression;
 import org.h2.table.TableFilter;
 import org.h2.value.CompareMode;
+import org.h2.value.TypeInfo;
 import org.h2.value.Value;
 import org.h2.value.ValueArray;
 import org.h2.value.ValueNull;
+import org.h2.value.ValueNumeric;
 import org.h2.value.ValueTimestamp;
 
 import com.hyd.h2omap.stats.ZoneMap;
@@ -294,13 +301,75 @@ public final class VectorizedFilter {
         Expression left = cmp.getSubexpression(0);
         Expression right = cmp.getSubexpression(1);
 
-        if (right.isConstant()) {
+        if (isFoldableConstant(right, filter)) {
             return compileLeftWithConst(left, cmpType, right.getValue(session), filter, session);
         }
-        if (left.isConstant()) {
+        if (isFoldableConstant(left, filter)) {
             return compileLeftWithConst(right, flipCompare(cmpType), left.getValue(session), filter, session);
         }
         return null;
+    }
+
+    /**
+     * 编译期只求值一次的表达式：字面常量，以及不引用被扫描表的不相关子查询。
+     *
+     * <p>相关子查询的值随外层行变化，必须交回 H2 逐行求值。
+     */
+    private static boolean isFoldableConstant(Expression expr, TableFilter filter) {
+        if (expr.isConstant()) {
+            return true;
+        }
+        return expr instanceof Subquery
+                && !referencesFilter(((Subquery) expr).getQuery(), filter);
+    }
+
+    /** 查询是否引用指定过滤表的列，包括嵌套子查询里的引用。 */
+    private static boolean referencesFilter(Query query, TableFilter filter) {
+        List<Expression> expressions = query.getExpressions();
+        for (int i = 0; i < expressions.size(); i++) {
+            if (referencesFilter(expressions.get(i), filter)) {
+                return true;
+            }
+        }
+        if (!(query instanceof Select)) {
+            return false;
+        }
+        Select select = (Select) query;
+        // ORDER BY 不参与 select 列表，单独判定；GROUP BY 表达式在 prepare 阶段
+        // 已并入 select 列表，不需单独遍历
+        if (select.getSortOrder() != null) {
+            return true;
+        }
+        if (referencesFilter(select.getCondition(), filter)
+                || referencesFilter(select.getHaving(), filter)) {
+            return true;
+        }
+        for (TableFilter tableFilter : select.getTableFilters()) {
+            if (referencesFilter(tableFilter.getJoinCondition(), filter)
+                    || referencesFilter(tableFilter.getFilterCondition(), filter)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean referencesFilter(Expression expr, TableFilter filter) {
+        if (expr == null) {
+            return false;
+        }
+        if (expr instanceof ExpressionColumn) {
+            return ((ExpressionColumn) expr).getTableFilter() == filter;
+        }
+        if (expr instanceof Subquery) {
+            return referencesFilter(((Subquery) expr).getQuery(), filter);
+        }
+        int count = expr.getSubexpressionCount();
+        for (int i = 0; i < count; i++) {
+            if (referencesFilter(expr.getSubexpression(i), filter)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static Node compileLeftWithConst(Expression left, int cmpType, Value constant,
@@ -309,11 +378,17 @@ public final class VectorizedFilter {
             return null;
         }
         int col = resolveColumn(left, filter);
+        int[] cmp = { cmpType };
+        Value bound = integerBound(constant, filter.getTable().getColumn(col >= 0 ? col : 0).getType(), cmp);
+        if (bound == null) {
+            return null;
+        }
+        cmpType = cmp[0];
         Value converted;
         try {
-            converted = constant.convertTo(filter.getTable().getColumn(col >= 0 ? col : 0).getType(), session);
+            converted = bound.convertTo(filter.getTable().getColumn(col >= 0 ? col : 0).getType(), session);
         } catch (RuntimeException ignored) {
-            converted = constant;
+            converted = bound;
         }
         if (col >= 0) {
             return new ColCmpNode(col, cmpType, converted);
@@ -351,6 +426,45 @@ public final class VectorizedFilter {
             }
         }
         return null;
+    }
+
+    /**
+     * 整型列与带小数的常量比较时，把常量收敛到整数边界并相应调整比较类型。
+     *
+     * <p>{@code convertTo} 对带小数的常量做四舍五入，会把 {@code INT_COL > 499999.5}
+     * 变成 {@code INT_COL > 500000}，结果集不同。
+     *
+     * @return 调整后的常量；用整数边界表达不了该关系时返回 {@code null}
+     */
+    private static Value integerBound(Value constant, TypeInfo columnType, int[] cmpType) {
+        int type = columnType.getValueType();
+        if (type != Value.TINYINT && type != Value.SMALLINT
+                && type != Value.INTEGER && type != Value.BIGINT) {
+            return constant;
+        }
+        BigDecimal decimal;
+        try {
+            decimal = constant.getBigDecimal();
+        } catch (RuntimeException ignored) {
+            return constant;
+        }
+        if (decimal == null || decimal.stripTrailingZeros().scale() <= 0) {
+            return constant;
+        }
+        switch (cmpType[0]) {
+        case Comparison.BIGGER:
+            cmpType[0] = Comparison.BIGGER_EQUAL;
+            return ValueNumeric.get(decimal.setScale(0, RoundingMode.CEILING));
+        case Comparison.BIGGER_EQUAL:
+            return ValueNumeric.get(decimal.setScale(0, RoundingMode.CEILING));
+        case Comparison.SMALLER:
+            cmpType[0] = Comparison.SMALLER_EQUAL;
+            return ValueNumeric.get(decimal.setScale(0, RoundingMode.FLOOR));
+        case Comparison.SMALLER_EQUAL:
+            return ValueNumeric.get(decimal.setScale(0, RoundingMode.FLOOR));
+        default:
+            return null;
+        }
     }
 
     private static int resolveColumn(Expression expr, TableFilter filter) {
