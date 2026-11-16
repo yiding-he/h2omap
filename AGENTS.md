@@ -26,7 +26,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | JDK | 构建与运行用 JDK 21.0.11；字节码目标 `maven.compiler.release=17` |
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变）。被替换的 3 个 H2 类按该版本源码合入，升级时必须逐类重新比对 |
 | 依赖 | 运行期只有 `com.h2database:h2`，测试用 `junit-jupiter`，构建期插件 `maven-shade-plugin` |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（43 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（15 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（51 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（15 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/`。该目录可能不存在（已排除在版本控制之外）。Maven Central 的 `h2-2.5.252-sources.jar` 内容等价，但个别文件与该 zip 相差数行，核对行号时以 zip 为准 |
 
 ## H2 侧的依据
@@ -60,13 +60,14 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 
 ## 对 H2 的局部替换与打包
 
-`TableEngine` 只能替换表的存储与索引，读路径下推与默认引擎都要改动 H2 自身。本分支因此替换了 3 个 H2 类，另加 3 个访问桥；替换类随本项目源码编译，`maven-shade-plugin` 打包时从 `com.h2database:h2` 中排除同名类（含内部类 `$*`），部署只需一个 Jar。
+`TableEngine` 只能替换表的存储与索引，读路径下推与默认引擎都要改动 H2 自身。本分支因此替换了 4 个 H2 类，另加 3 个访问桥；替换类随本项目源码编译，`maven-shade-plugin` 打包时从 `com.h2database:h2` 中排除同名类（含内部类 `$*`），部署只需一个 Jar。
 
 | 替换的类 | 改动 |
 | --- | --- |
 | `org.h2.command.query.Select` | `queryWithoutCache()` 增加 `vectorized` 标志与两个下推分支：`tryVectorizedGroup()` 排在 `queryGroup()` 之前，`tryVectorizedFlat()` 排在 `queryFlat()` 之前；命中时不再把 `offset` 归零 |
 | `org.h2.schema.Schema` | `createTable()` 增加两段判断：显式写 `ENGINE "org.h2.mvstore.db.Store"` 时清空 `data.tableEngine` 直接走 MVStore；`tableEngine == null` 且未设 `defaultTableEngine`、非开库重放（`!database.isStarting()`）、`data.id != 0`、非临时表时，默认取 `com.hyd.h2omap.engine.OmapTableEngine` |
 | `org.h2.expression.condition.Comparison` | 只新增一个 `public int getCompareType()`，供 `VectorizedFilter` 读取比较类型 |
+| `org.h2.expression.condition.ConditionInQuery` | 按 `2.5.252` 源码逐字合入，末尾新增 `getLeft()`、`isNot()`、`isAll()`、`getCompareType()` 四个访问器，供 `SubqueryFold` 读取 `IN (SELECT)` 谓词的成员 |
 
 访问桥不替换原类，只是声明在同一个包里，用来读取包级与受保护成员：
 
@@ -74,12 +75,12 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | --- | --- |
 | `org.h2.expression.H2ExpressionAccess` | `Operation1.arg`、`Operation2.left`、`Operation2.right` |
 | `org.h2.expression.aggregate.H2AggregateAccess` | `AbstractAggregate.args` |
-| `org.h2.expression.condition.H2ConditionAccess` | `SimplePredicate.left`、`SimplePredicate.not`、`ConditionIn.left`、`ConditionIn.not`、`ConditionIn.valueList`、`ConditionAndOr.getAndOrType()`、`ConditionAndOrN.getAndOrType()` |
+| `org.h2.expression.condition.H2ConditionAccess` | `SimplePredicate.left`、`SimplePredicate.not`、`ConditionIn.left`、`ConditionIn.not`、`ConditionIn.valueList`、`ConditionAndOr.getAndOrType()`、`ConditionAndOrN.getAndOrType()`、`PredicateWithSubquery.query`（经 `getExistsQuery`/`getInQueryQuery` 读取 `ExistsPredicate` 与 `ConditionInQuery` 的子查询） |
 
 升级 H2 时必须重做：
 
 1. 按上表逐类重新比对替换点，确认上游没有改名、没有改变控制流、没有挪动 `vectorized` 标志要跳过的语句。
-2. `Comparison.getCompareType()` 若上游已公开，删除本项目的 `Comparison.java`，同步 `pom.xml` 的排除清单。
+2. `Comparison.getCompareType()` 若上游已公开，删除本项目的 `Comparison.java`，同步 `pom.xml` 的排除清单；`ConditionInQuery` 的四个访问器同理。
 3. 复核 `Table`、`Index`、`Cursor` 的抽象方法集合，以及 `CreateTableData` 的构造器与所在包。
 4. 复核 `pom.xml` 的 shade 排除清单与替换类一一对应；漏掉内部类会留下同一个类的两个版本。
 
@@ -142,6 +143,18 @@ rowId 在 `append` 时就确定，之后不变。段号在开放段创建时预�
 共同的拒绝条件：`result` 为 null、`filters.size() != 1`、`FOR UPDATE`、窗口查询、`DISTINCT` 或 `distinctExpressions != null`、`qualifyIndex >= 0`、`WITH TIES`。`VectorizedFilter.compile()` 返回 null 时同样放弃下推。
 
 可下推的谓词：6 种 `Comparison` 比较、`AND`/`OR`（含 `ConditionAndOrN`）、`IN`、`IS NULL`/`IS NOT NULL`、`LIKE`/`NOT LIKE`、`CARDINALITY(...)`，以及比较左侧的一元与二元算术（`PLUS`、`MINUS`、`MULTIPLY`）。`ILIKE`、`REGEXP` 等形态交回 H2。
+
+子查询下推（`SubqueryFold`，由 `VectorizedFilter.compile` 末尾与 `compileComparison` 调用）：
+
+| 形态 | 执行方式 |
+| --- | --- |
+| 不相关标量子查询在比较一侧 | 编译期求值一次当常量用（M10 第一步，已先行提交） |
+| 不相关 `IN (SELECT)` | 子查询一次求值收进集合；整数列用原始 `long` 开放寻址集合，其余用 `Value` 哈希集合；空集折成恒假/恒真，子查询含 NULL 且 `NOT IN` 折成恒假 |
+| 不相关 `EXISTS`/`NOT EXISTS` | 编译期求值一次折成恒真/恒假 |
+| 关联 `EXISTS`/`NOT EXISTS`（单列等值关联） | 对内层表预计算关联键集合，折成半连接节点；键按外层键列类型装箱后哈希查找 |
+| 关联标量聚合子查询（单列等值关联、内层单聚合无分组） | 对内层表 `takeVectorizedSnapshot` 预计算一次分组聚合，外层按关联键查表比较；空组取 `COUNT` 为 0、其余聚合为 NULL 的空值语义 |
+
+内层接受的形态：单表 OMAP 查询、无 `ORDER BY`/`LIMIT`/`OFFSET`/窗口、恰好一个等值关联、其余合取项只引用内层表且可被 `VectorizedFilter` 编译；聚合限 `COUNT(*)`/`COUNT`/`SUM`/`MIN`/`MAX`/`AVG` 且 `SUM`/`AVG` 参数为整数列。不识别的形态一律交回 H2 行式路径。
 
 可下推的聚合：`COUNT(*)`、`COUNT(...)`、`COUNT(DISTINCT ...)`、`SUM`、`MIN`、`MAX`、`AVG`，以及形如 `SUM(col * 2)` 的「单列与常量做算术再聚合」。单列分组在字典向量上走 `groupByDict()`，多列分组走 `MultiGroupKey`，`HAVING` 编译成谓词在分组结果上求值。
 
@@ -226,7 +239,7 @@ src/main/java/com/hyd/h2omap/
 ├── storage/       列段、开放段缓冲、delta、rowId 编码、延迟行
 ├── persistence/   WAL 增量日志、增量列段快照与重启恢复
 ├── vector/        列向量（含字典向量与数组列）、ValueVector 回退、null 位图
-├── vectorized/    单表过滤与聚合下推、谓词编译
+├── vectorized/    单表过滤与聚合下推、谓词编译、子查询折叠（SubqueryFold）
 └── stats/         zone map
 
 src/main/java/org/h2/                     被替换的 H2 类与访问桥
@@ -259,7 +272,7 @@ src/test/java/com/hyd/h2omap/
 
 ## 当前状态与后续阶段
 
-M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）与 M8（持久化与单 Jar 打包）已完成，M9（数组列列式存储）已完成。判定依据为 43 个契约用例、15 个存储层用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
+M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）与 M10（子查询下推）均已完成。判定依据为 51 个契约用例、15 个存储层用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
 
 阶段编号按提出顺序，M7、M8 的实际交付早于 M6。
 
@@ -275,6 +288,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 | M7 向量化下推 | 替换 `Select` 与 `Comparison`，单表过滤与聚合按列执行 | 完成 |
 | M8 持久化与单 Jar 打包 | WAL 与增量段快照、重启恢复；shade 合并为单 Jar；普通用户表默认走本引擎 | 完成 |
 | M9 数组列列式存储 | 段内数组列拆成「前缀和下标数组 + 元素列」，`CARDINALITY` 退化为整数减法；段快照新增 `VEC_ARRAY` | 完成 |
+| M10 子查询下推 | `WHERE` 里的子查询谓词折进向量化过滤：不相关标量子查询/EXISTS 常量化、`IN (SELECT)` 集合化、关联标量聚合预计算、关联 EXISTS 半连接 | 完成 |
 
 已确认的设计决策：
 
@@ -291,6 +305,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - 主键与唯一索引用 `ConcurrentSkipListMap` 维护「索引键 → rowId」，`find` 按 `subMap`/`tailMap`/`headMap` 取区间后在存储锁之外迭代。`getCost` 沿用 `getCostRangeIndex` 且不额外加码——加码会让范围查询永远选扫描索引，区间分支不会被调用。
 - 两个索引的 `getCreateSQL()` 都保持返回 `null`：区间分支虽然按索引列有序返回，但顺序保证由 H2 的 `Select.getIndexSorts` 判断，交给扫描加排序更稳妥。
 - 向量化下推只在替换后的 `Select` 上触发，拒绝条件命中时退回 H2 原路径；下推只改变执行方式，不改变结果集内容。`ORDER BY` 由 H2 处理，`sort == null` 时才把 `LIMIT`、`OFFSET` 折成行数上限。
+- 子查询下推的折叠判定与预计算都发生在 `VectorizedFilter.compile` 编译期，不在每行求值期：不相关子查询一次求值后与常量同待遇；关联形态把内层表的一次 `takeVectorizedSnapshot` 预计算成分组聚合或键集合，外层扫描阶段只做哈希查找。预计算的聚合口径对齐 H2 的 `AggregateDataDefault`/`AggregateDataAvg`：`SUM` 溢出即回退，`AVG` 按结果类型走 double 或 `BigDecimal` 除法（HALF_DOWN），`MIN`/`MAX` 用 `session.compare`；关联键无匹配组时 `COUNT` 取 0、其余聚合取 NULL（与 SQL 空组语义一致）；内外层 NULL 键不匹配。整数列的 `IN` 与半连接用原始 `long` 开放寻址集合，避免百万级 `Value` 装箱哈希。
 - 默认引擎由替换后的 `Schema.createTable()` 决定，不依赖 `DEFAULT_TABLE_ENGINE`（它会把 H2 元数据表也交给本引擎）。
 - 性能数字记录在 `BENCHMARK_RESULT.md` 与 `problems/查询性能优化方向.md`；回归只要求集成测试与内部计数器断言。
 
@@ -301,7 +316,9 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - `collectVisibleRowIds` 的数组按 `rowCount` 估计值起步并在超出时扩容，因此估计值与实际可见行数不一致时不会越界；但行数仍不可能超过 `Integer.MAX_VALUE`（`long[]` 的长度上限）。
 - 向量化路径对 `delta` 新像与开放段的行逐行求值，这些行不参与按列扫描。
 - `GROUP BY` 的键必须是单表列引用，表达式分组键不下推。
-- 多表连接与子查询条件下的下推。
+- 多表连接条件下的下推。子查询下推只覆盖单表 `WHERE`：投影里的子查询、JOIN 条件里的子查询、多表查询里的关联子查询仍走 H2 行式路径。
+- 关联 `IN (SELECT ...)` 不折叠（交回 H2）；关联子查询的关联键限单列等值，多关联条件、关联键为表达式、内层 `HAVING`/`GROUP BY`/`DISTINCT`/窗口、内层非 OMAP 表均回退。
+- 关联聚合预计算只接受 `COUNT(*)`/`COUNT`/`SUM`/`MIN`/`MAX`/`AVG` 且 `SUM`/`AVG` 参数为整数列；浮点与十进制求和口径、`COUNT(DISTINCT)`、聚合参数为表达式时不折叠。
 - `ILIKE`、`REGEXP` 等谓词形态未下推。
 
 ## 待核对
@@ -312,6 +329,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - `OmapTableEngine` 不解析 schema 前缀：目录名取 `data.schema.getName()`，表名里的 schema 由 H2 在调用引擎之前解析完。
 - 文中 H2 行号已按 `.h2/` 逐条核对（该目录为 release zip 的 `h2/src/`，不入版本控制，获取方式见「工作约定」）；H2 版本固定为 `2.5.252`，换版本后需要重核。
 - `Comparison` 的替换只为公开 `getCompareType()`。若上游补上同名方法，删除本地副本并同步 shade 排除清单。
+- `ConditionInQuery` 的替换按 `2.5.252` 源码逐字合入后追加四个访问器；升级时除比对新增部分外，还要确认上游本体无改动（尤其 `getValue` 的 NULL 语义与 `createIndexConditions`）。
 
 ## 参考
 
@@ -319,4 +337,4 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - MVStore 设计：`.h2/docsrc/html/mvstore.html`
 - 外部表引擎样例：`.h2/test/org/h2/test/db/TestTableEngines.java`
 - 量化对比与优化记录：`BENCHMARK_RESULT.md`、`problems/查询性能优化方向.md`
-- 标量子查询的定位记录与当前限制：`problems/子查询暂不支持.md`（文件名沿用问题发现时的判断；正文记录修复过程，以及修复后仍未优化的形态）
+- 标量子查询的定位记录与当前限制：`problems/子查询暂不支持.md`（文件名沿用问题发现时的判断；正文记录两轮修复：结果集复用与子查询下推，以及仍未覆盖的形态）
