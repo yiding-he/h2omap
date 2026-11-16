@@ -319,4 +319,4 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - MVStore 设计：`.h2/docsrc/html/mvstore.html`
 - 外部表引擎样例：`.h2/test/org/h2/test/db/TestTableEngines.java`
 - 量化对比与优化记录：`BENCHMARK_RESULT.md`、`problems/查询性能优化方向.md`
-- 标量子查询的历史定位记录：`problems/子查询暂不支持.md`
+- 标量子查询的定位记录与当前限制：`problems/子查询暂不支持.md`（文件名沿用问题发现时的判断；正文记录修复过程，以及修复后仍未优化的形态）
