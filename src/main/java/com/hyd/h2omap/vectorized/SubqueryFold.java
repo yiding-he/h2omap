@@ -32,6 +32,7 @@ import org.h2.value.TypeInfo;
 import org.h2.value.Value;
 import org.h2.value.ValueBigint;
 import org.h2.value.ValueDouble;
+import org.h2.value.ValueInteger;
 import org.h2.value.ValueNull;
 import org.h2.value.ValueNumeric;
 
@@ -40,6 +41,8 @@ import com.hyd.h2omap.storage.ColumnarStore.VectorizedSnapshot;
 import com.hyd.h2omap.table.OmapTable;
 import com.hyd.h2omap.vector.ColumnVector;
 import com.hyd.h2omap.vector.DictValueVector;
+import com.hyd.h2omap.vector.DictVarcharVector;
+import com.hyd.h2omap.vector.DoubleVector;
 import com.hyd.h2omap.vector.IntVector;
 import com.hyd.h2omap.vector.LongVector;
 import com.hyd.h2omap.vector.NullBitmap;
@@ -380,7 +383,11 @@ final class SubqueryFold {
         CompareMode compareMode = table.getCompareMode();
         AggregateType type = inner.aggregate.getAggregateType();
         TypeInfo resultType = inner.aggregate.getType();
-        Map<Object, GroupAgg> groups = new HashMap<>();
+        // 组用列表按槽位保存，槽位由键值解析而来；字典列的槽位可以按字典下标一次算好，
+        // 内层循环里只剩数组读，不做 Value 哈希。
+        Map<Value, Integer> slotOf = new HashMap<>();
+        List<GroupAgg> slotGroups = new ArrayList<>();
+        List<Value> slotKeys = new ArrayList<>();
         VectorizedSnapshot snapshot = table.getStore().takeVectorizedSnapshot();
         try {
             for (ColumnSegment segment : snapshot.segments) {
@@ -410,19 +417,39 @@ final class SubqueryFold {
                 }
                 ColumnVector keyVec = segment.getColumn(inner.innerKeyCol);
                 ColumnVector aggVec = inner.aggCol >= 0 ? segment.getColumn(inner.aggCol) : null;
+                int[] dictCodes = dictCodes(keyVec);
+                if (dictCodes != null) {
+                    Value[] dict = rawDict(keyVec);
+                    int[] codeSlot = new int[dict.length];
+                    for (int c = 0; c < dict.length; c++) {
+                        codeSlot[c] = resolveSlot(dict[c], slotOf, slotGroups, slotKeys,
+                                type, resultType, session, compareMode);
+                    }
+                    for (int i = 0; i < selCount; i++) {
+                        int idx = sel == null ? i : sel[i];
+                        int code = dictCodes[idx];
+                        if (code < 0) {
+                            continue;
+                        }
+                        GroupAgg group = slotGroups.get(codeSlot[code]);
+                        if (aggVec != null) {
+                            group.addColumn(aggVec, idx);
+                        } else {
+                            group.count++;
+                        }
+                    }
+                    continue;
+                }
                 for (int i = 0; i < selCount; i++) {
                     int idx = sel == null ? i : sel[i];
                     Value k = keyVec.get(idx);
                     if (k == ValueNull.INSTANCE) {
                         continue;
                     }
-                    GroupAgg group = groups.get(k);
-                    if (group == null) {
-                        group = new GroupAgg(type, resultType);
-                        groups.put(k, group);
-                    }
+                    GroupAgg group = slotGroups.get(resolveSlot(k, slotOf, slotGroups, slotKeys,
+                            type, resultType, session, compareMode));
                     if (aggVec != null) {
-                        group.addColumn(aggVec, idx, session);
+                        group.addColumn(aggVec, idx);
                     } else {
                         group.count++;
                     }
@@ -437,13 +464,10 @@ final class SubqueryFold {
                 if (k == ValueNull.INSTANCE) {
                     continue;
                 }
-                GroupAgg group = groups.get(k);
-                if (group == null) {
-                    group = new GroupAgg(type, resultType);
-                    groups.put(k, group);
-                }
+                GroupAgg group = slotGroups.get(resolveSlot(k, slotOf, slotGroups, slotKeys,
+                        type, resultType, session, compareMode));
                 if (inner.aggCol >= 0) {
-                    group.addValue(row[inner.aggCol], session);
+                    group.addValue(row[inner.aggCol]);
                 } else {
                     group.count++;
                 }
@@ -451,17 +475,59 @@ final class SubqueryFold {
         } catch (RuntimeException e) {
             return null;
         }
-        Map<Object, Value> results = new HashMap<>(groups.size() * 2);
+        Map<Object, Value> results = new HashMap<>(slotGroups.size() * 2);
         try {
-            for (Map.Entry<Object, GroupAgg> entry : groups.entrySet()) {
-                results.put(normalizeKey((Value) entry.getKey(), inner.outerKeyType, session),
-                        entry.getValue().result());
+            for (int s = 0; s < slotGroups.size(); s++) {
+                results.put(normalizeKey(slotKeys.get(s), inner.outerKeyType, session),
+                        slotGroups.get(s).result());
             }
         } catch (RuntimeException e) {
             return null;
         }
         return results;
     }
+
+    /** 解析键值对应的组槽位；{@code ValueNull} 返回 {@code -1}。 */
+    private static int resolveSlot(Value key, Map<Value, Integer> slotOf, List<GroupAgg> slotGroups,
+            List<Value> slotKeys, AggregateType type, TypeInfo resultType,
+            SessionLocal session, CompareMode compareMode) {
+        if (key == ValueNull.INSTANCE) {
+            return -1;
+        }
+        Integer slot = slotOf.get(key);
+        if (slot != null) {
+            return slot;
+        }
+        int s = slotGroups.size();
+        slotGroups.add(new GroupAgg(type, resultType, session, compareMode));
+        slotKeys.add(key);
+        slotOf.put(key, s);
+        return s;
+    }
+
+    /** 字典向量的行内编码数组；非字典向量返回 {@code null}。 */
+    private static int[] dictCodes(ColumnVector vec) {
+        if (vec instanceof DictValueVector) {
+            return ((DictValueVector) vec).rawCodes();
+        }
+        if (vec instanceof DictVarcharVector) {
+            return ((DictVarcharVector) vec).rawCodes();
+        }
+        return null;
+    }
+
+    /** 字典向量的字典项数组；非字典向量返回 {@code null}。 */
+    private static Value[] rawDict(ColumnVector vec) {
+        if (vec instanceof DictValueVector) {
+            return ((DictValueVector) vec).rawDict();
+        }
+        if (vec instanceof DictVarcharVector) {
+            return ((DictVarcharVector) vec).rawDict();
+        }
+        return null;
+    }
+
+
 
     /** 预计算内层关联键集合；键规范化到外层键列类型。失败返回 {@code null}。 */
     private static Set<Object> precomputeKeySet(Inner inner, SessionLocal session) {
@@ -572,7 +638,10 @@ final class SubqueryFold {
     /**
      * 单组聚合累加器，口径对齐 H2 的 {@code AggregateDataDefault} / {@code AggregateDataAvg} /
      * {@code AggregateDataCount}：SUM 溢出即失败回退；AVG 按结果类型走 double 或
-     * {@code BigDecimal} 除法（HALF_DOWN）；MIN/MAX 用 {@code session.compare}。
+     * {@code BigDecimal} 除法（HALF_DOWN）；MIN/MAX 按数值次序比较。
+     *
+     * <p>段内列走原始数组，不逐行装箱；{@code extraRows} 走 {@link Value} 路径。
+     * MIN/MAX 因此有两个累加器，取值时按类型合并。
      */
     private static final class GroupAgg {
         private final AggregateType type;
@@ -581,14 +650,22 @@ final class SubqueryFold {
         private long longSum;
         private double doubleSum;
         private BigDecimal decimalSum = BigDecimal.ZERO;
+        /** 段内列（原始数组路径）的 MIN/MAX 累加器：Integer / Long / Double。 */
+        private Object extremeRaw;
+        /** {@code extraRows} 路径的 MIN/MAX 累加器。 */
         private Value extreme;
 
-        GroupAgg(AggregateType type, TypeInfo resultType) {
+        private final SessionLocal session;
+        private final CompareMode compareMode;
+
+        GroupAgg(AggregateType type, TypeInfo resultType, SessionLocal session, CompareMode compareMode) {
             this.type = type;
             this.resultType = resultType;
+            this.session = session;
+            this.compareMode = compareMode;
         }
 
-        void addColumn(ColumnVector vec, int idx, SessionLocal session) {
+        void addColumn(ColumnVector vec, int idx) {
             switch (type) {
             case COUNT_ALL:
                 count++;
@@ -604,19 +681,91 @@ final class SubqueryFold {
                     return;
                 }
                 count++;
-                // 累加器按结果类型分派（AVG(INT) 的结果是 DOUBLE，不能写进 longSum）
-                addSumValue(vec.get(idx));
+                if (!accumulateRaw(vec, idx)) {
+                    addSumValue(vec.get(idx));
+                }
                 return;
             case MIN:
             case MAX:
-                addExtreme(vec.get(idx), session);
+                if (vec.nulls().isNull(idx) || addExtremeRaw(vec, idx)) {
+                    return;
+                }
+                addExtreme(vec.get(idx));
                 return;
             default:
                 throw new AssertionError();
             }
         }
 
-        void addValue(Value v, SessionLocal session) {
+        /** 按原始数组累加；不支持的向量类型返回 {@code false}。 */
+        private boolean accumulateRaw(ColumnVector vec, int idx) {
+            int resultValueType = resultType.getValueType();
+            boolean asDouble = resultValueType == Value.DOUBLE;
+            boolean asLong = resultValueType == Value.BIGINT;
+            if (vec instanceof IntVector) {
+                int v = ((IntVector) vec).rawValues()[idx];
+                if (asDouble) {
+                    doubleSum += v;
+                } else if (asLong) {
+                    longSum = Math.addExact(longSum, v);
+                } else {
+                    decimalSum = decimalSum.add(BigDecimal.valueOf(v));
+                }
+                return true;
+            }
+            if (vec instanceof LongVector) {
+                long v = ((LongVector) vec).rawValues()[idx];
+                if (asDouble) {
+                    doubleSum += v;
+                } else if (asLong) {
+                    longSum = Math.addExact(longSum, v);
+                } else {
+                    decimalSum = decimalSum.add(BigDecimal.valueOf(v));
+                }
+                return true;
+            }
+            if (vec instanceof DoubleVector) {
+                double v = ((DoubleVector) vec).rawValues()[idx];
+                if (asDouble) {
+                    doubleSum += v;
+                } else {
+                    decimalSum = decimalSum.add(BigDecimal.valueOf(v));
+                }
+                return true;
+            }
+            return false;
+        }
+
+        /** 按原始数组比较 MIN/MAX；不支持的向量类型返回 {@code false}。 */
+        private boolean addExtremeRaw(ColumnVector vec, int idx) {
+            if (vec instanceof IntVector) {
+                int v = ((IntVector) vec).rawValues()[idx];
+                Integer cur = (Integer) extremeRaw;
+                if (cur == null || (type == AggregateType.MIN ? v < cur : v > cur)) {
+                    extremeRaw = v;
+                }
+                return true;
+            }
+            if (vec instanceof LongVector) {
+                long v = ((LongVector) vec).rawValues()[idx];
+                Long cur = (Long) extremeRaw;
+                if (cur == null || (type == AggregateType.MIN ? v < cur : v > cur)) {
+                    extremeRaw = v;
+                }
+                return true;
+            }
+            if (vec instanceof DoubleVector) {
+                double v = ((DoubleVector) vec).rawValues()[idx];
+                Double cur = (Double) extremeRaw;
+                if (cur == null || (type == AggregateType.MIN ? v < cur : v > cur)) {
+                    extremeRaw = v;
+                }
+                return true;
+            }
+            return false;
+        }
+
+        void addValue(Value v) {
             switch (type) {
             case COUNT_ALL:
                 count++;
@@ -636,14 +785,14 @@ final class SubqueryFold {
                 return;
             case MIN:
             case MAX:
-                addExtreme(v, session);
+                addExtreme(v);
                 return;
             default:
                 throw new AssertionError();
             }
         }
 
-        private void addExtreme(Value v, SessionLocal session) {
+        private void addExtreme(Value v) {
             if (v == ValueNull.INSTANCE) {
                 return;
             }
@@ -651,7 +800,7 @@ final class SubqueryFold {
                 extreme = v;
                 return;
             }
-            int cmp = session.compare(v, extreme);
+            int cmp = v.compareTo(extreme, session, compareMode);
             if ((type == AggregateType.MIN && cmp < 0) || (type == AggregateType.MAX && cmp > 0)) {
                 extreme = v;
             }
@@ -678,12 +827,9 @@ final class SubqueryFold {
                 return ValueBigint.get(count);
             case MIN:
             case MAX:
-                return extreme == null ? ValueNull.INSTANCE : extreme;
+                return extremeValue();
             case SUM:
-                if (count == 0) {
-                    return ValueNull.INSTANCE;
-                }
-                return sumValue();
+                return count == 0 ? ValueNull.INSTANCE : sumValue();
             case AVG:
                 if (count == 0) {
                     return ValueNull.INSTANCE;
@@ -698,6 +844,26 @@ final class SubqueryFold {
             }
         }
 
+        /** 合并原始数组与 {@code Value} 两个 MIN/MAX 累加器。 */
+        private Value extremeValue() {
+            Value raw = null;
+            if (extremeRaw instanceof Integer) {
+                raw = ValueInteger.get((Integer) extremeRaw);
+            } else if (extremeRaw instanceof Long) {
+                raw = ValueBigint.get((Long) extremeRaw);
+            } else if (extremeRaw instanceof Double) {
+                raw = ValueDouble.get((Double) extremeRaw);
+            }
+            if (extreme == null) {
+                return raw == null ? ValueNull.INSTANCE : raw;
+            }
+            if (raw == null) {
+                return extreme;
+            }
+            int cmp = raw.compareTo(extreme, session, compareMode);
+            return (type == AggregateType.MIN ? cmp <= 0 : cmp >= 0) ? raw : extreme;
+        }
+
         private Value sumValue() {
             switch (resultType.getValueType()) {
             case Value.BIGINT:
@@ -709,6 +875,7 @@ final class SubqueryFold {
             }
         }
     }
+
 
     // ------------------------------------------------------------------
     // 节点实现
@@ -899,12 +1066,12 @@ final class SubqueryFold {
             ColumnVector keyVec = segment.getColumn(keyCol);
             ColumnVector cmpVec = segment.getColumn(cmpCol);
             if (fast != null && cmpVec instanceof IntVector
-                    && (keyVec instanceof IntVector || keyVec instanceof DictValueVector)) {
-                return filterIntFast(keyVec, (IntVector) cmpVec, sel, selCount, fullRange);
+                    && (keyVec instanceof IntVector || isDict(keyVec))) {
+                return filterIntFast(keyVec, (IntVector) cmpVec, sel, selCount, fullRange, session);
             }
             if (fast != null && cmpVec instanceof LongVector
-                    && (keyVec instanceof LongVector || keyVec instanceof DictValueVector)) {
-                return filterLongFast(keyVec, (LongVector) cmpVec, sel, selCount, fullRange);
+                    && (keyVec instanceof LongVector || isDict(keyVec))) {
+                return filterLongFast(keyVec, (LongVector) cmpVec, sel, selCount, fullRange, session);
             }
             int out = 0;
             if (fullRange) {
@@ -924,14 +1091,14 @@ final class SubqueryFold {
             return out;
         }
 
-        /** 整数比较列的快路径；键列是 IntVector 或数值字典。 */
+        /** 整数比较列的快路径；键列是 IntVector 或字典向量。 */
         private int filterIntFast(ColumnVector keyVec, IntVector cmpVec, int[] sel, int selCount,
-                boolean fullRange) {
+                boolean fullRange, SessionLocal session) {
             int[] cmpVals = cmpVec.rawValues();
             long[] cmpBits = nullableBits(cmpVec);
             int[] keyVals = keyVec instanceof IntVector ? ((IntVector) keyVec).rawValues() : null;
-            int[] keyCodes = keyVec instanceof DictValueVector ? ((DictValueVector) keyVec).rawCodes() : null;
-            int[] dictKeys = keyCodes != null ? dictKeys((DictValueVector) keyVec) : null;
+            int[] keyCodes = keyVals == null ? rawCodes(keyVec) : null;
+            FastCmp[] dictKeys = keyCodes != null ? dictCmps(keyVec, session) : null;
             long[] keyBits = nullableBits(keyVec);
             int out = 0;
             if (fullRange) {
@@ -952,7 +1119,7 @@ final class SubqueryFold {
         }
 
         private boolean matchIntRow(int idx, int[] cmpVals, long[] cmpBits, int[] keyVals,
-                int[] keyCodes, int[] dictKeys, long[] keyBits) {
+                int[] keyCodes, FastCmp[] dictKeys, long[] keyBits) {
             if (cmpBits != null && (cmpBits[idx >>> 6] & (1L << idx)) != 0) {
                 return false;
             }
@@ -963,7 +1130,7 @@ final class SubqueryFold {
                         : fast.get(keyVals[idx]);
             } else {
                 int code = keyCodes[idx];
-                c = code < 0 ? defaultCmp : fast.get(dictKeys[code]);
+                c = code < 0 ? defaultCmp : dictKeys[code];
             }
             if (c == null) {
                 c = defaultCmp;
@@ -971,14 +1138,14 @@ final class SubqueryFold {
             return matchFast(cmpVals[idx], c);
         }
 
-        /** 长整数比较列的快路径；键列是 LongVector 或数值字典。 */
+        /** 长整数比较列的快路径；键列是 LongVector 或字典向量。 */
         private int filterLongFast(ColumnVector keyVec, LongVector cmpVec, int[] sel, int selCount,
-                boolean fullRange) {
+                boolean fullRange, SessionLocal session) {
             long[] cmpVals = cmpVec.rawValues();
             long[] cmpBits = nullableBits(cmpVec);
             long[] keyVals = keyVec instanceof LongVector ? ((LongVector) keyVec).rawValues() : null;
-            int[] keyCodes = keyVec instanceof DictValueVector ? ((DictValueVector) keyVec).rawCodes() : null;
-            long[] dictKeys = keyCodes != null ? dictLongKeys((DictValueVector) keyVec) : null;
+            int[] keyCodes = keyVals == null ? rawCodes(keyVec) : null;
+            FastCmp[] dictKeys = keyCodes != null ? dictCmps(keyVec, session) : null;
             long[] keyBits = nullableBits(keyVec);
             int out = 0;
             if (fullRange) {
@@ -999,7 +1166,7 @@ final class SubqueryFold {
         }
 
         private boolean matchLongRow(int idx, long[] cmpVals, long[] cmpBits, long[] keyVals,
-                int[] keyCodes, long[] dictKeys, long[] keyBits) {
+                int[] keyCodes, FastCmp[] dictKeys, long[] keyBits) {
             if (cmpBits != null && (cmpBits[idx >>> 6] & (1L << idx)) != 0) {
                 return false;
             }
@@ -1010,7 +1177,7 @@ final class SubqueryFold {
                         : fast.get(keyVals[idx]);
             } else {
                 int code = keyCodes[idx];
-                c = code < 0 ? defaultCmp : fast.get(dictKeys[code]);
+                c = code < 0 ? defaultCmp : dictKeys[code];
             }
             if (c == null) {
                 c = defaultCmp;
@@ -1023,24 +1190,31 @@ final class SubqueryFold {
             return nulls.hasNull() ? nulls.rawBits() : null;
         }
 
-        private static int[] dictKeys(DictValueVector dv) {
-            Value[] dict = dv.rawDict();
-            int size = dv.dictSize();
-            int[] keys = new int[size];
-            for (int i = 0; i < size; i++) {
-                keys[i] = dict[i].getInt();
-            }
-            return keys;
+        private static boolean isDict(ColumnVector vec) {
+            return vec instanceof DictValueVector || vec instanceof DictVarcharVector;
         }
 
-        private static long[] dictLongKeys(DictValueVector dv) {
-            Value[] dict = dv.rawDict();
-            int size = dv.dictSize();
-            long[] keys = new long[size];
-            for (int i = 0; i < size; i++) {
-                keys[i] = dict[i].getLong();
+        /** 字典向量的行内编码数组。 */
+        private static int[] rawCodes(ColumnVector vec) {
+            if (vec instanceof DictValueVector) {
+                return ((DictValueVector) vec).rawCodes();
             }
-            return keys;
+            return ((DictVarcharVector) vec).rawCodes();
+        }
+
+        /** 按字典下标预解析每个码对应的比较目标；缺失的码留 {@code null}，由行级匹配回退到默认值。 */
+        private FastCmp[] dictCmps(ColumnVector vec, SessionLocal session) {
+            Value[] dict = vec instanceof DictValueVector
+                    ? ((DictValueVector) vec).rawDict()
+                    : ((DictVarcharVector) vec).rawDict();
+            FastCmp[] cmps = new FastCmp[dict.length];
+            for (int i = 0; i < dict.length; i++) {
+                Value v = dict[i];
+                cmps[i] = v == ValueNull.INSTANCE
+                        ? null
+                        : fast.get(normalizeKey(v, outerKeyType, session));
+            }
+            return cmps;
         }
 
         private static boolean matchFast(long v, FastCmp c) {
