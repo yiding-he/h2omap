@@ -7,6 +7,7 @@ import org.h2.value.CompareMode;
 import org.h2.value.Value;
 import org.h2.value.ValueNull;
 
+import com.hyd.h2omap.vector.ArrayVector;
 import com.hyd.h2omap.vector.ColumnVector;
 
 /**
@@ -38,6 +39,11 @@ public final class ZoneMap {
      * @return zone map；值不可比较时返回恒相交的实例
      */
     public static ZoneMap of(ColumnVector vector, CompareMode compareMode) {
+        if (vector instanceof ArrayVector) {
+            // 数组列不参与剪枝：要算出值域必须把每行的 ValueArray 重建出来再比较，
+            // 而数组的值域几乎不可能用于跳过段，代价与收益不相称。
+            return new ZoneMap(null, null, compareMode);
+        }
         Value min = null;
         Value max = null;
         for (int i = 0, n = vector.size(); i < n; i++) {

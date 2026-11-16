@@ -7,10 +7,13 @@ import java.util.List;
 import java.util.Map;
 
 import org.h2.value.CompareMode;
+import org.h2.value.ExtTypeInfo;
+import org.h2.value.TypeInfo;
 import org.h2.value.Value;
 import org.h2.value.ValueNull;
 
 import com.hyd.h2omap.stats.ZoneMap;
+import com.hyd.h2omap.vector.ArrayVector;
 import com.hyd.h2omap.vector.ColumnVector;
 import com.hyd.h2omap.vector.DictValueVector;
 import com.hyd.h2omap.vector.DictVarcharVector;
@@ -70,20 +73,28 @@ public final class ColumnSegment {
      * 由一批行构建一个段。调用方保证 {@code rows} 不为空。
      *
      * @param segmentId   段号
-     * @param rows        行数据，每行长度等于列数
-     * @param valueTypes  每列的 H2 类型码，见 {@code org.h2.value.Value}
+     * @param rows        行数据，每行长度等于列数，0 号元素是 rowId
+     * @param columnTypes 每列的 H2 类型，见 {@code org.h2.value.TypeInfo}
      * @param compareMode 数据库的比较模式
      * @return 新段
      */
-    public static ColumnSegment build(int segmentId, List<Value[]> rows, int[] valueTypes,
+    public static ColumnSegment build(int segmentId, List<Value[]> rows, TypeInfo[] columnTypes,
             CompareMode compareMode) {
         int count = rows.size();
         int maxDict = Math.min(4096, Math.max(64, count / 4));
-        ColumnVector[] vectors = new ColumnVector[valueTypes.length];
-        boolean[] prebuilt = new boolean[valueTypes.length];
-        for (int c = 0; c < valueTypes.length; c++) {
-            int type = valueTypes[c];
-            if (type == Value.CHAR || type == Value.VARCHAR) {
+        ColumnVector[] vectors = new ColumnVector[columnTypes.length];
+        boolean[] prebuilt = new boolean[columnTypes.length];
+        for (int c = 0; c < columnTypes.length; c++) {
+            TypeInfo columnType = columnTypes[c];
+            int type = columnType.getValueType();
+            if (type == Value.ARRAY) {
+                ArrayVector arrayVec = ArrayVector.tryBuild(rows, c + 1, elementType(columnType));
+                if (arrayVec != null) {
+                    vectors[c] = arrayVec;
+                    prebuilt[c] = true;
+                    continue;
+                }
+            } else if (type == Value.CHAR || type == Value.VARCHAR) {
                 DictVarcharVector dictVec = DictVarcharVector.tryBuild(rows, c + 1, maxDict);
                 if (dictVec != null) {
                     vectors[c] = dictVec;
@@ -102,17 +113,23 @@ public final class ColumnSegment {
         }
         for (int r = 0; r < count; r++) {
             Value[] row = rows.get(r);
-            for (int c = 0; c < valueTypes.length; c++) {
+            for (int c = 0; c < columnTypes.length; c++) {
                 if (!prebuilt[c]) {
                     vectors[c].set(r, row[c + 1]);
                 }
             }
         }
-        ZoneMap[] zones = new ZoneMap[valueTypes.length];
-        for (int c = 0; c < valueTypes.length; c++) {
+        ZoneMap[] zones = new ZoneMap[columnTypes.length];
+        for (int c = 0; c < columnTypes.length; c++) {
             zones[c] = ZoneMap.of(vectors[c], compareMode);
         }
         return new ColumnSegment(segmentId, count, vectors, zones, compareMode);
+    }
+
+    /** 数组列的元素类型。不是 TypeInfo 或缺失时返回 null，让调用方退回 ValueVector。 */
+    private static TypeInfo elementType(TypeInfo arrayType) {
+        ExtTypeInfo ext = arrayType.getExtTypeInfo();
+        return ext instanceof TypeInfo ? (TypeInfo) ext : null;
     }
 
     private static boolean isNumericDictCandidate(int type) {

@@ -14,8 +14,10 @@ import java.util.List;
 import org.h2.engine.Database;
 import org.h2.mvstore.WriteBuffer;
 import org.h2.mvstore.db.ValueDataType;
+import org.h2.value.TypeInfo;
 import org.h2.value.Value;
 
+import com.hyd.h2omap.vector.ArrayVector;
 import com.hyd.h2omap.vector.ColumnVector;
 import com.hyd.h2omap.vector.DictValueVector;
 import com.hyd.h2omap.vector.DictVarcharVector;
@@ -42,6 +44,8 @@ final class ValueCodec {
     private static final byte VEC_DICT_VALUE = 6;
     private static final byte VEC_VALUE = 7;
     private static final byte VEC_TIMESTAMP = 8;
+
+    private static final byte VEC_ARRAY = 9;
 
     private final ValueDataType valueType;
     private final WriteBuffer writeBuffer = new WriteBuffer(4096);
@@ -163,6 +167,19 @@ final class ValueCodec {
                 out.writeLong(dates[i]);
                 out.writeLong(nanos[i]);
             }
+        } else if (vec instanceof ArrayVector av) {
+            out.writeByte(VEC_ARRAY);
+            writeNullBitmap(out, av.nulls());
+            TypeInfo componentType = av.getComponentType();
+            out.writeInt(componentType.getValueType());
+            out.writeLong(componentType.getPrecision());
+            out.writeInt(componentType.getScale());
+            int[] starts = av.rawStarts();
+            out.writeInt(starts.length - 1);
+            for (int s : starts) {
+                out.writeInt(s);
+            }
+            writeVector(out, av.elements());
         } else if (vec instanceof ValueVector vv) {
             out.writeByte(VEC_VALUE);
             writeNullBitmap(out, vv.nulls());
@@ -252,6 +269,20 @@ final class ValueCodec {
                 nanos[i] = in.readLong();
             }
             return TimestampVector.of(dates, nanos, nulls);
+        }
+        case VEC_ARRAY: {
+            int componentValueType = in.readInt();
+            long precision = in.readLong();
+            int scale = in.readInt();
+            int rowCount = in.readInt();
+            int[] starts = new int[rowCount + 1];
+            for (int i = 0; i <= rowCount; i++) {
+                starts[i] = in.readInt();
+            }
+            ColumnVector elements = readVector(in);
+            return ArrayVector.of(
+                    TypeInfo.getTypeInfo(componentValueType, precision, scale, null),
+                    starts, elements, nulls);
         }
         case VEC_VALUE: {
             int len = in.readInt();

@@ -34,6 +34,7 @@ import org.h2.value.ValueTimestamp;
 
 import com.hyd.h2omap.stats.ZoneMap;
 import com.hyd.h2omap.storage.ColumnSegment;
+import com.hyd.h2omap.vector.ArrayVector;
 import com.hyd.h2omap.vector.ColumnVector;
 import com.hyd.h2omap.vector.DictValueVector;
 import com.hyd.h2omap.vector.DictVarcharVector;
@@ -1086,6 +1087,17 @@ public final class VectorizedFilter {
                 BitSet masked, SessionLocal session, CompareMode compareMode) {
             ColumnVector vec = segment.getColumn(col);
             int out = 0;
+            if (vec instanceof ArrayVector av) {
+                // 数组列已经按行存了元素的起止下标，求元素个数不必重建 ValueArray。
+                for (int i = 0; i < selCount; i++) {
+                    int idx = fullRange ? i : sel[i];
+                    int len = av.length(idx);
+                    if (len >= 0 && matchCompare(Integer.compare(len, target), cmpType)) {
+                        sel[out++] = idx;
+                    }
+                }
+                return out;
+            }
             if (fullRange) {
                 for (int i = 0; i < selCount; i++) {
                     Value v = vec.get(i);

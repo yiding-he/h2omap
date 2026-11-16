@@ -18,6 +18,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.h2.result.Row;
 import org.h2.table.Column;
 import org.h2.value.CompareMode;
+import org.h2.value.TypeInfo;
 import org.h2.value.Value;
 import org.h2.value.ValueBigint;
 import org.h2.value.ValueNull;
@@ -42,6 +43,9 @@ import com.hyd.h2omap.persistence.OmapPersistence;
 public final class ColumnarStore {
 
     private final int[] valueTypes;
+
+    /** 每列的完整类型，建段时用它识别数组列的元素类型。 */
+    private final TypeInfo[] columnTypes;
 
     private final OmapOptions options;
 
@@ -74,8 +78,10 @@ public final class ColumnarStore {
         this.options = options;
         this.compareMode = compareMode;
         this.valueTypes = new int[columns.length];
+        this.columnTypes = new TypeInfo[columns.length];
         for (int i = 0; i < columns.length; i++) {
-            valueTypes[i] = columns[i].getType().getValueType();
+            columnTypes[i] = columns[i].getType();
+            valueTypes[i] = columnTypes[i].getValueType();
         }
         this.openSegment = new SegmentBuilder();
     }
@@ -628,7 +634,7 @@ public final class ColumnarStore {
             return;
         }
         ColumnSegment segment = ColumnSegment.build(
-                nextSegmentId, openSegment.drain(), valueTypes, compareMode);
+                nextSegmentId, openSegment.drain(), columnTypes, compareMode);
         segments.add(segment);
         // 段冻结后，开放段里的删除记录必须移交给 delta，否则那些行会重新可见。
         for (long rowId : openDeletes) {
