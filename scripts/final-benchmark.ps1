@@ -17,7 +17,7 @@
 
 .EXAMPLE
     ./scripts/final-benchmark.ps1
-    内存库，1000 万行，16 读 + 1 写，写线程不限速。
+    内存库，500 万行，16 读 + 1 写，写线程不限速。
 
 .EXAMPLE
     ./scripts/final-benchmark.ps1 -WriterRps 50
@@ -33,7 +33,7 @@
 #>
 [CmdletBinding()]
 param(
-    [int]$Rows = 10000000,
+    [int]$Rows = 5000000,
     [int]$Readers = 16,
     [int]$Rounds = 50,
     [int]$WriterRps = 0,

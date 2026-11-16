@@ -66,10 +66,10 @@ if [[ "$READY" -ne 1 ]]; then
     exit 1
 fi
 
-echo "[4/4] Running final benchmark (10,000,000 rows, OMAP only, 16 readers + 1 writer, 50 rounds, writer_rps=${WRITER_RPS})..."
+echo "[4/4] Running final benchmark (5,000,000 rows, OMAP only, 16 readers + 1 writer, 50 rounds, writer_rps=${WRITER_RPS})..."
 java -Xmx"${CLIENT_XMX}" \
     -cp "${H2_JAR}:target/test-classes" \
     com.hyd.h2omap.bench.ConcurrentQueryBench \
-    16 10000000 50 true omap \
-    "jdbc:h2:tcp://127.0.0.1:${PORT}/mem:omap10m;DB_CLOSE_DELAY=-1;QUERY_CACHE_SIZE=0" \
+    16 5000000 50 true omap \
+    "jdbc:h2:tcp://127.0.0.1:${PORT}/mem:omap5m;DB_CLOSE_DELAY=-1;QUERY_CACHE_SIZE=0" \
     "${WRITER_RPS}"
