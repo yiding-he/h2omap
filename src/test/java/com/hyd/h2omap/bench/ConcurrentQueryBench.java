@@ -29,7 +29,8 @@ public final class ConcurrentQueryBench {
     private static final String[] QUERIES = {
             "SELECT COUNT(*) FROM T WHERE INT_COL * 2 >= 900000",
             "SELECT COUNT(*) FROM T WHERE LOW_CARD IN ('C0','C1','C2','C3','C4','C5')",
-            "SELECT SUM(INT_COL) FROM T WHERE INT_COL >= 400000",
+            "SELECT SUM(INT_COL) FROM T WHERE INT_COL > (SELECT AVG(INT_COL) FROM T T2 "
+                    + "WHERE T2.LOW_CARD = T.LOW_CARD)",
             "SELECT COUNT(*) FROM T WHERE LOW_CARD <> 'C9' AND INT_COL >= 10000 "
                     + "AND DOUBLE_COL < 950 AND TS_COL >= TIMESTAMP '2026-02-01' "
                     + "AND NULLABLE_COL IS NOT NULL AND CARDINALITY(ARRAY_COL) >= 1 "
