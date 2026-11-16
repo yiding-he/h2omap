@@ -771,6 +771,154 @@ class OmapTableContractTest {
         }
     }
 
+    /**
+     * {@code IN (SELECT)} 折成集合节点后的语义核对：非空集、空集、{@code NOT IN} 的 NULL 传播、
+     * 不相关与关联两种形态。
+     */
+    @Test
+    void inSubqueryFoldsIntoSetPredicate() throws SQLException {
+        execute(createTable("T", "ID INT PRIMARY KEY, V INT, TAG VARCHAR", "\"segmentSize=4\""));
+        execute("CREATE TABLE M(ID INT PRIMARY KEY, V INT, TAG VARCHAR)"
+                + " ENGINE \"org.h2.mvstore.db.Store\"");
+        execute("INSERT INTO T VALUES (1, 10, 'a'), (2, 20, 'b'), (3, NULL, 'a'), (4, 40, NULL)");
+        execute("INSERT INTO M VALUES (1, 10, 'a'), (2, 20, 'b'), (3, NULL, 'a'), (4, 40, NULL)");
+
+        String[] queries = {
+                // 非空集且含 NULL 与字符串
+                "SELECT COUNT(*) FROM %1$s WHERE TAG IN (SELECT TAG FROM %1$s WHERE V >= 10)",
+                // NOT IN 且子查询含 NULL：任何行都不命中
+                "SELECT COUNT(*) FROM %1$s WHERE TAG NOT IN (SELECT TAG FROM %1$s WHERE V >= 10)",
+                // 子查询空集：IN 恒假、NOT IN 恒真（含左值为 NULL 的行）
+                "SELECT COUNT(*) FROM %1$s WHERE TAG IN (SELECT TAG FROM %1$s WHERE V > 100)",
+                "SELECT COUNT(*) FROM %1$s WHERE TAG NOT IN (SELECT TAG FROM %1$s WHERE V > 100)",
+                // 左值带 NULL
+                "SELECT COUNT(*) FROM %1$s WHERE V IN (SELECT V FROM %1$s WHERE TAG = 'a')",
+                "SELECT COUNT(*) FROM %1$s WHERE V NOT IN (SELECT V FROM %1$s WHERE TAG = 'a')",
+                // 数值键
+                "SELECT ID FROM %1$s WHERE V IN (SELECT V FROM %1$s WHERE TAG = 'b') ORDER BY ID",
+                // 关联 IN 交回 H2 路径，结果必须一致
+                "SELECT ID FROM %1$s WHERE V IN (SELECT V FROM %1$s T2 WHERE T2.TAG = %1$s.TAG) ORDER BY ID",
+        };
+        for (String query : queries) {
+            assertEquals(rows(String.format(query, "M")), rows(String.format(query, "T")), query);
+        }
+    }
+
+    /**
+     * 单列等值关联的标量聚合子查询折成预计算分组后的语义核对：
+     * 空组取 COUNT 0 / 其余 NULL、内外层 NULL 键不匹配、删除与更新后的可见性。
+     */
+    @Test
+    void correlatedAggregateFoldsIntoPrecomputedGroups() throws SQLException {
+        execute(createTable("T", "ID INT PRIMARY KEY, K INT, V INT", "\"segmentSize=4\""));
+        execute("CREATE TABLE M(ID INT PRIMARY KEY, K INT, V INT)"
+                + " ENGINE \"org.h2.mvstore.db.Store\"");
+        String insert = "INSERT INTO %s VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5), (4, 2, NULL),"
+                + " (5, 3, 7), (6, NULL, 99), (7, 4, 50), (8, 5, 1), (9, 5, 2), (10, NULL, 1)";
+        execute(String.format(insert, "T"));
+        execute(String.format(insert, "M"));
+        // 让段内出现删除位图与 delta 改动，预计算必须跳过已删行、看到新像
+        execute("DELETE FROM T WHERE ID = 2");
+        execute("DELETE FROM M WHERE ID = 2");
+        execute("UPDATE T SET V = 25 WHERE ID = 1");
+        execute("UPDATE M SET V = 25 WHERE ID = 1");
+
+        String[] queries = {
+                "SELECT ID FROM %1$s WHERE V > (SELECT AVG(V) FROM %1$s T2 WHERE T2.K = %1$s.K) ORDER BY ID",
+                "SELECT ID FROM %1$s WHERE V > (SELECT COUNT(V) FROM %1$s T2 WHERE T2.K = %1$s.K) ORDER BY ID",
+                "SELECT ID FROM %1$s WHERE V > (SELECT COUNT(*) FROM %1$s T2 WHERE T2.K = %1$s.K) ORDER BY ID",
+                "SELECT ID FROM %1$s WHERE V > (SELECT SUM(V) FROM %1$s T2 WHERE T2.K = %1$s.K) ORDER BY ID",
+                "SELECT ID FROM %1$s WHERE V < (SELECT MIN(V) FROM %1$s T2 WHERE T2.K = %1$s.K) ORDER BY ID",
+                "SELECT ID FROM %1$s WHERE V <= (SELECT MAX(V) FROM %1$s T2 WHERE T2.K = %1$s.K) ORDER BY ID",
+                // 内层常量谓词
+                "SELECT ID FROM %1$s WHERE V > (SELECT AVG(V) FROM %1$s T2 WHERE T2.K = %1$s.K AND T2.V > 6) ORDER BY ID",
+                // 子查询在比较左侧
+                "SELECT ID FROM %1$s WHERE (SELECT MIN(V) FROM %1$s T2 WHERE T2.K = %1$s.K) < V ORDER BY ID",
+        };
+        for (String query : queries) {
+            assertEquals(rows(String.format(query, "M")), rows(String.format(query, "T")), query);
+        }
+    }
+
+    /**
+     * 关联 {@code EXISTS} / {@code NOT EXISTS} 折成半连接后的语义核对，
+     * 含内层常量谓词与不相关 {@code EXISTS} 常量化。
+     */
+    @Test
+    void correlatedExistsFoldsIntoSemiJoin() throws SQLException {
+        execute(createTable("T", "ID INT PRIMARY KEY, K INT, V INT", "\"segmentSize=4\""));
+        execute("CREATE TABLE M(ID INT PRIMARY KEY, K INT, V INT)"
+                + " ENGINE \"org.h2.mvstore.db.Store\"");
+        String insert = "INSERT INTO %s VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5), (4, 3, 7),"
+                + " (5, NULL, 99), (6, 4, 50), (7, NULL, 1)";
+        execute(String.format(insert, "T"));
+        execute(String.format(insert, "M"));
+
+        String[] queries = {
+                "SELECT ID FROM %1$s WHERE EXISTS (SELECT 1 FROM %1$s T2 WHERE T2.K = %1$s.K) ORDER BY ID",
+                "SELECT ID FROM %1$s WHERE NOT EXISTS (SELECT 1 FROM %1$s T2 WHERE T2.K = %1$s.K) ORDER BY ID",
+                // 内层常量谓词
+                "SELECT ID FROM %1$s WHERE EXISTS (SELECT 1 FROM %1$s T2 WHERE T2.K = %1$s.K AND T2.V > 15) ORDER BY ID",
+                "SELECT ID FROM %1$s WHERE NOT EXISTS (SELECT 1 FROM %1$s T2 WHERE T2.K = %1$s.K AND T2.V > 15) ORDER BY ID",
+                // 不相关 EXISTS 常量化
+                "SELECT ID FROM %1$s WHERE EXISTS (SELECT 1 FROM %1$s WHERE V > 100) ORDER BY ID",
+                "SELECT ID FROM %1$s WHERE NOT EXISTS (SELECT 1 FROM %1$s WHERE V > 100) ORDER BY ID",
+        };
+        for (String query : queries) {
+            assertEquals(rows(String.format(query, "M")), rows(String.format(query, "T")), query);
+        }
+    }
+
+    /**
+     * 不识别的关联形态（多关联条件、内层 HAVING、内层非 OMAP 表）交回 H2 路径，
+     * 结果必须与 MVStore 一致。
+     */
+    @Test
+    void unsupportedCorrelatedShapesFallBackToRowPath() throws SQLException {
+        execute(createTable("T", "ID INT PRIMARY KEY, K INT, V INT", "\"segmentSize=4\""));
+        execute("CREATE TABLE M(ID INT PRIMARY KEY, K INT, V INT)"
+                + " ENGINE \"org.h2.mvstore.db.Store\"");
+        String insert = "INSERT INTO %s VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5), (4, 3, 7)";
+        execute(String.format(insert, "T"));
+        execute(String.format(insert, "M"));
+
+        String[] queries = {
+                // 多关联条件
+                "SELECT ID FROM %1$s WHERE V > (SELECT AVG(V) FROM %1$s T2"
+                        + " WHERE T2.K = %1$s.K AND T2.V < %1$s.V) ORDER BY ID",
+                // 内层 HAVING
+                "SELECT ID FROM %1$s WHERE V > (SELECT MAX(V) FROM %1$s T2 WHERE T2.K = K"
+                        + " HAVING MAX(V) > 4) ORDER BY ID",
+                // 内层非 OMAP 表
+                "SELECT ID FROM %1$s WHERE V > (SELECT AVG(V) FROM M T2 WHERE T2.K = %1$s.K) ORDER BY ID",
+                // 关联 IN：当前不折叠，交回 H2
+                "SELECT ID FROM %1$s WHERE V IN (SELECT T2.V FROM %1$s T2 WHERE T2.K = %1$s.K) ORDER BY ID",
+                "SELECT ID FROM %1$s WHERE V NOT IN (SELECT T2.V FROM %1$s T2 WHERE T2.K = %1$s.K) ORDER BY ID",
+        };
+        for (String query : queries) {
+            assertEquals(rows(String.format(query, "M")), rows(String.format(query, "T")), query);
+        }
+    }
+
+    /**
+     * 1 万行关联标量聚合的耗时断言：折成预计算分组后应在毫秒级，
+     * 未折叠的逐行嵌套循环实测在 3.5 秒量级。预期行数用两步物化独立验证。
+     */
+    @Test
+    void correlatedAggregateFasterThanNestedLoop() throws SQLException {
+        execute(createTable("T", "ID INT PRIMARY KEY, K INT, V INT", "\"segmentSize=1000\""));
+        execute("INSERT INTO T SELECT X, MOD(X, 100), X FROM SYSTEM_RANGE(1, 10000)");
+        execute("CREATE TABLE G(K INT PRIMARY KEY, A DOUBLE) AS SELECT K, AVG(V) FROM T GROUP BY K");
+        String expected = scalar("SELECT COUNT(*) FROM T WHERE V > (SELECT A FROM G WHERE G.K = T.K)");
+
+        long start = System.nanoTime();
+        String actual = scalar("SELECT COUNT(*) FROM T WHERE V > (SELECT AVG(V) FROM T T2 WHERE T2.K = T.K)");
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+        assertEquals(expected, actual);
+        assertTrue(elapsedMs < 200, "correlated aggregate took " + elapsedMs + " ms");
+    }
+
     // ------------------------------------------------------------------
     // 工具
     // ------------------------------------------------------------------
