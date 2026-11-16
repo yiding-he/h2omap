@@ -251,7 +251,7 @@ src/test/java/com/hyd/h2omap/
 `bench/ConcurrentQueryBench.java` 用于多线程并发查询基准（`[threads] [rows] [rounds] [withWriter] [engine] [url]`），支持进程内直连与独立 TCP 服务端进程两种模式：
 
 - 一键复现「最终性能测试」（独立 TCP 服务端 + 1,000 万行 + 仅 OMAP + 16 读 + 1 写 + 50 轮，自动起停服务端与定位 H2 Jar）：Linux 用 `./scripts/final-benchmark.sh`，Windows 用 `./scripts/final-benchmark.ps1`（`-WriterRps 50` 为写限速，`-Persist` 改用文件数据库并启用 OMAP 持久化、结束时重启校验行数，`-Rows`/`-Readers`/`-Rounds`/`-DataDir`/`-KeepData`/`-ServerXmx`/`-ClientXmx`/`-SkipBuild` 可调）。两种脚本等价，均为一次调用跑一种写负载（实测结果记录于 `BENCHMARK_RESULT.md`）。
-- 独立服务端启动（100 万行用 `-Xmx3g`，1000 万行用 `-Xmx6g`）：`java -Xmx6g -cp target/h2omap-0.1.0-SNAPSHOT.jar org.h2.tools.Server -tcp -tcpPort 19092 -ifNotExists`。
+- 独立服务端启动（100 万行用 `-Xmx3g`，1000 万行用 `-Xmx8g`）：`java -Xmx8g -cp target/h2omap-0.1.0-SNAPSHOT.jar org.h2.tools.Server -tcp -tcpPort 19092 -ifNotExists`。
 - 外部纯 H2 客户端压测（16 读 + 1 写 + 100 万行，客户端无需引入 `h2omap` Jar）：`java -Xmx1g -cp "$HOME/.m2/repository/com/h2database/h2/2.5.252/h2-2.5.252.jar:target/test-classes" com.hyd.h2omap.bench.ConcurrentQueryBench 16 1000000 5 true omap "jdbc:h2:tcp://localhost:19092/mem:omapconcurrent;DB_CLOSE_DELAY=-1;QUERY_CACHE_SIZE=0"`。
 - 外部纯 H2 客户端压测（16 读 + 1 写 + 1000 万行，仅 OMAP，50 轮共 3,200 次查询）：`java -Xmx2g -cp "$HOME/.m2/repository/com/h2database/h2/2.5.252/h2-2.5.252.jar:target/test-classes" com.hyd.h2omap.bench.ConcurrentQueryBench 16 10000000 50 true omap "jdbc:h2:tcp://localhost:19092/mem:omap10m;DB_CLOSE_DELAY=-1;QUERY_CACHE_SIZE=0"`。
 

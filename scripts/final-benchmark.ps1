@@ -41,7 +41,7 @@ param(
     [switch]$Persist,
     [string]$DataDir = 'target\bench-db',
     [switch]$KeepData,
-    [string]$ServerXmx = '6g',
+    [string]$ServerXmx = '8g',
     [string]$ClientXmx = '2g',
     [int]$Port = 19092,
     [ValidateSet('omap', 'mv')][string]$Engine = 'omap',
