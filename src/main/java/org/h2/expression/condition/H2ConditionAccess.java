@@ -5,6 +5,7 @@ package org.h2.expression.condition;
 
 import java.util.List;
 
+import org.h2.command.query.Query;
 import org.h2.expression.Expression;
 
 /**
@@ -41,5 +42,15 @@ public final class H2ConditionAccess {
 
     public static List<Expression> getInValues(Expression condition) {
         return ((ConditionIn) condition).valueList;
+    }
+
+    /** 读取 {@link ExistsPredicate} 继承自包私有基类的查询。 */
+    public static Query getExistsQuery(ExistsPredicate exists) {
+        return exists.query;
+    }
+
+    /** 读取 {@link ConditionInQuery} 继承自包私有基类的查询。 */
+    public static Query getInQueryQuery(ConditionInQuery in) {
+        return in.query;
     }
 }

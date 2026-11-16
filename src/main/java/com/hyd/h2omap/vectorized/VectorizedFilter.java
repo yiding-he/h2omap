@@ -207,7 +207,7 @@ public final class VectorizedFilter {
         if (expr instanceof CompareLike) {
             return compileLike((CompareLike) expr, filter, session);
         }
-        return null;
+        return SubqueryFold.compileNode(expr, filter, session);
     }
 
     private static Node compileLike(CompareLike like, TableFilter filter, SessionLocal session) {
@@ -307,6 +307,18 @@ public final class VectorizedFilter {
         if (isFoldableConstant(left, filter)) {
             return compileLeftWithConst(right, flipCompare(cmpType), left.getValue(session), filter, session);
         }
+        if (right instanceof Subquery) {
+            Node n = SubqueryFold.compileCorrelatedCmp(left, cmpType, (Subquery) right, filter, session);
+            if (n != null) {
+                return n;
+            }
+        }
+        if (left instanceof Subquery) {
+            Node n = SubqueryFold.compileCorrelatedCmp(right, flipCompare(cmpType), (Subquery) left, filter, session);
+            if (n != null) {
+                return n;
+            }
+        }
         return null;
     }
 
@@ -324,7 +336,7 @@ public final class VectorizedFilter {
     }
 
     /** 查询是否引用指定过滤表的列，包括嵌套子查询里的引用。 */
-    private static boolean referencesFilter(Query query, TableFilter filter) {
+    static boolean referencesFilter(Query query, TableFilter filter) {
         List<Expression> expressions = query.getExpressions();
         for (int i = 0; i < expressions.size(); i++) {
             if (referencesFilter(expressions.get(i), filter)) {
@@ -353,7 +365,7 @@ public final class VectorizedFilter {
         return false;
     }
 
-    private static boolean referencesFilter(Expression expr, TableFilter filter) {
+    static boolean referencesFilter(Expression expr, TableFilter filter) {
         if (expr == null) {
             return false;
         }
@@ -436,7 +448,7 @@ public final class VectorizedFilter {
      *
      * @return 调整后的常量；用整数边界表达不了该关系时返回 {@code null}
      */
-    private static Value integerBound(Value constant, TypeInfo columnType, int[] cmpType) {
+    static Value integerBound(Value constant, TypeInfo columnType, int[] cmpType) {
         int type = columnType.getValueType();
         if (type != Value.TINYINT && type != Value.SMALLINT
                 && type != Value.INTEGER && type != Value.BIGINT) {
@@ -467,7 +479,7 @@ public final class VectorizedFilter {
         }
     }
 
-    private static int resolveColumn(Expression expr, TableFilter filter) {
+    static int resolveColumn(Expression expr, TableFilter filter) {
         if (expr instanceof ExpressionColumn) {
             ExpressionColumn ec = (ExpressionColumn) expr;
             if (ec.getTableFilter() == filter) {
@@ -492,7 +504,7 @@ public final class VectorizedFilter {
         }
     }
 
-    private static boolean matchCompare(int cmp, int cmpType) {
+    static boolean matchCompare(int cmp, int cmpType) {
         switch (cmpType) {
         case Comparison.EQUAL:
             return cmp == 0;
@@ -1050,15 +1062,67 @@ public final class VectorizedFilter {
         }
     }
 
-    private static final class InNode implements Node {
+    /** 原始 long 开放寻址集合，供整数列的 IN 过滤避开 Value 装箱哈希。 */
+    static final class LongSet {
+        private long[] keys;
+        private boolean[] used;
+        private int mask;
+
+        LongSet(int expected) {
+            int cap = Integer.highestOneBit(Math.max(8, expected * 2 - 1)) << 1;
+            keys = new long[cap];
+            used = new boolean[cap];
+            mask = cap - 1;
+        }
+
+        void add(long key) {
+            int i = (int) (mix(key) & mask);
+            while (used[i]) {
+                if (keys[i] == key) {
+                    return;
+                }
+                i = (i + 1) & mask;
+            }
+            used[i] = true;
+            keys[i] = key;
+        }
+
+        boolean contains(long key) {
+            int i = (int) (mix(key) & mask);
+            while (used[i]) {
+                if (keys[i] == key) {
+                    return true;
+                }
+                i = (i + 1) & mask;
+            }
+            return false;
+        }
+
+        private static long mix(long key) {
+            long h = key * 0x9E3779B97F4A7C15L;
+            return h ^ (h >>> 32);
+        }
+    }
+
+    static final class InNode implements Node {
         private final int col;
         private final boolean not;
         private final Set<Value> set;
+        private final LongSet longSet;
 
         InNode(int col, boolean not, List<Value> values) {
+            this(col, not, new HashSet<>(values), null);
+        }
+
+        InNode(int col, boolean not, LongSet longSet) {
+            this(col, not, null, longSet);
+        }
+
+        private InNode(int col, boolean not, Set<Value> set, LongSet longSet) {
             this.col = col;
             this.not = not;
-            this.set = new HashSet<>(values);
+            this.set = set;
+            this.longSet = longSet;
         }
 
         @Override
@@ -1073,11 +1137,17 @@ public final class VectorizedFilter {
                 DictValueVector dv = (DictValueVector) vec;
                 return filterDict(dv.rawCodes(), dv.rawDict(), dv.dictSize(), sel, selCount, fullRange);
             }
+            if (longSet != null && vec instanceof IntVector) {
+                return filterLongSet(((IntVector) vec).rawValues(), sel, selCount, fullRange);
+            }
+            if (longSet != null && vec instanceof LongVector) {
+                return filterLongSet(((LongVector) vec).rawValues(), sel, selCount, fullRange);
+            }
             int out = 0;
             if (fullRange) {
                 for (int i = 0; i < selCount; i++) {
                     Value v = vec.get(i);
-                    if (v != ValueNull.INSTANCE && (set.contains(v) ^ not)) {
+                    if (v != ValueNull.INSTANCE && contains(v)) {
                         sel[out++] = i;
                     }
                 }
@@ -1085,7 +1155,52 @@ public final class VectorizedFilter {
                 for (int i = 0; i < selCount; i++) {
                     int idx = sel[i];
                     Value v = vec.get(idx);
-                    if (v != ValueNull.INSTANCE && (set.contains(v) ^ not)) {
+                    if (v != ValueNull.INSTANCE && contains(v)) {
+                        sel[out++] = idx;
+                    }
+                }
+            }
+            return out;
+        }
+
+        private boolean contains(Value v) {
+            if (longSet != null) {
+                return longSet.contains(v.getLong()) ^ not;
+            }
+            return set.contains(v) ^ not;
+        }
+
+        private int filterLongSet(int[] vals, int[] sel, int selCount, boolean fullRange) {
+            int out = 0;
+            if (fullRange) {
+                for (int i = 0; i < selCount; i++) {
+                    if (longSet.contains(vals[i]) ^ not) {
+                        sel[out++] = i;
+                    }
+                }
+            } else {
+                for (int i = 0; i < selCount; i++) {
+                    int idx = sel[i];
+                    if (longSet.contains(vals[idx]) ^ not) {
+                        sel[out++] = idx;
+                    }
+                }
+            }
+            return out;
+        }
+
+        private int filterLongSet(long[] vals, int[] sel, int selCount, boolean fullRange) {
+            int out = 0;
+            if (fullRange) {
+                for (int i = 0; i < selCount; i++) {
+                    if (longSet.contains(vals[i]) ^ not) {
+                        sel[out++] = i;
+                    }
+                }
+            } else {
+                for (int i = 0; i < selCount; i++) {
+                    int idx = sel[i];
+                    if (longSet.contains(vals[idx]) ^ not) {
                         sel[out++] = idx;
                     }
                 }
@@ -1098,7 +1213,7 @@ public final class VectorizedFilter {
             boolean[] allowed = new boolean[dictSize];
             boolean anyAllowed = false;
             for (int d = 0; d < dictSize; d++) {
-                if (set.contains(dict[d]) ^ not) {
+                if ((longSet != null ? longSet.contains(dict[d].getLong()) : set.contains(dict[d])) ^ not) {
                     allowed[d] = true;
                     anyAllowed = true;
                 }
@@ -1129,7 +1244,7 @@ public final class VectorizedFilter {
         @Override
         public boolean evalRow(Value[] row, SessionLocal session, CompareMode compareMode) {
             Value v = row[col];
-            return v != ValueNull.INSTANCE && (set.contains(v) ^ not);
+            return v != ValueNull.INSTANCE && contains(v);
         }
     }
 
