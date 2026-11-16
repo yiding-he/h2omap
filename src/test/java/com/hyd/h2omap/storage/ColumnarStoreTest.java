@@ -12,13 +12,21 @@ import org.h2.table.Column;
 import org.h2.value.TypeInfo;
 import org.h2.value.CompareMode;
 import org.h2.value.Value;
+import org.h2.value.ValueArray;
 import org.h2.value.ValueInteger;
+import org.h2.value.ValueNull;
 import org.h2.value.ValueVarchar;
 import org.junit.jupiter.api.Test;
 
 import com.hyd.h2omap.engine.OmapOptions;
+import com.hyd.h2omap.vector.ArrayVector;
+import com.hyd.h2omap.vector.ColumnVector;
+import com.hyd.h2omap.vector.IntVector;
+import com.hyd.h2omap.vector.ValueVector;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
@@ -26,6 +34,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
  * M1：段真正产生的单元测试。
  *
  * <p>直接驱动 {@link ColumnarStore}，断言段数与 rowId 的稳定性，
+ * 以及数组列的向量实现（前缀和下标、NULL 与空数组的区分、合并后的长度变化），
  * 这些无法只靠 SQL 层面的行为确认。
  */
 class ColumnarStoreTest {
@@ -50,6 +59,38 @@ class ColumnarStoreTest {
 
     private static String column(Row row, int index) {
         return row.getValueList()[index].getString();
+    }
+
+    private static final TypeInfo INTEGER_TYPE = TypeInfo.getTypeInfo(Value.INTEGER);
+
+    /** 单列、列为 {@code INTEGER ARRAY} 的存储。 */
+    private static ColumnarStore newArrayStore(int segmentSize, int compactionMinRows) {
+        return new ColumnarStore(
+                new Column[] { new Column("A",
+                        TypeInfo.getTypeInfo(Value.ARRAY, -1, -1, INTEGER_TYPE)) },
+                OmapOptions.from(List.of("segmentSize=" + segmentSize,
+                        "compactionMinRows=" + compactionMinRows)),
+                CompareMode.getInstance(null, 0));
+    }
+
+    private static Value[] arrayRow(Value array) {
+        return new Value[] { array };
+    }
+
+    private static Value intArray(int... elements) {
+        Value[] list = new Value[elements.length];
+        for (int i = 0; i < elements.length; i++) {
+            list[i] = ValueInteger.get(elements[i]);
+        }
+        return ValueArray.get(INTEGER_TYPE, list, null);
+    }
+
+    private static List<Integer> intsOf(Value array) {
+        List<Integer> out = new ArrayList<>();
+        for (Value v : ((ValueArray) array).getList()) {
+            out.add(v.getInt());
+        }
+        return out;
     }
 
     @Test
@@ -227,8 +268,7 @@ class ColumnarStoreTest {
                 Arrays.asList(reversed[0], reversed[1], reversed[2], reversed[3], reversed[4]));
     }
 
-    /** 已冻结段内被 delta 删除的行不得计入 rowId 收集结果，且与批量迭代器一致。 */
-    @Test
+    /** 已冻结段内被 delta 删除的行不得计入 rowId 收集结果，且与批量迭代器一致。 */    @Test
     void collectVisibleRowIdsSkipsRowsDeletedFromFrozenSegments() {
         ColumnarStore store = newStore(2);
         long r0 = store.append(row(1, "a"));
@@ -249,5 +289,98 @@ class ColumnarStoreTest {
             }
         }
         assertEquals(viaBatch, Arrays.asList(ids[0], ids[1]));
+    }
+
+    /**
+     * 数组列拆成「前缀和下标 + 元素列」，元素个数不必重建 {@code ValueArray} 就能取到。
+     */
+    @Test
+    void arrayColumnStoresPrefixSumsAndElements() {
+        ColumnarStore store = newArrayStore(2, Integer.MAX_VALUE);
+        long first = store.append(arrayRow(intArray(1, 2, 3)));
+        store.append(arrayRow(intArray()));
+        assertEquals(1, store.segments().size());
+
+        ArrayVector vector = assertInstanceOf(ArrayVector.class,
+                store.segments().get(0).getColumn(0));
+        assertArrayEquals(new int[] { 0, 3, 3 }, vector.rawStarts());
+        assertInstanceOf(IntVector.class, vector.elements());
+        assertEquals(3, vector.length(0));
+        assertEquals(0, vector.length(1));
+        assertEquals(Arrays.asList(1, 2, 3),
+                intsOf(store.materialize(first).getValueList()[0]));
+    }
+
+    /**
+     * 整值 NULL 与空数组是两个不同的结果：前者长度 -1，后者长度 0。
+     * {@code CARDINALITY(col) >= 1} 据此只命中非空数组。
+     */
+    @Test
+    void arrayColumnDistinguishesNullFromEmpty() {
+        ColumnarStore store = newArrayStore(3, Integer.MAX_VALUE);
+        long nullRow = store.append(arrayRow(ValueNull.INSTANCE));
+        long emptyRow = store.append(arrayRow(intArray()));
+        long threeRow = store.append(arrayRow(intArray(1, 2, 3)));
+        assertEquals(1, store.segments().size());
+
+        ArrayVector vector = assertInstanceOf(ArrayVector.class,
+                store.segments().get(0).getColumn(0));
+        assertEquals(-1, vector.length(RowId.offset(nullRow)));
+        assertEquals(0, vector.length(RowId.offset(emptyRow)));
+        assertEquals(3, vector.length(RowId.offset(threeRow)));
+        assertEquals(ValueNull.INSTANCE, store.materialize(nullRow).getValueList()[0]);
+        assertEquals(0, ((ValueArray) store.materialize(emptyRow).getValueList()[0])
+                .getList().length);
+
+        List<Long> hit = new ArrayList<>();
+        for (long rowId : new long[] { nullRow, emptyRow, threeRow }) {
+            if (vector.length(RowId.offset(rowId)) >= 1) {
+                hit.add(rowId);
+            }
+        }
+        assertEquals(List.of(threeRow), hit);
+    }
+
+    /** 合并把长度变化、置 NULL、置空数组三种改动写回段，rowId 不变。 */
+    @Test
+    void compactHandlesArrayLengthChange() {
+        ColumnarStore store = newArrayStore(2, 1);
+        long first = store.append(arrayRow(intArray(1)));
+        long second = store.append(arrayRow(intArray(2)));
+        assertEquals(1, store.segments().size());
+
+        store.update(first, arrayRow(intArray(7, 7, 7)));
+        assertEquals(Arrays.asList(7, 7, 7),
+                intsOf(store.materialize(first).getValueList()[0]));
+        assertEquals(first, store.materialize(first).getKey());
+        assertEquals(Arrays.asList(2),
+                intsOf(store.materialize(second).getValueList()[0]));
+
+        store.update(second, arrayRow(ValueNull.INSTANCE));
+        assertEquals(ValueNull.INSTANCE, store.materialize(second).getValueList()[0]);
+
+        store.update(second, arrayRow(intArray()));
+        assertEquals(0, ((ValueArray) store.materialize(second).getValueList()[0])
+                .getList().length);
+
+        ArrayVector vector = assertInstanceOf(ArrayVector.class,
+                store.segments().get(0).getColumn(0));
+        assertEquals(3, vector.length(RowId.offset(first)));
+        assertEquals(0, vector.length(RowId.offset(second)));
+    }
+
+    /** 元素值类型与列声明不一致时退回 {@link ValueVector}，值原样保存。 */
+    @Test
+    void arrayColumnFallsBackWhenElementTypeDiffers() {
+        ColumnarStore store = newArrayStore(2, Integer.MAX_VALUE);
+        Value strings = ValueArray.get(TypeInfo.getTypeInfo(Value.VARCHAR),
+                new Value[] { ValueVarchar.get("x") }, null);
+        long first = store.append(arrayRow(strings));
+        store.append(arrayRow(intArray(1, 2)));
+        assertEquals(1, store.segments().size());
+
+        ColumnVector vector = store.segments().get(0).getColumn(0);
+        assertInstanceOf(ValueVector.class, vector);
+        assertEquals(strings, store.materialize(first).getValueList()[0]);
     }
 }
