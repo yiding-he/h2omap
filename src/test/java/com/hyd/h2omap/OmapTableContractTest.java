@@ -841,6 +841,43 @@ class OmapTableContractTest {
     }
 
     /**
+     * 关联键为字符串字典列（{@code DictVarcharVector}）时的语义核对：
+     * 外层按字典下标取比较目标，结果必须与 MVStore 一致。
+     *
+     * <p>比较列取 200 个互不相同的值，使每段的不同值数量超过字典容量上限，
+     * 从而建成普通 {@code IntVector}，外层才能走整数比较列的快路径。
+     */
+    @Test
+    void correlatedAggregateWithVarcharKeyFoldsIntoPrecomputedGroups() throws SQLException {
+        execute(createTable("T", "ID INT PRIMARY KEY, K VARCHAR, V INT", "\"segmentSize=100\""));
+        execute("CREATE TABLE M(ID INT PRIMARY KEY, K VARCHAR, V INT)"
+                + " ENGINE \"org.h2.mvstore.db.Store\"");
+        String insert = "INSERT INTO %s SELECT X, CASE MOD(X, 7) WHEN 0 THEN NULL"
+                + " ELSE 'k' || MOD(X, 5) END, X * 10 FROM SYSTEM_RANGE(1, 200)";
+        execute(String.format(insert, "T"));
+        execute(String.format(insert, "M"));
+        // 让段内出现删除位图与 delta 改动，预计算必须跳过已删行、看到新像
+        execute("DELETE FROM T WHERE ID IN (3, 50, 150)");
+        execute("DELETE FROM M WHERE ID IN (3, 50, 150)");
+        execute("UPDATE T SET V = 25 WHERE ID = 4");
+        execute("UPDATE M SET V = 25 WHERE ID = 4");
+
+        String[] queries = {
+                "SELECT COUNT(*) FROM %1$s WHERE V > (SELECT AVG(V) FROM %1$s T2"
+                        + " WHERE T2.K = %1$s.K)",
+                "SELECT COUNT(*) FROM %1$s WHERE V < (SELECT MIN(V) FROM %1$s T2"
+                        + " WHERE T2.K = %1$s.K)",
+                "SELECT COUNT(*) FROM %1$s WHERE V <= (SELECT MAX(V) FROM %1$s T2"
+                        + " WHERE T2.K = %1$s.K)",
+                "SELECT COUNT(*) FROM %1$s WHERE V > (SELECT SUM(V) FROM %1$s T2"
+                        + " WHERE T2.K = %1$s.K AND T2.V > 60)",
+        };
+        for (String query : queries) {
+            assertEquals(rows(String.format(query, "M")), rows(String.format(query, "T")), query);
+        }
+    }
+
+    /**
      * 关联 {@code EXISTS} / {@code NOT EXISTS} 折成半连接后的语义核对，
      * 含内层常量谓词与不相关 {@code EXISTS} 常量化。
      */
