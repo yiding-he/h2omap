@@ -26,7 +26,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | JDK | 构建与运行用 JDK 21.0.11；字节码目标 `maven.compiler.release=17` |
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变）。被替换的 3 个 H2 类按该版本源码合入，升级时必须逐类重新比对 |
 | 依赖 | 运行期只有 `com.h2database:h2`，测试用 `junit-jupiter`，构建期插件 `maven-shade-plugin` |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（43 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（11 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（43 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（15 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/`。该目录可能不存在（已排除在版本控制之外）。Maven Central 的 `h2-2.5.252-sources.jar` 内容等价，但个别文件与该 zip 相差数行，核对行号时以 zip 为准 |
 
 ## H2 侧的依据
@@ -100,7 +100,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 ```
 OmapTable
 ├── segments : List<ColumnSegment>      按段号升序，合并时替换为新段
-│     每列：primitive 数组或字典向量 + null 位图 + zone map
+│     每列：primitive 数组、字典向量或数组列（前缀和下标 + 元素列）+ null 位图 + zone map
 │     段级：删除位图（每行 1 bit）
 └── delta    : DeltaStore               行式写缓冲
       ├── updated        已冻结段内被更新行的新像
@@ -225,7 +225,7 @@ src/main/java/com/hyd/h2omap/
 ├── index/         扫描索引、rowId 索引、游标
 ├── storage/       列段、开放段缓冲、delta、rowId 编码、延迟行
 ├── persistence/   WAL 增量日志、增量列段快照与重启恢复
-├── vector/        列向量（含字典向量）、ValueVector 回退、null 位图
+├── vector/        列向量（含字典向量与数组列）、ValueVector 回退、null 位图
 ├── vectorized/    单表过滤与聚合下推、谓词编译
 └── stats/         zone map
 
@@ -259,7 +259,7 @@ src/test/java/com/hyd/h2omap/
 
 ## 当前状态与后续阶段
 
-M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）与 M8（持久化与单 Jar 打包）已完成。判定依据为 43 个契约用例、11 个存储层用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
+M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）与 M8（持久化与单 Jar 打包）已完成，M9（数组列列式存储）已完成。判定依据为 43 个契约用例、15 个存储层用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
 
 阶段编号按提出顺序，M7、M8 的实际交付早于 M6。
 
@@ -274,11 +274,13 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 | M6 判决点 | 给出「行式物化开销占总耗时比例」的实测结论 | 未开始 |
 | M7 向量化下推 | 替换 `Select` 与 `Comparison`，单表过滤与聚合按列执行 | 完成 |
 | M8 持久化与单 Jar 打包 | WAL 与增量段快照、重启恢复；shade 合并为单 Jar；普通用户表默认走本引擎 | 完成 |
+| M9 数组列列式存储 | 段内数组列拆成「前缀和下标数组 + 元素列」，`CARDINALITY` 退化为整数减法；段快照新增 `VEC_ARRAY` | 完成 |
 
 已确认的设计决策：
 
 - rowId 在插入时按「预分配的段号 + 段内偏移」编码，冻结与合并都不改变已有 rowId。
 - 专用向量包含 `INT`、`BIGINT`、`DOUBLE`、`VARCHAR`、`TIMESTAMP`，其余类型用 `ValueVector` 原样存放，保证段机制对所有类型生效。
+- 数组列拆成「前缀和下标数组 `starts` + 按行拼接的元素列」两部分：`CARDINALITY` 退化为一次整数减法。元素值类型与列声明的元素类型不一致，或元素类型带扩展类型（嵌套数组）时退回 `ValueVector`；只比较元素的值类型，不比较精度，因为 H2 给 `ARRAY[]` 的元素类型是 `NULL`、给 `ARRAY['a','bb']` 的元素类型是 `CHARACTER VARYING(2)` 这样的窄类型。数组列不参与 zone map 剪枝。
 - 字典向量在建段时按基数决定：`VARCHAR` 与低基数数值列尝试建字典，容量上限 `min(4096, max(64, 行数 / 4))`，超出则退回普通向量。
 - 冻结同步在 `append` 的写锁内完成，不交给后台线程。
 - 合并采用「就地写回」而不是「写新段」：段内保留删除位图，delta 的新值写回列向量，rowId 全程不变，因此不需要段集合快照与引用计数。
@@ -295,7 +297,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 ## 尚未实现
 
 - 并发写的后台合并线程：合并现在由写路径同步触发。
-- 数组列的按元素存储与剪枝：目前整值存放在 `ValueVector` 里，zone map 只能整值比较，无法按元素过滤。
+- 数组列的剪枝与按元素过滤：数组列不参与 zone map 剪枝（算值域要重建每行 `ValueArray`，而数组值域几乎不能用于跳段），`UNNEST` 与按元素过滤也没有下推路径。
 - `collectVisibleRowIds` 的数组按 `rowCount` 估计值起步并在超出时扩容，因此估计值与实际可见行数不一致时不会越界；但行数仍不可能超过 `Integer.MAX_VALUE`（`long[]` 的长度上限）。
 - 向量化路径对 `delta` 新像与开放段的行逐行求值，这些行不参与按列扫描。
 - `GROUP BY` 的键必须是单表列引用，表达式分组键不下推。
