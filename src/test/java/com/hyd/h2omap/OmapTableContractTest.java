@@ -1324,6 +1324,102 @@ class OmapTableContractTest {
         }
     }
 
+    @Test
+    void arrayContainsMatchesMvStoreAndSurvivesRestart() throws Exception {
+        Path dir = java.nio.file.Files.createTempDirectory("h2omap_arr_persist_");
+        String url = "jdbc:h2:" + dir.resolve("arr_db").toAbsolutePath() + ";DB_CLOSE_DELAY=-1";
+        String[] templates = {
+                "SELECT ID FROM %s WHERE ARRAY_CONTAINS(V, 100) ORDER BY ID",
+                "SELECT ID FROM %s WHERE NOT ARRAY_CONTAINS(V, 100) ORDER BY ID",
+                "SELECT ID FROM %s WHERE ARRAY_CONTAINS(V, NULL) ORDER BY ID",
+                "SELECT ID FROM %s WHERE NOT ARRAY_CONTAINS(V, NULL) ORDER BY ID",
+                "SELECT ID FROM %s WHERE ARRAY_CONTAINS(V, 100) OR ID < 5 ORDER BY ID",
+                "SELECT ID FROM %s WHERE ARRAY_CONTAINS(V, 100) AND ARRAY_CONTAINS(S, 'abc') ORDER BY ID",
+                "SELECT ID FROM %s WHERE ARRAY_CONTAINS(S, 'abc') ORDER BY ID",
+                "SELECT ID FROM %s WHERE NOT ARRAY_CONTAINS(S, 'abc') ORDER BY ID",
+                "SELECT ID FROM %s WHERE ARRAY_CONTAINS(V, 100.0) ORDER BY ID",
+                "SELECT ID FROM %s WHERE ARRAY_CONTAINS(V, 100.5) ORDER BY ID",
+                "SELECT ID FROM %s WHERE ARRAY_CONTAINS(B, 100) ORDER BY ID",
+                "SELECT ID FROM %s WHERE ARRAY_CONTAINS(D, 2.5) ORDER BY ID",
+                "SELECT ID FROM %s WHERE ARRAY_CONTAINS(T, TIMESTAMP '2026-01-02 03:04:05') ORDER BY ID",
+                "SELECT ID FROM %s WHERE ARRAY_CONTAINS(ID, 1) ORDER BY ID",
+                "SELECT COUNT(*) FROM %s WHERE ARRAY_CONTAINS(V, 100) AND ID > 2 AND IV < 900",
+                "SELECT CAT, COUNT(*) FROM %s WHERE ARRAY_CONTAINS(V, 100) GROUP BY CAT ORDER BY CAT NULLS FIRST",
+                "SELECT ID, S FROM %s WHERE ARRAY_CONTAINS(S, 'abc') AND ID >= 3 ORDER BY ID DESC LIMIT 4",
+        };
+        try (Connection c1 = DriverManager.getConnection(url, "sa", "");
+                Statement s = c1.createStatement()) {
+            String ddl = " (ID INT PRIMARY KEY, CAT VARCHAR(8), IV INT, V INT ARRAY, S VARCHAR ARRAY,"
+                    + " B BIGINT ARRAY, D DOUBLE ARRAY, T TIMESTAMP ARRAY) ";
+            s.execute("CREATE TABLE T" + ddl + "WITH \"segmentSize=8\", \"compactionMinRows=2\"");
+            s.execute("CREATE TABLE T_MV" + ddl + "ENGINE \"org.h2.mvstore.db.Store\"");
+            for (int i = 1; i <= 30; i++) {
+                String v = switch (i % 6) {
+                case 0 -> "NULL";
+                case 1 -> "ARRAY[]";
+                case 2 -> "ARRAY[100]";
+                case 3 -> "ARRAY[100, " + i + "]";
+                case 4 -> "ARRAY[" + i + ", " + (i + 1) + "]";
+                default -> "ARRAY[NULL, 100]";
+                };
+                String sv = switch (i % 5) {
+                case 0 -> "NULL";
+                case 1 -> "ARRAY[]";
+                case 2 -> "ARRAY['abc', 'x']";
+                case 3 -> "ARRAY['abd']";
+                default -> "ARRAY['abc']";
+                };
+                String b = switch (i % 4) {
+                case 0 -> "NULL";
+                case 1 -> "ARRAY[100]";
+                default -> "ARRAY[" + i + "]";
+                };
+                String d = switch (i % 4) {
+                case 0 -> "NULL";
+                case 1 -> "ARRAY[2.5]";
+                case 2 -> "ARRAY[2.0]";
+                default -> "ARRAY[" + i + " * 0.5]";
+                };
+                String t = switch (i % 4) {
+                case 0 -> "NULL";
+                case 1 -> "ARRAY[TIMESTAMP '2026-01-02 03:04:05']";
+                default -> "ARRAY[TIMESTAMP '2026-01-0" + (1 + i % 3) + " 03:04:05']";
+                };
+                String row = i + ", 'c" + (i % 3) + "', " + (i * 10) + ", " + v + ", " + sv
+                        + ", " + b + ", " + d + ", " + t;
+                s.execute("INSERT INTO T VALUES (" + row + ")");
+                s.execute("INSERT INTO T_MV VALUES (" + row + ")");
+            }
+            assertEquals("15", toString(s,
+                    "SELECT COUNT(*) FROM T WHERE ARRAY_CONTAINS(V, 100)"));
+            assertQueriesMatch(s, templates);
+
+            // 更新与删除让命中的行同时出现在已冻结段与 delta 里
+            for (String table : new String[] { "T", "T_MV" }) {
+                s.execute("UPDATE " + table + " SET V = ARRAY[100] WHERE ID IN (5, 8)");
+                s.execute("UPDATE " + table + " SET V = ARRAY[] WHERE ID = 11");
+                s.execute("DELETE FROM " + table + " WHERE ID IN (2, 20)");
+            }
+            assertEquals("12", toString(s,
+                    "SELECT COUNT(*) FROM T WHERE ARRAY_CONTAINS(V, 100)"));
+            assertQueriesMatch(s, templates);
+        }
+        try (Connection c2 = DriverManager.getConnection(url, "sa", "");
+                Statement s = c2.createStatement()) {
+            assertEquals("12", toString(s,
+                    "SELECT COUNT(*) FROM T WHERE ARRAY_CONTAINS(V, 100)"));
+            assertQueriesMatch(s, templates);
+        }
+    }
+
+    private static void assertQueriesMatch(Statement s, String[] templates) throws SQLException {
+        for (String template : templates) {
+            String expected = collectRows(s, String.format(template, "T_MV"));
+            String actual = collectRows(s, String.format(template, "T"));
+            assertEquals(expected, actual, "Mismatch on query: " + template);
+        }
+    }
+
     private static String collectRows(Statement s, String sql) throws SQLException {
         StringBuilder sb = new StringBuilder();
         try (ResultSet rs = s.executeQuery(sql)) {

@@ -19,6 +19,7 @@ import org.h2.expression.Expression;
 import org.h2.expression.ExpressionColumn;
 import org.h2.expression.H2ExpressionAccess;
 import org.h2.expression.Operation1;
+import org.h2.expression.OperationN;
 import org.h2.expression.Subquery;
 import org.h2.expression.ValueExpression;
 import org.h2.expression.condition.CompareLike;
@@ -27,14 +28,17 @@ import org.h2.expression.condition.ConditionAndOr;
 import org.h2.expression.condition.ConditionAndOrN;
 import org.h2.expression.condition.ConditionInConstantSet;
 import org.h2.expression.condition.ConditionInList;
+import org.h2.expression.condition.ConditionNot;
 import org.h2.expression.condition.H2ConditionAccess;
 import org.h2.expression.condition.NullPredicate;
+import org.h2.expression.function.ArrayFunction;
 import org.h2.expression.function.CardinalityExpression;
 import org.h2.table.TableFilter;
 import org.h2.value.CompareMode;
 import org.h2.value.TypeInfo;
 import org.h2.value.Value;
 import org.h2.value.ValueArray;
+import org.h2.value.ValueCollectionBase;
 import org.h2.value.ValueNull;
 import org.h2.value.ValueNumeric;
 import org.h2.value.ValueTimestamp;
@@ -207,7 +211,49 @@ public final class VectorizedFilter {
         if (expr instanceof CompareLike) {
             return compileLike((CompareLike) expr, filter, session);
         }
+        if (isArrayContains(expr)) {
+            return compileArrayContains((ArrayFunction) expr, false, filter, session);
+        }
+        if (expr instanceof ConditionNot) {
+            Expression inner = expr.getSubexpression(0);
+            if (isArrayContains(inner)) {
+                return compileArrayContains((ArrayFunction) inner, true, filter, session);
+            }
+            return null;
+        }
         return SubqueryFold.compileNode(expr, filter, session);
+    }
+
+    private static boolean isArrayContains(Expression expr) {
+        return expr instanceof ArrayFunction
+                && "ARRAY_CONTAINS".equals(((ArrayFunction) expr).getName());
+    }
+
+    /**
+     * 编译 {@code ARRAY_CONTAINS(数组列, 常量)}；{@code negate} 为 {@code true} 表示外面包了一层 {@code NOT}。
+     *
+     * <p>语义按 H2 的 {@code ArrayFunction.ARRAY_CONTAINS}：数组为 NULL 时结果是 NULL（两种形式都不命中），
+     * 否则只要有一个元素与目标值相等（NULL 与 NULL 视为相等）即为 TRUE，没有则为 FALSE。
+     */
+    private static Node compileArrayContains(ArrayFunction fn, boolean negate,
+            TableFilter filter, SessionLocal session) {
+        Expression[] args = H2ExpressionAccess.getArgs(fn);
+        if (args.length != 2) {
+            return null;
+        }
+        int col = resolveColumn(args[0], filter);
+        if (col < 0 || !args[1].isConstant()) {
+            return null;
+        }
+        int columnType = filter.getTable().getColumn(col).getType().getValueType();
+        if (columnType != Value.ARRAY && columnType != Value.ROW) {
+            return null;
+        }
+        Value target = args[1].getValue(session);
+        if (target == null) {
+            return null;
+        }
+        return new ArrayContainsNode(col, target, negate);
     }
 
     private static Node compileLike(CompareLike like, TableFilter filter, SessionLocal session) {
@@ -1359,6 +1405,246 @@ public final class VectorizedFilter {
             Value v = row[col];
             return v != ValueNull.INSTANCE && matchCard(v);
         }
+    }
+
+    private static final class ArrayContainsNode implements Node {
+        private final int col;
+        private final Value target;
+        private final boolean negate;
+
+        ArrayContainsNode(int col, Value target, boolean negate) {
+            this.col = col;
+            this.target = target;
+            this.negate = negate;
+        }
+
+        @Override
+        public int filterSegment(ColumnSegment segment, int[] sel, int selCount, boolean fullRange,
+                BitSet masked, SessionLocal session, CompareMode compareMode) {
+            ColumnVector vec = segment.getColumn(col);
+            if (vec instanceof ArrayVector) {
+                return filterArray((ArrayVector) vec, sel, selCount, fullRange, session, compareMode);
+            }
+            int out = 0;
+            for (int i = 0; i < selCount; i++) {
+                int idx = fullRange ? i : sel[i];
+                if (matchValue(vec.get(idx), session, compareMode) == (negate ? 0 : 1)) {
+                    sel[out++] = idx;
+                }
+            }
+            return out;
+        }
+
+        /**
+         * 在元素列上判等：{@code starts} 给出每行元素的区间，按行的区间求“是否有元素相等”。
+         *
+         * <p>与 {@link ArrayVector#get(int)} 逐行重建 {@code ValueArray} 的区别是这里不产生任何对象。
+         */
+        private int filterArray(ArrayVector av, int[] sel, int selCount, boolean fullRange,
+                SessionLocal session, CompareMode compareMode) {
+            ColumnVector elements = av.elements();
+            NullBitmap arrayNulls = av.nulls();
+            int[] starts = av.rawStarts();
+            int targetType = target.getValueType();
+            if (target == ValueNull.INSTANCE) {
+                NullBitmap elementNulls = elements.nulls();
+                int out = 0;
+                for (int i = 0; i < selCount; i++) {
+                    int idx = fullRange ? i : sel[i];
+                    if (arrayNulls.isNull(idx)) {
+                        continue;
+                    }
+                    boolean found = false;
+                    for (int j = starts[idx], end = starts[idx + 1]; j < end; j++) {
+                        if (elementNulls.isNull(j)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found != negate) {
+                        sel[out++] = idx;
+                    }
+                }
+                return out;
+            }
+            if (elements instanceof IntVector && targetType == Value.INTEGER) {
+                IntVector iv = (IntVector) elements;
+                int[] vals = iv.rawValues();
+                NullBitmap elementNulls = iv.nulls();
+                boolean hasNull = elementNulls.hasNull();
+                int t = target.getInt();
+                int out = 0;
+                for (int i = 0; i < selCount; i++) {
+                    int idx = fullRange ? i : sel[i];
+                    if (arrayNulls.isNull(idx)) {
+                        continue;
+                    }
+                    boolean found = false;
+                    for (int j = starts[idx], end = starts[idx + 1]; j < end; j++) {
+                        if ((!hasNull || !elementNulls.isNull(j)) && vals[j] == t) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found != negate) {
+                        sel[out++] = idx;
+                    }
+                }
+                return out;
+            }
+            if (elements instanceof LongVector && targetType == Value.BIGINT) {
+                LongVector lv = (LongVector) elements;
+                long[] vals = lv.rawValues();
+                NullBitmap elementNulls = lv.nulls();
+                boolean hasNull = elementNulls.hasNull();
+                long t = target.getLong();
+                int out = 0;
+                for (int i = 0; i < selCount; i++) {
+                    int idx = fullRange ? i : sel[i];
+                    if (arrayNulls.isNull(idx)) {
+                        continue;
+                    }
+                    boolean found = false;
+                    for (int j = starts[idx], end = starts[idx + 1]; j < end; j++) {
+                        if ((!hasNull || !elementNulls.isNull(j)) && vals[j] == t) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found != negate) {
+                        sel[out++] = idx;
+                    }
+                }
+                return out;
+            }
+            if (elements instanceof DoubleVector && targetType == Value.DOUBLE) {
+                DoubleVector dv = (DoubleVector) elements;
+                double[] vals = dv.rawValues();
+                NullBitmap elementNulls = dv.nulls();
+                boolean hasNull = elementNulls.hasNull();
+                double t = target.getDouble();
+                int out = 0;
+                for (int i = 0; i < selCount; i++) {
+                    int idx = fullRange ? i : sel[i];
+                    if (arrayNulls.isNull(idx)) {
+                        continue;
+                    }
+                    boolean found = false;
+                    for (int j = starts[idx], end = starts[idx + 1]; j < end; j++) {
+                        if ((!hasNull || !elementNulls.isNull(j)) && Double.compare(vals[j], t) == 0) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found != negate) {
+                        sel[out++] = idx;
+                    }
+                }
+                return out;
+            }
+            if (elements instanceof VarcharVector && targetType == Value.VARCHAR) {
+                VarcharVector sv = (VarcharVector) elements;
+                String[] vals = sv.rawValues();
+                NullBitmap elementNulls = sv.nulls();
+                boolean hasNull = elementNulls.hasNull();
+                String t = target.getString();
+                int out = 0;
+                for (int i = 0; i < selCount; i++) {
+                    int idx = fullRange ? i : sel[i];
+                    if (arrayNulls.isNull(idx)) {
+                        continue;
+                    }
+                    boolean found = false;
+                    for (int j = starts[idx], end = starts[idx + 1]; j < end; j++) {
+                        if ((!hasNull || !elementNulls.isNull(j)) && vals[j] != null
+                                && compareMode.compareString(vals[j], t, false) == 0) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found != negate) {
+                        sel[out++] = idx;
+                    }
+                }
+                return out;
+            }
+            if (elements instanceof DictVarcharVector && isStringType(targetType)) {
+                DictVarcharVector dv = (DictVarcharVector) elements;
+                int[] codes = dv.rawCodes();
+                Value[] dict = dv.rawDict();
+                boolean[] matched = new boolean[dv.dictSize()];
+                for (int d = 0; d < matched.length; d++) {
+                    matched[d] = dict[d].compareTo(target, session, compareMode) == 0;
+                }
+                int out = 0;
+                for (int i = 0; i < selCount; i++) {
+                    int idx = fullRange ? i : sel[i];
+                    if (arrayNulls.isNull(idx)) {
+                        continue;
+                    }
+                    boolean found = false;
+                    for (int j = starts[idx], end = starts[idx + 1]; j < end; j++) {
+                        int code = codes[j];
+                        if (code >= 0 && matched[code]) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found != negate) {
+                        sel[out++] = idx;
+                    }
+                }
+                return out;
+            }
+            int out = 0;
+            for (int i = 0; i < selCount; i++) {
+                int idx = fullRange ? i : sel[i];
+                if (arrayNulls.isNull(idx)) {
+                    continue;
+                }
+                boolean found = false;
+                for (int j = starts[idx], end = starts[idx + 1]; j < end; j++) {
+                    if (elements.get(j).compareTo(target, session, compareMode) == 0) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (found != negate) {
+                    sel[out++] = idx;
+                }
+            }
+            return out;
+        }
+
+        /**
+         * 整值判等，返回 {@code 1} 命中、{@code 0} 不命中、{@code -1} 结果为 NULL。
+         *
+         * <p>非数组值按 H2 的定义结果也是 NULL（{@code ArrayFunction} 对既非 ARRAY 也非 ROW 的首参返回 NULL）。
+         */
+        private int matchValue(Value v, SessionLocal session, CompareMode compareMode) {
+            if (v == null || v == ValueNull.INSTANCE) {
+                return -1;
+            }
+            int type = v.getValueType();
+            if (type != Value.ARRAY && type != Value.ROW) {
+                return -1;
+            }
+            for (Value element : ((ValueCollectionBase) v).getList()) {
+                if (element.compareTo(target, session, compareMode) == 0) {
+                    return 1;
+                }
+            }
+            return 0;
+        }
+
+        @Override
+        public boolean evalRow(Value[] row, SessionLocal session, CompareMode compareMode) {
+            return matchValue(row[col], session, compareMode) == (negate ? 0 : 1);
+        }
+    }
+
+    private static boolean isStringType(int type) {
+        return type == Value.VARCHAR || type == Value.CHAR || type == Value.VARCHAR_IGNORECASE;
     }
 
     private static final class LikeNode implements Node {

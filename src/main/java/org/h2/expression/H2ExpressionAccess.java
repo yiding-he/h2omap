@@ -4,7 +4,7 @@
 package org.h2.expression;
 
 /**
- * 暴露 {@link Operation1} 与 {@link Operation2} 的受保护子表达式字段。
+ * 暴露 {@link Operation1}、{@link Operation2} 与 {@link OperationN} 的受保护子表达式字段。
  */
 public final class H2ExpressionAccess {
 
@@ -21,5 +21,9 @@ public final class H2ExpressionAccess {
 
     public static Expression getRight(Operation2 op) {
         return op.right;
+    }
+
+    public static Expression[] getArgs(OperationN op) {
+        return op.args;
     }
 }
