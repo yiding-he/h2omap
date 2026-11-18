@@ -1298,6 +1298,51 @@ class OmapTableContractTest {
     }
 
     @Test
+    void orderedLimitMatchesMvStoreAndStopsEarly() throws Exception {
+        execute("CREATE TABLE T (ID BIGINT PRIMARY KEY, TS TIMESTAMP, S VARCHAR) "
+                + "ENGINE \"" + ENGINE + "\" WITH \"segmentSize=10\"");
+        execute("CREATE TABLE T_MV (ID BIGINT PRIMARY KEY, TS TIMESTAMP, S VARCHAR) "
+                + "ENGINE \"org.h2.mvstore.db.Store\"");
+        long base = java.sql.Timestamp.valueOf("2026-01-01 00:00:00").getTime();
+        for (int i = 0; i < 200; i++) {
+            String ts = "TIMESTAMP '" + new java.sql.Timestamp(base + i * 1000L) + "'";
+            String vals = i + ", " + ts + ", 's_" + (i % 7) + "'";
+            execute("INSERT INTO T VALUES (" + vals + ")");
+            execute("INSERT INTO T_MV VALUES (" + vals + ")");
+        }
+        // 制造 delta 新像与删除，验证 extraRows 也参与堆
+        execute("UPDATE T SET TS = TIMESTAMP '2026-01-01 00:05:00' WHERE ID = 1");
+        execute("UPDATE T_MV SET TS = TIMESTAMP '2026-01-01 00:05:00' WHERE ID = 1");
+        execute("DELETE FROM T WHERE ID = 199");
+        execute("DELETE FROM T_MV WHERE ID = 199");
+
+        org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                ((org.h2.jdbc.JdbcConnection) conn).getSession();
+        com.hyd.h2omap.table.OmapTable table = (com.hyd.h2omap.table.OmapTable)
+                session.getDatabase().getMainSchema().findTableOrView(session, "T");
+        com.hyd.h2omap.storage.ColumnarStore store = table.getStore();
+
+        String[] queries = {
+                "SELECT ID, TS FROM %s ORDER BY TS DESC LIMIT 5",
+                "SELECT ID, TS FROM %s ORDER BY TS ASC LIMIT 5",
+                "SELECT ID, S FROM %s ORDER BY TS DESC LIMIT 7 OFFSET 3",
+                "SELECT ID, TS FROM %s WHERE TS >= TIMESTAMP '2026-01-01 00:00:30' "
+                        + "AND TS <= TIMESTAMP '2026-01-01 00:02:00' ORDER BY TS DESC LIMIT 6",
+                "SELECT ID, TS FROM %s ORDER BY ID DESC LIMIT 4"
+        };
+        long beforeSkips = store.getOrderedSkippedSegmentCount();
+        try (Statement s = conn.createStatement()) {
+            for (String template : queries) {
+                String expected = collectRows(s, String.format(template, "T_MV"));
+                String actual = collectRows(s, String.format(template, "T"));
+                assertEquals(expected, actual, "Mismatch on query: " + template);
+            }
+        }
+        assertTrue(store.getOrderedSkippedSegmentCount() > beforeSkips,
+                "有序 LIMIT 应跳过部分段，实际未跳：" + store.getOrderedSkippedSegmentCount());
+    }
+
+    @Test
     void vectorizedBoundsPruneSegmentsWithoutChangingResults() throws Exception {
         execute("CREATE TABLE T (ID BIGINT PRIMARY KEY, TS TIMESTAMP) "
                 + "ENGINE \"" + ENGINE + "\" WITH \"segmentSize=10\"");
