@@ -7,8 +7,8 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import org.h2.engine.Database;
@@ -118,15 +118,17 @@ final class ValueCodec {
             out.writeByte(VEC_VARCHAR);
             NullBitmap nulls = sv.nulls();
             writeNullBitmap(out, nulls);
-            String[] arr = sv.rawValues();
-            out.writeInt(arr.length);
-            for (int i = 0; i < arr.length; i++) {
-                if (!nulls.isNull(i) && arr[i] != null) {
-                    byte[] utf8 = arr[i].getBytes(StandardCharsets.UTF_8);
-                    out.writeInt(utf8.length);
-                    out.write(utf8);
-                } else {
+            int rows = sv.filledRows();
+            int[] starts = sv.rawStarts();
+            byte[] data = sv.rawData();
+            out.writeInt(rows);
+            for (int i = 0; i < rows; i++) {
+                if (nulls.isNull(i)) {
                     out.writeInt(-1);
+                } else {
+                    int len = starts[i + 1] - starts[i];
+                    out.writeInt(len);
+                    out.write(data, starts[i], len);
                 }
             }
         } else if (vec instanceof DictVarcharVector dv) {
@@ -222,17 +224,22 @@ final class ValueCodec {
             return DoubleVector.of(arr, nulls);
         }
         case VEC_VARCHAR: {
-            int len = in.readInt();
-            String[] arr = new String[len];
-            for (int i = 0; i < len; i++) {
-                int slen = in.readInt();
-                if (slen >= 0) {
-                    byte[] utf8 = new byte[slen];
-                    in.readFully(utf8);
-                    arr[i] = new String(utf8, StandardCharsets.UTF_8);
+            int rows = in.readInt();
+            int[] starts = new int[rows + 1];
+            byte[] data = new byte[Math.max(16, rows * 8)];
+            int pos = 0;
+            for (int i = 0; i < rows; i++) {
+                int len = in.readInt();
+                if (len >= 0) {
+                    if (pos + len > data.length) {
+                        data = Arrays.copyOf(data, Math.max(pos + len, data.length * 2));
+                    }
+                    in.readFully(data, pos, len);
+                    pos += len;
                 }
+                starts[i + 1] = pos;
             }
-            return VarcharVector.of(arr, nulls);
+            return VarcharVector.of(starts, data, nulls);
         }
         case VEC_DICT_VARCHAR: {
             int dictSize = in.readInt();

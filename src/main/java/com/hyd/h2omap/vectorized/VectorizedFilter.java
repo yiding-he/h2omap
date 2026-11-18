@@ -1619,7 +1619,6 @@ public final class VectorizedFilter {
             }
             if (elements instanceof VarcharVector && targetType == Value.VARCHAR) {
                 VarcharVector sv = (VarcharVector) elements;
-                String[] vals = sv.rawValues();
                 NullBitmap elementNulls = sv.nulls();
                 boolean hasNull = elementNulls.hasNull();
                 String t = target.getString();
@@ -1631,8 +1630,8 @@ public final class VectorizedFilter {
                     }
                     boolean found = false;
                     for (int j = starts[idx], end = starts[idx + 1]; j < end; j++) {
-                        if ((!hasNull || !elementNulls.isNull(j)) && vals[j] != null
-                                && compareMode.compareString(vals[j], t, false) == 0) {
+                        if ((!hasNull || !elementNulls.isNull(j))
+                                && compareMode.compareString(sv.getString(j), t, false) == 0) {
                             found = true;
                             break;
                         }
@@ -1777,20 +1776,19 @@ public final class VectorizedFilter {
             }
             if (vec instanceof VarcharVector) {
                 VarcharVector vv = (VarcharVector) vec;
-                String[] vals = vv.rawValues();
                 NullBitmap nulls = vv.nulls();
                 boolean hasNull = nulls.hasNull();
                 synchronized (like) {
                     if (fullRange) {
                         for (int i = 0; i < selCount; i++) {
-                            if ((!hasNull || !nulls.isNull(i)) && vals[i] != null && matchString(vals[i])) {
+                            if ((!hasNull || !nulls.isNull(i)) && matchString(vv.getString(i))) {
                                 sel[out++] = i;
                             }
                         }
                     } else {
                         for (int i = 0; i < selCount; i++) {
                             int idx = sel[i];
-                            if ((!hasNull || !nulls.isNull(idx)) && vals[idx] != null && matchString(vals[idx])) {
+                            if ((!hasNull || !nulls.isNull(idx)) && matchString(vv.getString(idx))) {
                                 sel[out++] = idx;
                             }
                         }
