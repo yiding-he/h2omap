@@ -1452,6 +1452,36 @@ class OmapTableContractTest {
         }
     }
 
+    /**
+     * 行式路径的区间剪枝不丢 delta 新像：段的 zone map 可能落后于 delta
+     * （更新量低于合并阈值时新像留在段外；重开后 WAL 重放又把它放回 delta），
+     * 被剪段内已更新行必须仍可见。DISTINCT 拒绝向量化下推，走 H2 行式路径。
+     */
+    @Test
+    void rowPathBoundsKeepDeltaRows() throws Exception {
+        // 不设 DB_CLOSE_DELAY：关掉最后一个连接即关闭数据库，第二次连接从段文件与 WAL 重放恢复
+        Path dir = java.nio.file.Files.createTempDirectory("h2omap_delta_prune_");
+        String url = "jdbc:h2:" + dir.resolve("dp_db").toAbsolutePath();
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            s.execute("CREATE TABLE T(ID BIGINT PRIMARY KEY, S VARCHAR(64))"
+                    + " WITH \"segmentSize=128\", \"compactionMinRows=20\"");
+            for (int i = 1; i <= 400; i++) {
+                s.execute("INSERT INTO T VALUES (" + i + ", 'value-"
+                        + String.format("%010d", i) + "-pad')");
+            }
+            // 4 行更新（ID = 83、166、249、332，全在冻结段）低于合并阈值：
+            // 新像留在 delta，段 zone map 仍是更新前的 'value-...'
+            s.execute("UPDATE T SET S = CONCAT('zzz-', S) WHERE MOD(ID, 83) = 0");
+            // 区间下界 'y' 使更新前 zone map 不相交，剪枝若丢 delta 新像则返回 0
+            assertEquals(4, countRows(s, "SELECT DISTINCT ID FROM T WHERE S >= 'y'"));
+        }
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            assertEquals(4, countRows(s, "SELECT DISTINCT ID FROM T WHERE S >= 'y'"));
+        }
+    }
+
     @Test
     void timestampVectorSurvivesRestartAndCompaction() throws Exception {
         Path dir = java.nio.file.Files.createTempDirectory("h2omap_ts_persist_");
@@ -1572,6 +1602,16 @@ class OmapTableContractTest {
             String expected = collectRows(s, String.format(template, "T_MV"));
             String actual = collectRows(s, String.format(template, "T"));
             assertEquals(expected, actual, "Mismatch on query: " + template);
+        }
+    }
+
+    private static int countRows(Statement s, String sql) throws SQLException {
+        try (ResultSet rs = s.executeQuery(sql)) {
+            int n = 0;
+            while (rs.next()) {
+                n++;
+            }
+            return n;
         }
     }
 

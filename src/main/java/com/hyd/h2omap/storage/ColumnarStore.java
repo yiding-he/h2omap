@@ -928,6 +928,12 @@ public final class ColumnarStore {
         }
 
         private boolean intersects(ColumnSegment segment) {
+            // 段的 zone map 可能落后于 delta（重开后 WAL 重放把更新放回 delta，段文件与
+            // 其中重算的 zone map 仍是合并前的；未重开时合并也会先改段后清 delta），
+            // 被剪段内的 delta 新像会随段一起丢。有 delta 改动的段不参与边界剪枝。
+            if (delta.hasSegmentDelta(segment.getSegmentId())) {
+                return true;
+            }
             return ColumnarStore.intersects(segment, lower, upper, valueTypes.length);
         }
     }
