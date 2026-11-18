@@ -81,6 +81,18 @@ public final class VectorizedFilter {
 
         /** 对 delta/开放段的行数组做逐行过滤。 */
         boolean evalRow(Value[] row, SessionLocal session, CompareMode compareMode);
+
+        /**
+         * 收集本节点给出的列值区间，供存储层按段剪枝。
+         *
+         * <p>只有顶层 {@code AND} 的合取项参与：区间取宽不取窄，漏剪只是少省一点，
+         * 剪错会丢行。因此 {@code OR}、{@code IN}、{@code <>}、列上算术等形态保持空实现。
+         *
+         * @param lower 每列下界，{@code null} 元素表示该列无下界
+         * @param upper 每列上界，{@code null} 元素表示该列无上界
+         */
+        default void collectBounds(Value[] lower, Value[] upper) {
+        }
     }
 
     private final Node root;
@@ -109,6 +121,20 @@ public final class VectorizedFilter {
 
     public boolean evalRow(Value[] row, SessionLocal session, CompareMode compareMode) {
         return root.evalRow(row, session, compareMode);
+    }
+
+    /**
+     * 收集顶层合取项给出的列值区间。
+     *
+     * @param columnCount 表的列数
+     * @return 长度为 2 的数组：{@code [0]} 是每列下界、{@code [1]} 是每列上界，
+     *         元素为 {@code null} 表示该侧无界
+     */
+    public Value[][] segmentBounds(int columnCount) {
+        Value[] lower = new Value[columnCount];
+        Value[] upper = new Value[columnCount];
+        root.collectBounds(lower, upper);
+        return new Value[][] { lower, upper };
     }
 
     /** 编译过滤表达式；不支持时返回 {@code null}。 */
@@ -525,6 +551,28 @@ public final class VectorizedFilter {
         }
     }
 
+    /**
+     * 记录某列的边界值。同一列已有边界时保持原值不动，即区间取宽不取窄。
+     *
+     * <p>合取项中的每一个都是合法区间，因此只保留其中一个也不会漏掉任何命中的行，
+     * 只是多保留一段更宽的区间、少省一点。这样不需要比较两个常量，
+     * 也就不依赖类型的比较模式。
+     *
+     * @param bounds 每列边界数组
+     * @param column 列号
+     * @param value  候选边界值
+     */
+    static void setBound(Value[] bounds, int column, Value value) {
+        if (bounds == null || column < 0 || column >= bounds.length || value == null
+                || value == ValueNull.INSTANCE) {
+            return;
+        }
+        Value current = bounds[column];
+        if (current == null || current == ValueNull.INSTANCE) {
+            bounds[column] = value;
+        }
+    }
+
     static int resolveColumn(Expression expr, TableFilter filter) {
         if (expr instanceof ExpressionColumn) {
             ExpressionColumn ec = (ExpressionColumn) expr;
@@ -603,6 +651,13 @@ public final class VectorizedFilter {
                 }
             }
             return true;
+        }
+
+        @Override
+        public void collectBounds(Value[] lower, Value[] upper) {
+            for (Node child : children) {
+                child.collectBounds(lower, upper);
+            }
         }
     }
 
@@ -687,6 +742,26 @@ public final class VectorizedFilter {
             this.col = col;
             this.cmpType = cmpType;
             this.constant = constant;
+        }
+
+        @Override
+        public void collectBounds(Value[] lower, Value[] upper) {
+            switch (cmpType) {
+            case Comparison.EQUAL:
+                setBound(lower, col, constant);
+                setBound(upper, col, constant);
+                break;
+            case Comparison.BIGGER:
+            case Comparison.BIGGER_EQUAL:
+                setBound(lower, col, constant);
+                break;
+            case Comparison.SMALLER:
+            case Comparison.SMALLER_EQUAL:
+                setBound(upper, col, constant);
+                break;
+            default:
+                break;
+            }
         }
 
         @Override

@@ -117,7 +117,7 @@ public final class OmapVectorizedExecutor {
         }
 
         OmapTable table = (OmapTable) tableFilter.getTable();
-        ColumnarStore.VectorizedSnapshot snap = table.getStore().takeVectorizedSnapshot();
+        ColumnarStore.VectorizedSnapshot snap = takeSnapshot(table, filter, tableFilter);
         CompareMode compareMode = table.getCompareMode();
         long emitted = 0;
 
@@ -300,9 +300,8 @@ public final class OmapVectorizedExecutor {
         int aggCount = aggSpecs.length;
 
         OmapTable table = (OmapTable) tableFilter.getTable();
-        ColumnarStore store = table.getStore();
         CompareMode compareMode = table.getCompareMode();
-        ColumnarStore.VectorizedSnapshot snap = store.takeVectorizedSnapshot();
+        ColumnarStore.VectorizedSnapshot snap = takeSnapshot(table, filter, tableFilter);
 
         if (groupCount == 0) {
             executeGlobal(snap, filter, havingPred, aggSpecs, aggCount, resultColumnCount,
@@ -315,6 +314,22 @@ public final class OmapVectorizedExecutor {
                     groupByCopies, aggSpecs, aggCount, resultColumnCount, result, session, compareMode);
         }
         return true;
+    }
+
+    /**
+     * 取向量化快照，并把过滤条件给出的列值区间交给存储层按段剪枝。
+     *
+     * <p>区间只由顶层 {@code AND} 的合取项给出，与合取项的排列顺序无关，
+     * 所以不可能命中的段在任何谓词开始求值之前就被跳过。
+     */
+    private static ColumnarStore.VectorizedSnapshot takeSnapshot(OmapTable table, VectorizedFilter filter,
+            TableFilter tableFilter) {
+        ColumnarStore store = table.getStore();
+        if (filter == null) {
+            return store.takeVectorizedSnapshot();
+        }
+        Value[][] bounds = filter.segmentBounds(tableFilter.getTable().getColumns().length);
+        return store.takeVectorizedSnapshot(bounds[0], bounds[1]);
     }
 
     private static boolean qualifyIndexCheck(List<Expression> expressions, int resultColumnCount, int havingIndex) {

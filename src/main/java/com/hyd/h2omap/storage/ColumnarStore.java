@@ -72,6 +72,8 @@ public final class ColumnarStore {
 
     private long rowCount;
 
+    private final AtomicLong prunedSegments = new AtomicLong();
+
     private volatile OmapPersistence persistence;
 
     public ColumnarStore(Column[] columns, OmapOptions options, CompareMode compareMode) {
@@ -924,22 +926,7 @@ public final class ColumnarStore {
         }
 
         private boolean intersects(ColumnSegment segment) {
-            for (int c = 0; c < valueTypes.length; c++) {
-                Value low = bound(lower, c);
-                Value high = bound(upper, c);
-                if ((low != null || high != null) && !segment.getZoneMap(c).mayIntersect(low, high)) {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        private Value bound(Value[] bounds, int column) {
-            if (bounds == null || column >= bounds.length) {
-                return null;
-            }
-            Value v = bounds[column];
-            return v == null || v == ValueNull.INSTANCE ? null : v;
+            return ColumnarStore.intersects(segment, lower, upper, valueTypes.length);
         }
     }
 
@@ -962,9 +949,23 @@ public final class ColumnarStore {
     }
 
     public VectorizedSnapshot takeVectorizedSnapshot() {
+        return takeVectorizedSnapshot(null, null);
+    }
+
+    /**
+     * 向量化查询的一次性一致性快照，并按列值区间跳过不可能命中的段。
+     *
+     * @param lower 每列下界，null 元素表示该列无下界；null 表示不剪枝
+     * @param upper 每列上界，null 元素表示该列无上界；null 表示不剪枝
+     * @return 快照，{@code segments} 只含可能与区间相交的段
+     */
+    public VectorizedSnapshot takeVectorizedSnapshot(Value[] lower, Value[] upper) {
         lock.readLock().lock();
         try {
             ColumnSegment[] segs = segments.toArray(new ColumnSegment[0]);
+            if (lower != null || upper != null) {
+                segs = prune(segs, lower, upper);
+            }
             Map<Integer, BitSet> masked = null;
             for (ColumnSegment seg : segs) {
                 if (seg.getDeleted().hasNull()) {
@@ -1019,5 +1020,47 @@ public final class ColumnarStore {
         } finally {
             lock.readLock().unlock();
         }
+    }
+
+    private ColumnSegment[] prune(ColumnSegment[] segs, Value[] lower, Value[] upper) {
+        int kept = 0;
+        ColumnSegment[] result = new ColumnSegment[segs.length];
+        for (ColumnSegment segment : segs) {
+            if (intersects(segment, lower, upper, valueTypes.length)) {
+                result[kept++] = segment;
+            }
+        }
+        prunedSegments.addAndGet(segs.length - kept);
+        return kept == segs.length ? segs : Arrays.copyOf(result, kept);
+    }
+
+    /**
+     * 段是否可能与给定区间相交。区间为 null 的一侧视为无界。
+     *
+     * <p>行迭代器与向量化快照共用这一份判定，避免两套实现漂移。
+     */
+    private static boolean intersects(ColumnSegment segment, Value[] lower, Value[] upper,
+            int columnCount) {
+        for (int c = 0; c < columnCount; c++) {
+            Value low = bound(lower, c);
+            Value high = bound(upper, c);
+            if ((low != null || high != null) && !segment.getZoneMap(c).mayIntersect(low, high)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static Value bound(Value[] bounds, int column) {
+        if (bounds == null || column >= bounds.length) {
+            return null;
+        }
+        Value v = bounds[column];
+        return v == null || v == ValueNull.INSTANCE ? null : v;
+    }
+
+    /** 被段级 zone map 剪掉的段数累计值，供测试断言剪枝确实生效。 */
+    public long getPrunedSegmentCount() {
+        return prunedSegments.get();
     }
 }
