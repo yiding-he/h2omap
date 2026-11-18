@@ -27,7 +27,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | JDK | 构建与运行用 JDK 21.0.11；字节码目标 `maven.compiler.release=17` |
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变）。被替换的 3 个 H2 类按该版本源码合入，升级时必须逐类重新比对 |
 | 依赖 | 运行期只有 `com.h2database:h2`，测试用 `junit-jupiter`，构建期插件 `maven-shade-plugin` |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（57 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（17 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（59 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（17 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/`。该目录可能不存在（已排除在版本控制之外）。Maven Central 的 `h2-2.5.252-sources.jar` 内容等价，但个别文件与该 zip 相差数行，核对行号时以 zip 为准 |
 
 ## H2 侧的依据
@@ -158,6 +158,7 @@ rowId 在 `append` 时就确定，之后不变。段号在开放段创建时预�
 | 不相关 `EXISTS`/`NOT EXISTS` | 编译期求值一次折成恒真/恒假 |
 | 关联 `EXISTS`/`NOT EXISTS`（单列等值关联） | 对内层表预计算关联键集合，折成半连接节点；键按外层键列类型装箱后哈希查找 |
 | 关联标量聚合子查询（单列等值关联、内层单聚合无分组） | 对内层表 `takeVectorizedSnapshot` 预计算一次分组聚合，外层按关联键查表比较；空组取 `COUNT` 为 0、其余聚合为 NULL 的空值语义 |
+| 关联 `IN`/`NOT IN (SELECT)`（单列等值关联、内层投影为列引用） | 预计算「关联键 → 内层值集合」，外层按键做成员判定；整数族值列用原始 `long` 集合（按元素数扩容），字典键列按码预解析集合引用；`NOT IN` 按 SQL 三值语义，UNKNOWN 不命中 |
 
 内层接受的形态：单表 OMAP 查询、无 `ORDER BY`/`LIMIT`/`OFFSET`/窗口、恰好一个等值关联、其余合取项只引用内层表且可被 `VectorizedFilter` 编译；聚合限 `COUNT(*)`/`COUNT`/`SUM`/`MIN`/`MAX`/`AVG` 且 `SUM`/`AVG` 参数为整数列。不识别的形态一律交回 H2 行式路径。
 
@@ -277,7 +278,7 @@ src/test/java/com/hyd/h2omap/
 
 ## 当前状态与后续阶段
 
-M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成。判定依据为 57 个契约用例、17 个存储层用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
+M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成。判定依据为 59 个契约用例、17 个存储层用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
 
 阶段编号按提出顺序，M7、M8 的实际交付早于 M6。
 
@@ -326,7 +327,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - 向量化路径对 `delta` 新像与开放段的行逐行求值，这些行不参与按列扫描。
 - `GROUP BY` 的键必须是单表列引用，表达式分组键不下推。
 - 多表连接条件下的下推。子查询下推只覆盖单表 `WHERE`：投影里的子查询、JOIN 条件里的子查询、多表查询里的关联子查询仍走 H2 行式路径。
-- 关联 `IN (SELECT ...)` 不折叠（交回 H2）；关联子查询的关联键限单列等值，多关联条件、关联键为表达式、内层 `HAVING`/`GROUP BY`/`DISTINCT`/窗口、内层非 OMAP 表均回退。
+- 关联 `IN (SELECT ...)` 的投影为表达式时不折叠（内层投影限列引用）；关联子查询的关联键限单列等值，多关联条件、关联键为表达式、内层 `HAVING`/`GROUP BY`/`DISTINCT`/窗口、内层非 OMAP 表均回退。
 - 关联聚合预计算只接受 `COUNT(*)`/`COUNT`/`SUM`/`MIN`/`MAX`/`AVG` 且 `SUM`/`AVG` 参数为整数列；浮点与十进制求和口径、`COUNT(DISTINCT)`、聚合参数为表达式时不折叠。
 - `ILIKE`、`REGEXP` 等谓词形态未下推。
 
