@@ -915,7 +915,7 @@ public class Select extends Query {
             return false;
         }
         long maxRows = -1L;
-        if (sort == null && !fetchPercent && limit >= 0) {
+        if (!fetchPercent && limit >= 0) {
             if (offset > 0) {
                 long sum = limit + offset;
                 maxRows = sum < 0 ? Long.MAX_VALUE : sum;
@@ -924,7 +924,7 @@ public class Select extends Query {
             }
         }
         return com.hyd.h2omap.vectorized.OmapVectorizedExecutor.tryExecuteFlat(
-                session, topTableFilter, condition, expressions, resultColumnCount, maxRows, result);
+                session, topTableFilter, condition, expressions, resultColumnCount, maxRows, sort, result);
     }
 
     private boolean tryVectorizedGroup(LocalResult result) {

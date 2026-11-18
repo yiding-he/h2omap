@@ -74,6 +74,8 @@ public final class ColumnarStore {
 
     private final AtomicLong prunedSegments = new AtomicLong();
 
+    private final AtomicLong orderedSkippedSegments = new AtomicLong();
+
     private volatile OmapPersistence persistence;
 
     public ColumnarStore(Column[] columns, OmapOptions options, CompareMode compareMode) {
@@ -1062,5 +1064,15 @@ public final class ColumnarStore {
     /** 被段级 zone map 剪掉的段数累计值，供测试断言剪枝确实生效。 */
     public long getPrunedSegmentCount() {
         return prunedSegments.get();
+    }
+
+    /** 有序扫描中因段内最好一行不优于第 N 名而整段跳过的段数，供测试断言早停生效。 */
+    public long getOrderedSkippedSegmentCount() {
+        return orderedSkippedSegments.get();
+    }
+
+    /** 记一次有序扫描的整段跳过。 */
+    public void recordOrderedSkip() {
+        orderedSkippedSegments.incrementAndGet();
     }
 }
