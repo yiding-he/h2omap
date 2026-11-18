@@ -23,6 +23,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | --- | --- |
 | 构建 | `mvn -B -q package`；`maven-shade-plugin` 产出单 Jar `target/h2omap-0.1.0-SNAPSHOT.jar`，其中已排除被替换的 H2 同名类 |
 | 测试 | `mvn -B test`；一次性运行 Gradle 时加 `--no-daemon`（本仓库用 Maven） |
+| 性能测试 | 不对原版 H2（`ENGINE "org.h2.mvstore.db.Store"`）做耗时测量。H2 自身的执行缺陷（关联子查询不做去关联化、派生表被编译成参数化视图等）会让这类测量跑到小时级甚至无法结束，得不出可用数据。MVStore 只用作**结果正确性**的对照：契约与规模用例里的 `T_MV` 表用于逐行比对，不记录耗时；需要性能数字时只测 OMAP 侧，并与历史 OMAP 数字对照 |
 | JDK | 构建与运行用 JDK 21.0.11；字节码目标 `maven.compiler.release=17` |
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变）。被替换的 3 个 H2 类按该版本源码合入，升级时必须逐类重新比对 |
 | 依赖 | 运行期只有 `com.h2database:h2`，测试用 `junit-jupiter`，构建期插件 `maven-shade-plugin` |
@@ -261,9 +262,9 @@ src/test/java/com/hyd/h2omap/
 └── bench/                        测试数据生成与规模验证
 ```
 
-`bench/DataGenerator.java` 是固定种子（20260923）的数据生成器，同时建 OMAP 表 `T` 与 MVStore 对比表 `T_MV`，两表数据完全一致。表结构 9 列：`ID` 主键、`LOW_CARD`（10 取值）、`HIGH_CARD`、`INT_COL`（部分连续部分随机）、`DOUBLE_COL`、`TS_COL`、`NULLABLE_COL`（约 5% null）、`ARRAY_COL`、`STR_ARRAY_COL`。
+`bench/DataGenerator.java` 是固定种子（20260923）的数据生成器，同时建 OMAP 表 `T` 与 MVStore 对比表 `T_MV`，两表数据完全一致。表结构 10 列：`ID` 主键、`LOW_CARD`（10 取值）、`HIGH_CARD`、`INT_COL`（部分连续部分随机）、`DOUBLE_COL`、`TS_COL`（随机）、`NULLABLE_COL`（约 5% null）、`ARRAY_COL`、`STR_ARRAY_COL`、`SORT_TS`（递增，与插入顺序同向，用于有序扫描与段级剪枝）。
 
-命令行用法：`java -cp "target/h2omap-0.1.0-SNAPSHOT.jar:<h2 jar>:target/test-classes" com.hyd.h2omap.bench.DataGenerator [rows] [url] [omap|mv]`，默认 100 万行、内存库 `omapbench`、OMAP 引擎。第三参数选 `omap` 或 `mv`，两种引擎分开跑，每次只建一张表 `T`；命令行走 `benchSetup`（先插满预热，再 `TRUNCATE` 清空重插，最后跑查询），MVStore 作为基准只在测试条件变化时才重跑。`DataScaleTest` 用 1 万行加 `segmentSize=1000`、`compactionMinRows=1000` 跑默认测试，同时建两表做签名对比；`DataScaleLargeTest` 用 100 万行，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行。
+命令行用法：`java -cp "target/h2omap-0.1.0-SNAPSHOT.jar:<h2 jar>:target/test-classes" com.hyd.h2omap.bench.DataGenerator [rows] [url] [omap|mv]`，默认 100 万行、内存库 `omapbench`、OMAP 引擎。第三参数选 `omap` 或 `mv`，两种引擎分开跑，每次只建一张表 `T`；命令行走 `benchSetup`（先插满预热，再 `TRUNCATE` 清空重插，最后跑查询）。`mv` 只用于核对结果与观察数据形状，不用于耗时测量（见「工作约定」的性能测试一条）。`DataScaleTest` 用 1 万行加 `segmentSize=1000`、`compactionMinRows=1000` 跑默认测试，同时建两表做签名对比；`DataScaleLargeTest` 用 100 万行，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行。
 
 `bench/ConcurrentQueryBench.java` 用于多线程并发查询基准（`[threads] [rows] [rounds] [withWriter] [engine] [url]`），支持进程内直连与独立 TCP 服务端进程两种模式：
 
