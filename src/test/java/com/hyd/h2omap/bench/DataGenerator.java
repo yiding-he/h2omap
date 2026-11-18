@@ -22,7 +22,7 @@ import java.util.Random;
  * <p>固定随机种子，同一行数重复执行产出相同的数据。同时灌 OMAP 表与
  * MVStore 对比表，两张表的数据完全一致，供 M5 的量化对比使用。
  *
- * <p>表结构固定 8 列，覆盖列类型与分布：
+ * <p>表结构固定 10 列，覆盖列类型与分布：
  * <ul>
  *   <li>{@code ID} 主键，连续</li>
  *   <li>{@code LOW_CARD} 低基数 VARCHAR，10 个取值，用于字典编码收益测量</li>
@@ -33,6 +33,7 @@ import java.util.Random;
  *   <li>{@code NULLABLE_COL} 约 5% 为 NULL</li>
  *   <li>{@code ARRAY_COL} 随机长度整型数组，当前整值存放</li>
  *   <li>{@code STR_ARRAY_COL} 随机长度字符串数组，覆盖变长元素</li>
+ *   <li>{@code SORT_TS} 递增时间戳（插入顺序与值同向），用于有序扫描与段级剪枝</li>
  * </ul>
  *
  * <p>命令行：{@code java com.hyd.h2omap.bench.DataGenerator [rows] [url] [omap|mv]}。
@@ -59,7 +60,7 @@ public final class DataGenerator {
      * 基准查询集：条件复杂多变的组合查询，不包含主键列 ID，
      * 使行式基线无法通过索引优化，只能全表扫描。
      *
-     * <p>第 10、11 条是列裁剪对照（读 1 列对读 9 列），
+     * <p>第 10、11 条是列裁剪对照（读 1 列对读 10 列），
      * 最后一条的子查询需要两个表名参数。
      */
     public static final String[] QUERIES = {
@@ -89,7 +90,7 @@ public final class DataGenerator {
 
     private static final String MV_TABLE = "T_MV";
 
-    private static final LocalDateTime BASE = LocalDateTime.of(2026, 1, 1, 0, 0);
+    static final LocalDateTime BASE = LocalDateTime.of(2026, 1, 1, 0, 0);
 
     private static final String DDL = """
             CREATE TABLE %s(
@@ -101,7 +102,8 @@ public final class DataGenerator {
               TS_COL TIMESTAMP,
               NULLABLE_COL INT,
               ARRAY_COL INT ARRAY,
-              STR_ARRAY_COL VARCHAR ARRAY
+              STR_ARRAY_COL VARCHAR ARRAY,
+              SORT_TS TIMESTAMP
             )""";
 
     private DataGenerator() {
@@ -238,7 +240,7 @@ public final class DataGenerator {
     }
 
     private static long insert(Connection conn, String table, int rows) throws SQLException {
-        String sql = "INSERT INTO " + table + " VALUES (?,?,?,?,?,?,?,?,?)";
+        String sql = "INSERT INTO " + table + " VALUES (?,?,?,?,?,?,?,?,?,?)";
         Random random = new Random(SEED);
         long t0 = System.nanoTime();
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -268,6 +270,7 @@ public final class DataGenerator {
         }
         ps.setObject(8, randomArray(random));
         ps.setObject(9, randomStringArray(random));
+        ps.setTimestamp(10, Timestamp.valueOf(BASE.plusSeconds(i)));
     }
 
     private static String[] randomStringArray(Random random) {

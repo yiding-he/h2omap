@@ -12,6 +12,7 @@ import java.sql.Statement;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -26,7 +27,7 @@ import java.util.concurrent.locks.LockSupport;
  */
 public final class ConcurrentQueryBench {
 
-    private static final String[] QUERIES = {
+    private static final String[] FIXED_QUERIES = {
             "SELECT COUNT(*) FROM T WHERE INT_COL * 2 >= 900000",
             "SELECT COUNT(*) FROM T WHERE LOW_CARD IN ('C0','C1','C2','C3','C4','C5')",
             "SELECT SUM(INT_COL) FROM T WHERE INT_COL > (SELECT AVG(INT_COL) FROM T T2 "
@@ -36,6 +37,21 @@ public final class ConcurrentQueryBench {
                     + "AND NULLABLE_COL IS NOT NULL AND CARDINALITY(ARRAY_COL) >= 1 "
                     + "AND CARDINALITY(STR_ARRAY_COL) >= 1",
     };
+
+    /**
+     * 有序扫描查询：{@code SORT_TS} 与插入顺序同向，窗口只与末尾少量段相交。
+     *
+     * <p>窗口按行数算出（末尾 3 天、每天 86400 行），行数变化时结果仍非空。
+     */
+    private static String orderedQuery(int rows) {
+        int windowRows = Math.min(rows, 3 * 86400);
+        java.time.LocalDateTime start = DataGenerator.BASE.plusSeconds(Math.max(0, rows - windowRows));
+        String since = start.toString().replace('T', ' ');
+        return "SELECT ID, INT_COL, SORT_TS FROM T WHERE SORT_TS >= TIMESTAMP '" + since
+                + "' AND LOW_CARD = 'C3' ORDER BY SORT_TS DESC LIMIT 100";
+    }
+
+    private static String[] queries;
 
     private ConcurrentQueryBench() {
     }
@@ -51,13 +67,15 @@ public final class ConcurrentQueryBench {
         int writerRatePerSec = args.length > 6 ? Integer.parseInt(args[6]) : 0;
 
         int compactionMinRows = withWriter ? 1 : DataGenerator.DEFAULT_COMPACTION_MIN_ROWS;
+        queries = Arrays.copyOf(FIXED_QUERIES, FIXED_QUERIES.length + 1);
+        queries[FIXED_QUERIES.length] = orderedQuery(rows);
         try (Connection setupConn = DriverManager.getConnection(url, "sa", "")) {
             DataGenerator.generateSingle(setupConn, rows, engine,
                     DataGenerator.DEFAULT_SEGMENT_SIZE, compactionMinRows);
             warmupAndVerify(setupConn, rows);
         }
 
-        AtomicLongArray totalNanos = new AtomicLongArray(QUERIES.length);
+        AtomicLongArray totalNanos = new AtomicLongArray(queries.length);
         List<Throwable> errors = new ArrayList<>();
         int totalWorkers = threads + (withWriter ? 1 : 0);
         CountDownLatch ready = new CountDownLatch(totalWorkers);
@@ -73,9 +91,9 @@ public final class ConcurrentQueryBench {
                     ready.countDown();
                     start.await();
                     for (int r = 0; r < rounds; r++) {
-                        for (int q = 0; q < QUERIES.length; q++) {
+                        for (int q = 0; q < queries.length; q++) {
                             long t0 = System.nanoTime();
-                            try (ResultSet rs = s.executeQuery(QUERIES[q])) {
+                            try (ResultSet rs = s.executeQuery(queries[q])) {
                                 if (!rs.next()) {
                                     throw new IllegalStateException("empty result");
                                 }
@@ -96,7 +114,7 @@ public final class ConcurrentQueryBench {
         Thread writer = null;
         if (withWriter) {
             writer = new Thread(() -> {
-                String insertSql = "INSERT INTO T VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                String insertSql = "INSERT INTO T VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 String updateSql = "UPDATE T SET INT_COL = ? WHERE ID = ?";
                 String deleteSql = "DELETE FROM T WHERE ID = ?";
                 try (Connection c = DriverManager.getConnection(url, "sa", "");
@@ -125,6 +143,7 @@ public final class ConcurrentQueryBench {
                         ins.setInt(7, 42);
                         ins.setObject(8, intArr);
                         ins.setObject(9, strArr);
+                        ins.setTimestamp(10, Timestamp.valueOf(DataGenerator.BASE.plusSeconds(newId)));
                         ins.executeUpdate();
 
                         long updId = ((step - 1) % half) + 1;
@@ -172,14 +191,14 @@ public final class ConcurrentQueryBench {
 
         long totalExecutions = (long) threads * rounds;
         long sumAllNanos = 0;
-        for (int q = 0; q < QUERIES.length; q++) {
+        for (int q = 0; q < queries.length; q++) {
             long nanos = totalNanos.get(q);
             sumAllNanos += nanos;
             double avgMs = nanos / 1_000_000.0 / totalExecutions;
             System.out.printf("engine=%s threads=%d writer=%s q%d avg_ms=%.2f : %s%n",
-                    engine, threads, withWriter, q + 1, avgMs, QUERIES[q]);
+                    engine, threads, withWriter, q + 1, avgMs, queries[q]);
         }
-        long totalQueryCount = totalExecutions * QUERIES.length;
+        long totalQueryCount = totalExecutions * queries.length;
         double overallAvgMs = sumAllNanos / 1_000_000.0 / totalQueryCount;
         double qps = totalQueryCount * 1000.0 / Math.max(1L, wallMs);
         System.out.printf("SUMMARY engine=%s threads=%d writer=%s writer_rounds=%d rows=%d rounds=%d "
@@ -190,13 +209,13 @@ public final class ConcurrentQueryBench {
 
     private static void warmupAndVerify(Connection conn, int rows) throws SQLException {
         try (Statement s = conn.createStatement()) {
-            for (int q = 0; q < QUERIES.length; q++) {
-                try (ResultSet rs = s.executeQuery(QUERIES[q])) {
+            for (int q = 0; q < queries.length; q++) {
+                try (ResultSet rs = s.executeQuery(queries[q])) {
                     if (!rs.next()) {
                         throw new IllegalStateException("warmup empty");
                     }
                     long val = rs.getLong(1);
-                    if (QUERIES[q].startsWith("SELECT COUNT(*)")) {
+                    if (queries[q].startsWith("SELECT COUNT(*)")) {
                         double ratio = (double) val / rows;
                         if (ratio <= 0.5) {
                             throw new IllegalStateException(
@@ -205,7 +224,7 @@ public final class ConcurrentQueryBench {
                     }
                 }
             }
-            for (String sql : QUERIES) {
+            for (String sql : queries) {
                 try (ResultSet rs = s.executeQuery(sql)) {
                     rs.next();
                 }
