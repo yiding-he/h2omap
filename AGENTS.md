@@ -26,7 +26,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | JDK | 构建与运行用 JDK 21.0.11；字节码目标 `maven.compiler.release=17` |
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变）。被替换的 3 个 H2 类按该版本源码合入，升级时必须逐类重新比对 |
 | 依赖 | 运行期只有 `com.h2database:h2`，测试用 `junit-jupiter`，构建期插件 `maven-shade-plugin` |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（53 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（15 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（55 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（15 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/`。该目录可能不存在（已排除在版本控制之外）。Maven Central 的 `h2-2.5.252-sources.jar` 内容等价，但个别文件与该 zip 相差数行，核对行号时以 zip 为准 |
 
 ## H2 侧的依据
@@ -137,12 +137,16 @@ rowId 在 `append` 时就确定，之后不变。段号在开放段创建时预�
 
 | 入口 | 触发的形态 | 附加前提 |
 | --- | --- | --- |
-| `tryExecuteFlat` | 单表投影加 `WHERE`，可带 `LIMIT`、`OFFSET` | 投影项是单表列引用或常量；`tableFilter` 用的是扫描索引；`sort == null` 时才把行数上限折进去 |
+| `tryExecuteFlat` | 单表投影加 `WHERE`，可带 `LIMIT`、`OFFSET`；`ORDER BY` 单列且 `LIMIT` 为常量时走有序模式 | 投影项是单表列引用或常量；`tableFilter` 用的是扫描索引；有序模式要求排序键是被扫描表的列、`limit + offset` 不超过 10000 |
 | `tryExecuteGroup` | 单表聚合，可带 `GROUP BY`、`HAVING` | 分组键是单表列引用；结果列是聚合或分组键；`qualifyIndex < 0` |
 
 共同的拒绝条件：`result` 为 null、`filters.size() != 1`、`FOR UPDATE`、窗口查询、`DISTINCT` 或 `distinctExpressions != null`、`qualifyIndex >= 0`、`WITH TIES`。`VectorizedFilter.compile()` 返回 null 时同样放弃下推。
 
 可下推的谓词：6 种 `Comparison` 比较、`AND`/`OR`（含 `ConditionAndOrN`）、`IN`、`IS NULL`/`IS NOT NULL`、`LIKE`/`NOT LIKE`、`CARDINALITY(...)`、`ARRAY_CONTAINS(数组列, 常量)`（含 `NOT`），以及比较左侧的一元与二元算术（`PLUS`、`MINUS`、`MULTIPLY`）。`ILIKE`、`REGEXP`、`= ANY(...)`/`= ALL(...)`（`ConditionInArray`）等形态交回 H2。
+
+段级剪枝：`VectorizedFilter` 从过滤条件的顶层 `AND` 合取项收集每列上下界（`ColCmpNode` 按比较类型给出，其余节点不给出），`ColumnarStore.takeVectorizedSnapshot(lower, upper)` 据此用 zone map 跳过不相交的段，任何谓词都不在被跳过的段上求值。同一列有多个合取项时只保留首次出现的界（区间取宽不取窄），因此不需要比较两个常量。
+
+有序模式：`ORDER BY` 单列加常量 `LIMIT` 时，段按排序列在 zone map 上的边界排序后依次扫描，用容量为 `limit + offset` 的堆留下前 N 行；堆已满且某段内最好的一行也不优于第 N 名时整段跳过。物理聚簇与排序键同向时只需扫一两段；同向不成立时结果仍正确，只是跳过不了段。多列 `ORDER BY`、排序键为表达式、`LIMIT` 缺失或超过 10000 时交回 H2。
 
 子查询下推（`SubqueryFold`，由 `VectorizedFilter.compile` 末尾与 `compileComparison` 调用）：
 
@@ -272,7 +276,7 @@ src/test/java/com/hyd/h2omap/
 
 ## 当前状态与后续阶段
 
-M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）与 M10（子查询下推）均已完成。判定依据为 53 个契约用例、15 个存储层用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
+M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成。判定依据为 55 个契约用例、15 个存储层用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
 
 阶段编号按提出顺序，M7、M8 的实际交付早于 M6。
 
@@ -289,6 +293,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 | M8 持久化与单 Jar 打包 | WAL 与增量段快照、重启恢复；shade 合并为单 Jar；普通用户表默认走本引擎 | 完成 |
 | M9 数组列列式存储 | 段内数组列拆成「前缀和下标数组 + 元素列」，`CARDINALITY` 退化为整数减法；段快照新增 `VEC_ARRAY` | 完成 |
 | M10 子查询下推 | `WHERE` 里的子查询谓词折进向量化过滤：不相关标量子查询/EXISTS 常量化、`IN (SELECT)` 集合化、关联标量聚合预计算、关联 EXISTS 半连接 | 完成 |
+| M11 段级剪枝与有序 LIMIT | 向量化快照按过滤条件给出的列值区间跳过不相交的段；`ORDER BY` 单列加 `LIMIT` 时按段边界排序扫描、用堆取前 N 行并整段早停 | 完成 |
 
 已确认的设计决策：
 
@@ -305,7 +310,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - zone map 比较失败（JSON、几何等不可比较的类型）时该列退化为「恒相交」，不参与剪枝；剪枝只是优化，不能让它阻止建段。
 - 主键与唯一索引用 `ConcurrentSkipListMap` 维护「索引键 → rowId」，`find` 按 `subMap`/`tailMap`/`headMap` 取区间后在存储锁之外迭代。`getCost` 沿用 `getCostRangeIndex` 且不额外加码——加码会让范围查询永远选扫描索引，区间分支不会被调用。
 - 两个索引的 `getCreateSQL()` 都保持返回 `null`：区间分支虽然按索引列有序返回，但顺序保证由 H2 的 `Select.getIndexSorts` 判断，交给扫描加排序更稳妥。
-- 向量化下推只在替换后的 `Select` 上触发，拒绝条件命中时退回 H2 原路径；下推只改变执行方式，不改变结果集内容。`ORDER BY` 由 H2 处理，`sort == null` 时才把 `LIMIT`、`OFFSET` 折成行数上限。
+- 向量化下推只在替换后的 `Select` 上触发，拒绝条件命中时退回 H2 原路径；下推只改变执行方式，不改变结果集内容。无 `ORDER BY` 时把 `LIMIT`、`OFFSET` 折成行数上限；`ORDER BY` 单列加常量 `LIMIT` 时由有序模式产出已排序结果，其余 `ORDER BY` 仍交回 H2。
 - 子查询下推的折叠判定与预计算都发生在 `VectorizedFilter.compile` 编译期，不在每行求值期：不相关子查询一次求值后与常量同待遇；关联形态把内层表的一次 `takeVectorizedSnapshot` 预计算成分组聚合或键集合，外层扫描阶段只做哈希查找。预计算的聚合口径对齐 H2 的 `AggregateDataDefault`/`AggregateDataAvg`：`SUM` 溢出即回退，`AVG` 按结果类型走 double 或 `BigDecimal` 除法（HALF_DOWN），`MIN`/`MAX` 用 `session.compare`；关联键无匹配组时 `COUNT` 取 0、其余聚合取 NULL（与 SQL 空组语义一致）；内外层 NULL 键不匹配。整数列的 `IN` 与半连接用原始 `long` 开放寻址集合，避免百万级 `Value` 装箱哈希。关联聚合的外层扫描对字典键列（`DictValueVector`、`DictVarcharVector`）按字典下标预先解析出每个码的比较目标，行内只剩数组读，不再逐行装箱或哈希查找。
 - 默认引擎由替换后的 `Schema.createTable()` 决定，不依赖 `DEFAULT_TABLE_ENGINE`（它会把 H2 元数据表也交给本引擎）。
 - 性能数字记录在 `BENCHMARK_RESULT.md` 与 `problems/查询性能优化方向.md`；回归只要求集成测试与内部计数器断言。
