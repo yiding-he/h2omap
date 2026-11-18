@@ -928,13 +928,66 @@ class OmapTableContractTest {
                         + " HAVING MAX(V) > 4) ORDER BY ID",
                 // 内层非 OMAP 表
                 "SELECT ID FROM %1$s WHERE V > (SELECT AVG(V) FROM M T2 WHERE T2.K = %1$s.K) ORDER BY ID",
-                // 关联 IN：当前不折叠，交回 H2
-                "SELECT ID FROM %1$s WHERE V IN (SELECT T2.V FROM %1$s T2 WHERE T2.K = %1$s.K) ORDER BY ID",
-                "SELECT ID FROM %1$s WHERE V NOT IN (SELECT T2.V FROM %1$s T2 WHERE T2.K = %1$s.K) ORDER BY ID",
+                // 关联 IN：多关联条件不折叠，交回 H2
+                "SELECT ID FROM %1$s WHERE V IN (SELECT T2.V FROM %1$s T2"
+                        + " WHERE T2.K = %1$s.K AND T2.ID < %1$s.ID) ORDER BY ID",
         };
         for (String query : queries) {
             assertEquals(rows(String.format(query, "M")), rows(String.format(query, "T")), query);
         }
+    }
+
+    /**
+     * 关联 IN / NOT IN (SELECT ...)：折成「关联键 → 内层值集合」后与 MVStore 逐行一致，
+     * 覆盖整数与 varchar 关联键、未命中键、NULL 键、内层投影含 NULL（NOT IN 三值语义）、
+     * 内层常量谓词，以及表达式投影不折叠交回 H2 的回退。
+     */
+    @Test
+    void correlatedInFoldsIntoKeyedSets() throws SQLException {
+        execute(createTable("T", "ID INT PRIMARY KEY, K INT, S VARCHAR(8), V INT", "\"segmentSize=4\""));
+        execute("CREATE TABLE M(ID INT PRIMARY KEY, K INT, S VARCHAR(8), V INT)"
+                + " ENGINE \"org.h2.mvstore.db.Store\"");
+        String insert = "INSERT INTO %s VALUES "
+                + "(1, 1, 'a', 10), (2, 1, 'b', NULL), (3, 2, 'a', 30), (4, NULL, 'b', 40),"
+                + " (5, 3, 'a', 50), (6, 3, 'b', 60), (7, 9, 'c', 70), (8, 2, NULL, 80)";
+        execute(String.format(insert, "T"));
+        execute(String.format(insert, "M"));
+
+        String[] queries = {
+                "SELECT ID FROM %1$s WHERE V IN (SELECT T2.V FROM %1$s T2 WHERE T2.K = %1$s.K) ORDER BY ID",
+                "SELECT ID FROM %1$s WHERE V NOT IN (SELECT T2.V FROM %1$s T2 WHERE T2.K = %1$s.K) ORDER BY ID",
+                // varchar 关联键
+                "SELECT ID FROM %1$s WHERE V IN (SELECT T2.V FROM %1$s T2 WHERE T2.S = %1$s.S) ORDER BY ID",
+                "SELECT ID FROM %1$s WHERE V NOT IN (SELECT T2.V FROM %1$s T2 WHERE T2.S = %1$s.S) ORDER BY ID",
+                // 内层常量谓词
+                "SELECT ID FROM %1$s WHERE V IN (SELECT T2.V FROM %1$s T2 WHERE T2.K = %1$s.K AND T2.V >= 30) ORDER BY ID",
+                // 投影是表达式：不折叠，交回 H2
+                "SELECT ID FROM %1$s WHERE V IN (SELECT T2.V + 1 FROM %1$s T2 WHERE T2.K = %1$s.K) ORDER BY ID",
+        };
+        for (String query : queries) {
+            assertEquals(rows(String.format(query, "M")), rows(String.format(query, "T")), query);
+        }
+    }
+
+    /**
+     * 1 万行关联 IN 的耗时断言：折成键值集合后应在毫秒级；未折叠的嵌套循环
+     * 实测在 7 秒量级。预期行数用等值自连接独立验证。
+     */
+    @Test
+    void correlatedInFasterThanNestedLoop() throws SQLException {
+        execute(createTable("T", "ID INT PRIMARY KEY, K INT, X INT", "\"segmentSize=1000\""));
+        execute("INSERT INTO T SELECT X, MOD(X, 100), MOD(X * 7919, 10000) FROM SYSTEM_RANGE(1, 10000)");
+        // 期望值用 MVStore 表独立验证（MVStore 只作结果对照，不测耗时）
+        execute("CREATE TABLE M(ID INT PRIMARY KEY, K INT, X INT) ENGINE \"org.h2.mvstore.db.Store\""
+                + " AS SELECT X, MOD(X, 100), MOD(X * 7919, 10000) FROM SYSTEM_RANGE(1, 10000)");
+        String expected = scalar("SELECT COUNT(*) FROM M WHERE X IN (SELECT T2.ID FROM M T2 WHERE T2.K = M.K)");
+
+        long start = System.nanoTime();
+        String actual = scalar("SELECT COUNT(*) FROM T WHERE X IN (SELECT T2.ID FROM T T2 WHERE T2.K = T.K)");
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+        assertEquals(expected, actual);
+        assertTrue(elapsedMs < 200, "correlated IN took " + elapsedMs + " ms");
     }
 
     /**
