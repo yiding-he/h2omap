@@ -97,6 +97,10 @@ CREATE TABLE EVENTS_MV(TS TIMESTAMP, HOST VARCHAR, COST DOUBLE)
 - **列式结构已生效，部分优化未做**：写入达到 `segmentSize` 后冻结成列段，读路径先段后 delta；zone map 剪枝、两阶段合并、字典编码、列裁剪与向量化下推均已实现，后台合并线程未做。
 - **没有事务**：失败的部分更新不会回滚，并发写由 delta 内部加锁保证。
 
+## 性能测试
+
+并发查询的最终性能测试（独立 TCP 服务端、500 万行、16 读线程 + 1 写线程、5 条查询 × 50 轮）实测数据见 [`BENCHMARK_RESULT.md`](BENCHMARK_RESULT.md)，含 Apple M4 与 i5-14500 两批结果、汇总指标与一键复现脚本。
+
 ## 设计与实现
 
 架构、与 H2 的契约、必须遵守的硬性约束、模块职责、当前状态与后续阶段，见 [`AGENTS.md`](AGENTS.md)。
