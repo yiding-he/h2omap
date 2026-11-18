@@ -1402,6 +1402,56 @@ class OmapTableContractTest {
         }
     }
 
+    /**
+     * 高基数 VARCHAR 列（段内不同值个数超过字典容量，段里存打包字节与偏移）：
+     * 变长更新经合并写回、NULL、删除，重启前后都与 MVStore 逐行一致。
+     */
+    @Test
+    void varcharColumnSurvivesRestartAndCompaction() throws Exception {
+        // 不设 DB_CLOSE_DELAY：关掉最后一个连接即关闭数据库，第二次连接真正从段文件恢复
+        Path dir = java.nio.file.Files.createTempDirectory("h2omap_varchar_persist_");
+        String url = "jdbc:h2:" + dir.resolve("vc_db").toAbsolutePath();
+        String[] templates = {
+                "SELECT ID, S FROM %s ORDER BY ID",
+                "SELECT ID FROM %s WHERE S LIKE '长值-%%' ORDER BY ID",
+                "SELECT ID FROM %s WHERE S = 'q' ORDER BY ID",
+                "SELECT ID FROM %s WHERE S > 'value-0000000300' ORDER BY ID",
+        };
+        String expectedBefore;
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            for (String table : new String[] { "T", "T_MV" }) {
+                String engine = table.equals("T_MV") ? " ENGINE \"org.h2.mvstore.db.Store\"" : "";
+                s.execute("CREATE TABLE " + table + "(ID BIGINT PRIMARY KEY, S VARCHAR(64))"
+                        + engine + " WITH \"segmentSize=128\", \"compactionMinRows=20\"");
+                for (int i = 1; i <= 400; i++) {
+                    s.execute("INSERT INTO " + table + " VALUES (" + i + ", 'value-"
+                            + String.format("%010d", i) + "-padding')");
+                }
+                s.execute("UPDATE " + table + " SET S = CONCAT('长值-', S) WHERE MOD(ID, 7) = 0");
+                s.execute("UPDATE " + table + " SET S = 'q' WHERE MOD(ID, 11) = 1");
+                s.execute("UPDATE " + table + " SET S = NULL WHERE MOD(ID, 13) = 0");
+                s.execute("DELETE FROM " + table + " WHERE MOD(ID, 17) = 0");
+                // 再写满一段：冻结与检查点把合并结果写进段文件，重启后段里的 zone map 与列值一致
+                for (int i = 401; i <= 528; i++) {
+                    s.execute("INSERT INTO " + table + " VALUES (" + i + ", 'value-"
+                            + String.format("%010d", i) + "-padding')");
+                }
+            }
+            assertQueriesMatch(s, templates);
+            assertEquals("长值-value-0000000007-padding", toString(s,
+                    "SELECT S FROM T WHERE ID = 7"));
+            expectedBefore = collectRows(s, "SELECT ID, S FROM T ORDER BY ID");
+        }
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            assertEquals(expectedBefore, collectRows(s, "SELECT ID, S FROM T ORDER BY ID"));
+            assertQueriesMatch(s, templates);
+            assertEquals("长值-value-0000000007-padding", toString(s,
+                    "SELECT S FROM T WHERE ID = 7"));
+        }
+    }
+
     @Test
     void timestampVectorSurvivesRestartAndCompaction() throws Exception {
         Path dir = java.nio.file.Files.createTempDirectory("h2omap_ts_persist_");

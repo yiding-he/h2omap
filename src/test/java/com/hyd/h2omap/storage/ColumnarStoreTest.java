@@ -23,12 +23,14 @@ import com.hyd.h2omap.vector.ArrayVector;
 import com.hyd.h2omap.vector.ColumnVector;
 import com.hyd.h2omap.vector.IntVector;
 import com.hyd.h2omap.vector.ValueVector;
+import com.hyd.h2omap.vector.VarcharVector;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * M1：段真正产生的单元测试。
@@ -382,5 +384,75 @@ class ColumnarStoreTest {
         ColumnVector vector = store.segments().get(0).getColumn(0);
         assertInstanceOf(ValueVector.class, vector);
         assertEquals(strings, store.materialize(first).getValueList()[0]);
+    }
+    /** 单列 {@code VARCHAR(64)} 的存储，用于观察打包字节向量。 */
+    private static ColumnarStore newVarcharStore(int segmentSize, int compactionMinRows) {
+        return new ColumnarStore(
+                new Column[] { new Column("S", TypeInfo.getTypeInfo(Value.VARCHAR, 64, 0, null)) },
+                OmapOptions.from(List.of("segmentSize=" + segmentSize,
+                        "compactionMinRows=" + compactionMinRows)),
+                CompareMode.getInstance(null, 0));
+    }
+
+    private static Value[] varcharRow(Value value) {
+        return new Value[] { value };
+    }
+
+    /**
+     * 高基数 VARCHAR 列：段内按「字节池 + 偏移」存放，不再逐行持有 String。
+     *
+     * <p>行里混入 NULL，覆盖「NULL 行之后继续追加」时前缀和必须保持单调的情况。
+     */
+    @Test
+    void varcharColumnPacksBytesAndOffsets() {
+        ColumnarStore store = newVarcharStore(1000, Integer.MAX_VALUE);
+        long[] ids = new long[1000];
+        for (int i = 0; i < 1000; i++) {
+            Value value = i % 7 == 0 ? ValueNull.INSTANCE
+                    : ValueVarchar.get("value-" + String.format("%010d", i));
+            ids[i] = store.append(varcharRow(value));
+        }
+        assertEquals(1, store.segments().size());
+        ColumnVector vector = store.segments().get(0).getColumn(0);
+        assertInstanceOf(VarcharVector.class, vector);
+        long perRow = vector.getEstimatedMemory() / vector.size();
+        assertTrue(perRow < 24, "打包后每行应低于 24 B，实际 " + perRow + " B");
+        for (int i = 0; i < 1000; i++) {
+            Value actual = store.materialize(ids[i]).getValueList()[0];
+            if (i % 7 == 0) {
+                assertEquals(ValueNull.INSTANCE, actual, "第 " + i + " 行应为 NULL");
+            } else {
+                assertEquals("value-" + String.format("%010d", i), actual.getString());
+            }
+        }
+    }
+
+    /**
+     * 合并写回时值长度变化：前缀和整体调整，未改动的行仍然取到正确的值。
+     *
+     * <p>段长 200、每段 200 个互不相同的值，超过字典容量（{@code min(4096, 段长/4)}），
+     * 因此该列走打包字节向量而不是字典向量。
+     */
+    @Test
+    void compactRewritesVarcharWithDifferentLengths() {
+        ColumnarStore store = newVarcharStore(200, 1);
+        long[] ids = new long[200];
+        for (int i = 0; i < 200; i++) {
+            ids[i] = store.append(varcharRow(ValueVarchar.get("v" + i)));
+        }
+        assertEquals(1, store.segments().size());
+
+        store.update(ids[0], varcharRow(ValueVarchar.get("这是一个明显更长的值")));
+        store.update(ids[1], varcharRow(ValueVarchar.get("短")));
+        store.update(ids[2], varcharRow(ValueNull.INSTANCE));
+
+        assertEquals(1, store.segments().size());
+        assertEquals("这是一个明显更长的值",
+                store.materialize(ids[0]).getValueList()[0].getString());
+        assertEquals("短", store.materialize(ids[1]).getValueList()[0].getString());
+        assertEquals(ValueNull.INSTANCE, store.materialize(ids[2]).getValueList()[0]);
+        assertEquals("v3", store.materialize(ids[3]).getValueList()[0].getString());
+        assertEquals("v7", store.materialize(ids[7]).getValueList()[0].getString());
+        assertEquals("v199", store.materialize(ids[199]).getValueList()[0].getString());
     }
 }
