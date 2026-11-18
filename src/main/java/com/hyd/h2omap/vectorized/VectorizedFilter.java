@@ -1188,6 +1188,7 @@ public final class VectorizedFilter {
         private long[] keys;
         private boolean[] used;
         private int mask;
+        private int size;
 
         LongSet(int expected) {
             int cap = Integer.highestOneBit(Math.max(8, expected * 2 - 1)) << 1;
@@ -1197,6 +1198,11 @@ public final class VectorizedFilter {
         }
 
         void add(long key) {
+            // 固定容量下满槽会让开放寻址死循环；按元素个数扩容，
+            // 预估容量的调用方（InNode）永远不会触到阈值，只有逐步增长的调用方（SubqueryFold）会。
+            if (size * 4 > mask * 3) {
+                rehash();
+            }
             int i = (int) (mix(key) & mask);
             while (used[i]) {
                 if (keys[i] == key) {
@@ -1206,6 +1212,7 @@ public final class VectorizedFilter {
             }
             used[i] = true;
             keys[i] = key;
+            size++;
         }
 
         boolean contains(long key) {
@@ -1217,6 +1224,25 @@ public final class VectorizedFilter {
                 i = (i + 1) & mask;
             }
             return false;
+        }
+
+        private void rehash() {
+            long[] oldKeys = keys;
+            boolean[] oldUsed = used;
+            int cap = (mask + 1) << 1;
+            keys = new long[cap];
+            used = new boolean[cap];
+            mask = cap - 1;
+            for (int i = 0; i < oldKeys.length; i++) {
+                if (oldUsed[i]) {
+                    int j = (int) (mix(oldKeys[i]) & mask);
+                    while (used[j]) {
+                        j = (j + 1) & mask;
+                    }
+                    used[j] = true;
+                    keys[j] = oldKeys[i];
+                }
+            }
         }
 
         private static long mix(long key) {
