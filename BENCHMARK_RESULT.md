@@ -4,56 +4,37 @@
 
 | 项 | 值 |
 | --- | --- |
-| 代码基线 | `feature/subquery-constant-pushdown`（`main` 的 `5428d14` 之后，含 M10 子查询下推与基准 `q3` 替换） |
-| JDK | `21.0.12.1`（字节码目标 Java 17） |
-| CPU | Intel Core i5-14500，14 核 / 20 逻辑处理器 |
-| 操作系统 | Windows 11 `10.0.26300` |
-| 物理内存 | 31.69 GB |
-| 电源模式 | 最佳性能（Windows 11「设置 > 系统 > 电源」，全程未变） |
-| 服务端堆 | `-Xmx8g`（`scripts/final-benchmark.ps1` 的 `-ServerXmx` 默认值），客户端 `-Xmx2g` |
+| 代码基线 | `feature/vectorized-zone-pruning`（`d623873`，含段级 zone map 剪枝、单列 `ORDER BY` + `LIMIT` 的段序早停与压测表新增的 `SORT_TS` 列） |
+| JDK | `21.0.11`（Microsoft OpenJDK，字节码目标 Java 17） |
+| CPU | Apple M4，10 核 |
+| 操作系统 | macOS `26.6.2`（`25G83`） |
+| 物理内存 | 16 GB |
+| 电源模式 | 低电量模式关闭（`pmset -g` 的 `lowpowermode 0`），全程未变 |
+| 服务端堆 | `-Xmx8g`（`scripts/final-benchmark.sh` 的 `OMAP_SERVER_XMX` 默认值），客户端 `-Xmx2g` |
 | 引擎 | 仅 OMAP（`com.hyd.h2omap.engine.OmapTableEngine`） |
 | 部署模式 | 独立 TCP 服务端进程 + 外部纯 H2 客户端进程（客户端不含 `h2omap` Jar） |
-| 数据规模 | 5,000,000 行，9 列（`ID` 主键、`LOW_CARD`、`HIGH_CARD`、`INT_COL`、`DOUBLE_COL`、`TS_COL`、`NULLABLE_COL`、`ARRAY_COL`、`STR_ARRAY_COL`） |
+| 数据规模 | 5,000,000 行，10 列（`ID` 主键、`LOW_CARD`、`HIGH_CARD`、`INT_COL`、`DOUBLE_COL`、`TS_COL`、`NULLABLE_COL`、`ARRAY_COL`、`STR_ARRAY_COL`、`SORT_TS`） |
 | 存储参数 | `segmentSize=65536`，`compactionMinRows=1` |
-| 存储形态 | 内存库（`jdbc:h2:mem:`）；文件模式用于观察写路径代价，数据目录 `target\bench-db`，500 万行占 `484.5 MB` |
+| 存储形态 | 内存库（`jdbc:h2:mem:`）；第三档改用文件库，数据目录 `target/bench-db`，500 万行占 `562 MB` |
 | 查询缓存 | 关闭（`QUERY_CACHE_SIZE=0`） |
-
-`电源模式`指 Windows 11 设置的电源模式；`powercfg /getactivescheme` 返回的旧版电源计划在本机一直是「平衡」，与实测无关，不作为基准条件记录。
 
 ## 复现命令
 
-一键执行（自动完成构建、启动 `-Xmx8g` 独立 TCP 服务端、定位 H2 Jar、执行 50 轮压测并自动清理服务端进程）。脚本一次调用跑一种写负载，三种写负载需要分三次调用：
+三档均一键执行（自动完成构建、启动 `-Xmx8g` 独立 TCP 服务端、定位 H2 Jar、执行 50 轮压测、重启校验并自动清理服务端与数据目录）。脚本一次调用跑一种写负载：
 
-```powershell
-./scripts/final-benchmark.ps1                  # 默认：500 万行、16 读、50 轮、写线程不限速
-./scripts/final-benchmark.ps1 -WriterRps 50    # 限速：写线程每秒执行 50 轮（每轮含 INSERT+UPDATE+DELETE）
-./scripts/final-benchmark.ps1 -WriterRps 50 -Persist   # 同上，改用文件数据库，结束时重启校验行数
+```bash
+./scripts/final-benchmark.sh                   # 默认：500 万行、16 读、50 轮、写线程不限速（内存库）
+./scripts/final-benchmark.sh 50                # 限速：写线程每秒执行 50 轮（每轮含 INSERT+UPDATE+DELETE），内存库
+./scripts/final-benchmark.sh 50 --persist      # 同上，改用文件数据库，结束时重启校验行数并清理数据目录
 ```
 
-其余参数：`-Rows`、`-Readers`、`-Rounds`、`-ServerXmx`、`-ClientXmx`、`-Port`、`-Engine`、`-NoWriter`、`-SkipBuild`。
+端口与堆可用 `OMAP_BENCH_PORT`、`OMAP_SERVER_XMX`、`OMAP_CLIENT_XMX` 覆盖，写限速也可用 `OMAP_WRITER_RPS` 给出；`--keep-data` 保留文件库数据目录（默认在 `target/bench-db`，可用 `OMAP_BENCH_DATA_DIR` 覆盖）。Windows 用等价脚本 `scripts/final-benchmark.ps1`（`-WriterRps 50 -Persist`，另有 `-Rows`/`-Readers`/`-Rounds`/`-ServerXmx`/`-ClientXmx`/`-DataDir`/`-KeepData`/`-SkipBuild` 可调）。
 
-`-SkipBuild` 建议配合单独的 `mvn -B -q package -DskipTests` 使用：脚本内部调用 `mvn`，在 Windows PowerShell 上会命中 `mvn.ps1` 包装脚本并在 `Set-StrictMode` 下因未定义变量抛错。该缺陷尚未修复。
-
-Linux 用等价脚本 `./scripts/final-benchmark.sh`（同样以位置参数或环境变量给出写限速）。
-
-若需手动分步执行：
-
-```powershell
-mvn -B -q package
-
-java -Xmx8g -cp target\h2omap-0.1.0-SNAPSHOT.jar `
-  org.h2.tools.Server -tcp -tcpPort 19092 -ifNotExists
-
-java -Xmx2g `
-  -cp "$env:USERPROFILE\.m2\repository\com\h2database\h2\2.5.252\h2-2.5.252.jar;target\test-classes" `
-  com.hyd.h2omap.bench.ConcurrentQueryBench `
-  16 5000000 50 true omap `
-  "jdbc:h2:tcp://localhost:19092/mem:omap5m;DB_CLOSE_DELAY=-1;QUERY_CACHE_SIZE=0"
-```
+`ps1` 的 `-SkipBuild` 建议配合单独的 `mvn -B -q package -DskipTests` 使用：脚本内部调用 `mvn` 会命中 `mvn.ps1` 包装脚本并在 `Set-StrictMode` 下因未定义变量抛错，该缺陷尚未修复。`ps1` 的重启校验要求行数严格等于 `-Rows`，而写线程每轮先 `INSERT` 后 `DELETE`、停止点可能落在两条语句之间（净行数为 `Rows` 或 `Rows + 1`），因此偶发假失败；`sh` 的校验接受这两个值。
 
 ## 并发负载说明
 
-- **读负载**：16 个读线程并发执行 50 轮，每轮顺序执行 `q1`–`q4` 共 4 条 SQL，总计 3,200 次查询。
+- **读负载**：16 个读线程并发执行 50 轮，每轮顺序执行 `q1`–`q5` 共 5 条 SQL，总计 4,000 次查询。
 - **写负载**：1 个写线程在并发读期间持续循环执行单行细粒度变更，每轮依次执行：
   1. `INSERT` 1 行新记录（写入开放段）
   2. `UPDATE` 1 行已有记录
@@ -64,14 +45,42 @@ java -Xmx2g `
 
 - q1: `SELECT COUNT(*) FROM T WHERE INT_COL * 2 >= 900000`
 - q2: `SELECT COUNT(*) FROM T WHERE LOW_CARD IN ('C0','C1','C2','C3','C4','C5')`
-- q3: `SELECT SUM(INT_COL) FROM T WHERE INT_COL > (SELECT AVG(INT_COL) FROM T T2 WHERE T2.LOW_CARD = T.LOW_CARD)`（M10 之后替换；此前为 `SELECT SUM(INT_COL) FROM T WHERE INT_COL >= 400000`，下方历史表中 `q3` 的数值均属旧查询）
+- q3: `SELECT SUM(INT_COL) FROM T WHERE INT_COL > (SELECT AVG(INT_COL) FROM T T2 WHERE T2.LOW_CARD = T.LOW_CARD)`
 - q4: `SELECT COUNT(*) FROM T WHERE LOW_CARD <> 'C9' AND INT_COL >= 10000 AND DOUBLE_COL < 950 AND TS_COL >= TIMESTAMP '2026-02-01' AND NULLABLE_COL IS NOT NULL AND CARDINALITY(ARRAY_COL) >= 1 AND CARDINALITY(STR_ARRAY_COL) >= 1`
+- q5: `SELECT ID, INT_COL, SORT_TS FROM T WHERE SORT_TS >= TIMESTAMP '2026-02-24 20:53:20' AND LOW_CARD = 'C3' ORDER BY SORT_TS DESC LIMIT 100`（窗口由行数算出，取末尾 3 天即 259,200 行）
 
 ## 实测结果
 
-三个场景各跑一次，每次为独立的服务端进程与全新数据库：不限速写（`./scripts/final-benchmark.ps1`）、限速每秒写 50 轮（`./scripts/final-benchmark.ps1 -WriterRps 50`）与文件数据库且限速 50 轮/秒（再加 `-Persist`）。每轮写含 1 次 INSERT + 1 次 UPDATE + 1 次 DELETE，并因 `compactionMinRows=1` 触发 2 次段合并。
+三个场景各跑一次，每次为独立的服务端进程与全新数据库：不限速写、限速每秒写 50 轮、文件数据库且限速 50 轮/秒。每轮写含 1 次 INSERT + 1 次 UPDATE + 1 次 DELETE，并因 `compactionMinRows=1` 触发 2 次段合并。
 
-数据规模自本次起改为 500 万行（此前为 1000 万行）；下节「历史记录」保留旧数据供追溯。
+| 查询 | 不限速写 | 限速 50 轮/秒 | 文件数据库且限速 50 轮/秒 |
+| --- | --- | --- | --- |
+| `q1` | `34.47 ms` | `26.27 ms` | `27.10 ms` |
+| `q2` | `48.15 ms` | `37.14 ms` | `40.73 ms` |
+| `q3` | `93.37 ms` | `69.56 ms` | `65.38 ms` |
+| `q4` | `168.86 ms` | `121.59 ms` | `120.43 ms` |
+| `q5` | `14.07 ms` | `12.78 ms` | `13.07 ms` |
+
+两档限速写各复跑一次以确认抖动幅度：内存库 `26.27 / 39.97 / 66.16 / 122.33 / 13.03 ms`（单次总平均 `53.81 ms`、`294.9 QPS`），文件库 `28.05 / 41.01 / 68.24 / 120.85 / 13.10 ms`（`54.25 ms`、`292.1 QPS`）。同一档两次的偏差最大出现在内存库 `q2`（`37.14 → 39.97 ms`，`+7.6%`），其余项在 `±5%` 以内。
+
+### 汇总指标
+
+| 指标 | 不限速写 | 限速 50 轮/秒 | 文件数据库且限速 50 轮/秒 |
+| --- | --- | --- | --- |
+| 读查询总数 | `4,000`（16 线程 × 50 轮 × 5 查询） | `4,000` | `4,000` |
+| 墙钟时间 | `18,135 ms` | `13,510 ms` | `13,458 ms` |
+| 单次查询总平均耗时 | `71.78 ms` | `53.47 ms` | `53.34 ms` |
+| 读吞吐 | `220.6 QPS` | `296.1 QPS` | `297.2 QPS` |
+| 并发写完成轮数 | `199,352` 轮（约 `10,993` 轮/秒，对应 `398,704` 次段合并） | `674` 轮（`49.9` 轮/秒，对应 `1,348` 次段合并） | `672` 轮（`49.9` 轮/秒，对应 `1,344` 次段合并） |
+| 重启校验 | — | — | `5,000,000` 行全部可读，数据目录 `562 MB` |
+
+文件库档的重启校验在 `SHUTDOWN` 后由独立 JVM 走本地 URL 读取：表定义从 `.mv.db` 恢复，列段与 WAL 从 `target/bench-db/h2omapdb.omap/` 恢复。校验接受 `5,000,000` 与 `5,000,001` 两个值——写线程每轮先 `INSERT` 后 `DELETE`，停止点可能落在两条语句之间。
+
+## 历史记录
+
+### 上一台机器（Windows 11，i5-14500）500 万行、M10 基线
+
+代码基线 `feature/subquery-constant-pushdown`，JDK `21.0.12.1`、Intel Core i5-14500（14 核 / 20 逻辑处理器）、物理内存 31.69 GB、服务端堆 `-Xmx8g`。查询集为 4 条（无 `q5`，表内无 `SORT_TS` 列，读查询总数 `3,200`），**与现行数值不可直接比较**：
 
 | 查询 | 不限速写 | 限速 50 轮/秒 | 文件数据库且限速 50 轮/秒 |
 | --- | --- | --- | --- |
@@ -79,21 +88,15 @@ java -Xmx2g `
 | `q2` | `31.38 ms` | `28.45 ms` | `28.47 ms` |
 | `q3` | `63.44 ms` | `56.97 ms` | `50.50 ms` |
 | `q4` | `128.89 ms` | `117.92 ms` | `98.60 ms` |
-
-### 汇总指标
-
-| 指标 | 不限速写 | 限速 50 轮/秒 | 文件数据库且限速 50 轮/秒 |
-| --- | --- | --- | --- |
-| 读查询总数 | `3,200`（16 线程 × 50 轮 × 4 查询） | `3,200` | `3,200` |
 | 墙钟时间 | `12,797 ms` | `11,609 ms` | `10,186 ms` |
 | 单次查询总平均耗时 | `62.89 ms` | `57.05 ms` | `50.43 ms` |
 | 读吞吐 | `250.1 QPS` | `275.6 QPS` | `314.2 QPS` |
-| 并发写完成轮数 | `12,089` 轮（对应 `24,178` 次段合并） | `580` 轮（实际 `50.0` 轮/秒，对应 `1,160` 次段合并） | `508` 轮（实际 `49.9` 轮/秒，对应 `1,016` 次段合并） |
-| 重启校验 | — | — | `5,000,000` 行全部可读，数据目录 `484.2 MB` |
+| 并发写完成轮数 | `12,089` 轮（`24,178` 次段合并） | `580` 轮（`1,160` 次段合并） | `508` 轮（`1,016` 次段合并） |
+| 数据目录 | — | — | `484.2 MB` |
 
-### `q3` 的执行成本
+### `q3` 的执行成本（上一台机器）
 
-`q3` 是四条中唯一含子查询的查询：每次执行对内层表做一次分组聚合预计算，再做外层扫描。同样 9 列数据、500 万行，单线程与 16 线程分别执行（各预热后取 5 次）：
+`q3` 是查询集中唯一含子查询的查询：每次执行对内层表做一次分组聚合预计算，再做外层扫描。同样 9 列数据、500 万行，单线程与 16 线程分别执行（各预热后取 5 次）：
 
 | 指标 | 单线程 | 16 线程 |
 | --- | --- | --- |
@@ -112,8 +115,6 @@ java -Xmx2g `
 | 16 线程 × 50 轮的 Young GC | `46` 次，暂停 `314 ms` | `3` 次，暂停 `103 ms` |
 | 压测中的 `q3` 单次耗时 | `651 – 707 ms` | `51 – 63 ms` |
 
-## 历史记录
-
 ### 本机 1000 万行、M9 基线（`q3` 为替换前旧查询）
 
 | 查询 | 不限速写 | 限速 50 轮/秒 | 文件数据库且限速 50 轮/秒 |
@@ -125,9 +126,9 @@ java -Xmx2g `
 | 墙钟时间 | `16,557 ms` | `15,612 ms` | `14,756 ms` |
 | 读吞吐 | `193.3 QPS` | `205.0 QPS` | `216.9 QPS` |
 
-与现行数据的差异同时来自数据规模（1000 万 → 500 万）、`q3` 查询替换、M10 代码与 `q3` 的两轮优化，不可分离单项贡献。
+与 500 万行数据的差异同时来自数据规模（1000 万 → 500 万）、`q3` 查询替换、M10 代码与 `q3` 的两轮优化，不可分离单项贡献。
 
-### 上一台机器（`2090985`）
+### 前一版 500 万行基线（`2090985`，i7-12700H）
 
 下表是 `2090985` 在另一台机器上测得的值（CPU 为 i7-12700H、JDK 为 21.0.3、服务端堆 `-Xmx6g`、数据规模 1000 万行、`q3` 为替换前的旧查询），列在此处供追溯，**与本次数值不可直接比较**：
 
