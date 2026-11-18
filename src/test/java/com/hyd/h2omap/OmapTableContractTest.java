@@ -1298,6 +1298,66 @@ class OmapTableContractTest {
     }
 
     @Test
+    void vectorizedBoundsPruneSegmentsWithoutChangingResults() throws Exception {
+        execute("CREATE TABLE T (ID BIGINT PRIMARY KEY, TS TIMESTAMP) "
+                + "ENGINE \"" + ENGINE + "\" WITH \"segmentSize=10\"");
+        execute("CREATE TABLE T_MV (ID BIGINT PRIMARY KEY, TS TIMESTAMP) "
+                + "ENGINE \"org.h2.mvstore.db.Store\"");
+        for (int i = 0; i < 200; i++) {
+            String ts = "TIMESTAMP '2026-01-01 00:00:" + String.format("%02d", i / 4)
+                    + "." + String.format("%03d", (i % 4) * 250) + "000'";
+            execute("INSERT INTO T VALUES (" + i + ", " + ts + ")");
+            execute("INSERT INTO T_MV VALUES (" + i + ", " + ts + ")");
+        }
+
+        org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                ((org.h2.jdbc.JdbcConnection) conn).getSession();
+        com.hyd.h2omap.table.OmapTable table = (com.hyd.h2omap.table.OmapTable)
+                session.getDatabase().getMainSchema().findTableOrView(session, "T");
+        com.hyd.h2omap.storage.ColumnarStore store = table.getStore();
+
+        try (Statement s = conn.createStatement()) {
+            String unbounded = "SELECT COUNT(*) FROM %s";
+            assertEquals(toString(s, String.format(unbounded, "T_MV")),
+                    toString(s, String.format(unbounded, "T")));
+            long afterUnbounded = store.getPrunedSegmentCount();
+
+            // 窄区间：只与少数段相交，应剪掉其余段
+            String narrow = "SELECT COUNT(*) FROM %s "
+                    + "WHERE TS >= TIMESTAMP '2026-01-01 00:00:10.000000' "
+                    + "AND TS <= TIMESTAMP '2026-01-01 00:00:20.000000'";
+            assertEquals(toString(s, String.format(narrow, "T_MV")),
+                    toString(s, String.format(narrow, "T")));
+            assertTrue(store.getPrunedSegmentCount() > afterUnbounded,
+                    "窄区间应跳过部分段，实际未跳：" + store.getPrunedSegmentCount());
+            long afterNarrow = store.getPrunedSegmentCount();
+
+            // 单侧区间同样可剪，且结果不变
+            String oneSided = "SELECT ID, TS FROM %s "
+                    + "WHERE TS >= TIMESTAMP '2026-01-01 00:00:40.000000' ORDER BY ID";
+            assertEquals(collectRows(s, String.format(oneSided, "T_MV")),
+                    collectRows(s, String.format(oneSided, "T")));
+            assertTrue(store.getPrunedSegmentCount() > afterNarrow,
+                    "单侧区间应跳过部分段，实际未跳：" + store.getPrunedSegmentCount());
+
+            // 区间覆盖全段、剪不掉任何段的查询，结果应与全表一致且不增加剪枝计数
+            long beforeNoPrune = store.getPrunedSegmentCount();
+            String noPrune = "SELECT SUM(ID) FROM %s WHERE ID >= 0";
+            assertEquals(toString(s, String.format(noPrune, "T_MV")),
+                    toString(s, String.format(noPrune, "T")));
+            assertEquals(beforeNoPrune, store.getPrunedSegmentCount(),
+                    "所有段都与区间相交时不应剪段");
+
+            // 区间覆盖全表时结果应与全表一致
+            String wide = "SELECT COUNT(*) FROM %s "
+                    + "WHERE TS >= TIMESTAMP '2025-01-01 00:00:00' "
+                    + "AND TS <= TIMESTAMP '2027-01-01 00:00:00'";
+            assertEquals(toString(s, String.format(unbounded, "T_MV")),
+                    toString(s, String.format(wide, "T")));
+        }
+    }
+
+    @Test
     void timestampVectorSurvivesRestartAndCompaction() throws Exception {
         Path dir = java.nio.file.Files.createTempDirectory("h2omap_ts_persist_");
         String url = "jdbc:h2:" + dir.resolve("ts_db").toAbsolutePath() + ";DB_CLOSE_DELAY=-1";
