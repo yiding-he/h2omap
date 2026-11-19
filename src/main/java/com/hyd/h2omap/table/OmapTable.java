@@ -49,6 +49,9 @@ public final class OmapTable extends TableBase {
     public OmapTable(CreateTableData data, OmapOptions options) {
         super(data);
         this.store = new ColumnarStore(getColumns(), options, getCompareMode());
+        // 惰性加载由服务端启动参数决定，默认关闭。
+        this.store.setLazyLoad(database.getSettings().omapLazyLoad);
+        this.store.setVisibilityListener(this::setModified);
         this.scanIndex = new OmapScanIndex(this, data.id, data.tableName + "_SCAN",
                 IndexColumn.wrap(getColumns()), IndexType.createScan(false), store);
         this.indexes.add(scanIndex);
@@ -56,6 +59,7 @@ public final class OmapTable extends TableBase {
         if (this.persistence != null) {
             if (this.persistence.hasExistingData()) {
                 this.persistence.recover(store);
+                this.store.startLazyLoading();
                 syncLastModificationIdWithDatabase();
             } else {
                 this.persistence.initEmptyWal();
@@ -304,6 +308,7 @@ public final class OmapTable extends TableBase {
 
     @Override
     public void close(SessionLocal session) {
+        store.stopLazyLoading();
         if (persistence != null) {
             persistence.close();
         }

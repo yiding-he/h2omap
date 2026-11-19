@@ -118,7 +118,9 @@ public final class OmapPersistence {
      */
     public void recover(ColumnarStore store) {
         try {
-            List<ColumnSegment> segments = new ArrayList<>();
+            int[] segmentIds = new int[0];
+            int[] generations = new int[0];
+            ColumnSegment[] preloaded = new ColumnSegment[0];
             int nextSegmentId = 0;
             long manifestWalSeq = 0;
             List<Value[]> openRows = new ArrayList<>();
@@ -137,12 +139,18 @@ public final class OmapPersistence {
                     nextSegmentId = in.readInt();
                     manifestWalSeq = in.readLong();
                     int segCount = in.readInt();
+                    segmentIds = new int[segCount];
+                    generations = new int[segCount];
+                    preloaded = new ColumnSegment[segCount];
                     for (int i = 0; i < segCount; i++) {
                         int segId = in.readInt();
                         int gen = in.readInt();
-                        ColumnSegment seg = readSegment(segId, gen);
-                        segments.add(seg);
+                        segmentIds[i] = segId;
+                        generations[i] = gen;
                         persistedSegments.put(segId, gen);
+                        if (!store.isLazyLoad()) {
+                            preloaded[i] = readSegment(segId, gen);
+                        }
                     }
                 }
                 Path tailPath = dir.resolve("tail_" + manifestWalSeq + ".omap");
@@ -152,7 +160,8 @@ public final class OmapPersistence {
             }
 
             store.restoreFromPersistence(
-                    segments, nextSegmentId, openRows, openDeletes, deltaUpdated, deltaDeletes);
+                    segmentIds, generations, preloaded, nextSegmentId,
+                    openRows, openDeletes, deltaUpdated, deltaDeletes);
 
             // 按 walSeq 升序重放所有 >= manifestWalSeq 的 WAL 文件
             List<Long> walSeqs = listWalSeqs();
@@ -299,8 +308,8 @@ public final class OmapPersistence {
     /**
      * 在锁外将增量段快照、tail 状态与 manifest 写盘，并清理过期旧文件。
      */
-    public void writeCheckpoint(List<ColumnSegment> segmentsSnapshot, int nextSegmentId,
-            long checkpointWalSeq, List<Value[]> openRows, Set<Long> openDeletes,
+    public void writeCheckpoint(ColumnarStore store, List<ColumnarStore.SegmentMeta> segmentsSnapshot,
+            int nextSegmentId, long checkpointWalSeq, List<Value[]> openRows, Set<Long> openDeletes,
             Map<Long, Value[]> deltaUpdated, Set<Long> deltaDeletes) {
         synchronized (ckptLock) {
             if (closed) {
@@ -309,12 +318,17 @@ public final class OmapPersistence {
             try {
                 // 1. 仅写出新增或版本号递增的列段
                 Set<Integer> activeSegIds = new HashSet<>(segmentsSnapshot.size() * 2 + 1);
-                for (ColumnSegment seg : segmentsSnapshot) {
-                    int id = seg.getSegmentId();
-                    int gen = seg.getGeneration();
+                for (ColumnarStore.SegmentMeta meta : segmentsSnapshot) {
+                    int id = meta.segmentId();
+                    int gen = meta.generation();
                     activeSegIds.add(id);
                     Integer persistedGen = persistedSegments.get(id);
                     if (persistedGen == null || persistedGen != gen) {
+                        // 版本号只在合并时递增，而合并要求段已加载；未加载段的版本号不会变。
+                        ColumnSegment seg = store.loadedSegment(id);
+                        if (seg == null) {
+                            continue;
+                        }
                         writeSegment(seg);
                         persistedSegments.put(id, gen);
                     }
@@ -338,9 +352,9 @@ public final class OmapPersistence {
                     out.writeInt(nextSegmentId);
                     out.writeLong(checkpointWalSeq);
                     out.writeInt(segmentsSnapshot.size());
-                    for (ColumnSegment seg : segmentsSnapshot) {
-                        out.writeInt(seg.getSegmentId());
-                        out.writeInt(seg.getGeneration());
+                    for (ColumnarStore.SegmentMeta meta : segmentsSnapshot) {
+                        out.writeInt(meta.segmentId());
+                        out.writeInt(meta.generation());
                     }
                 }
                 Files.move(manifestTmp, manifestDst, StandardCopyOption.REPLACE_EXISTING,
@@ -516,6 +530,11 @@ public final class OmapPersistence {
         Files.move(tmp, dst, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
     }
 
+    /** 读取单个段文件，供惰性加载按需调用。 */
+    public ColumnSegment loadSegment(int segmentId, int generation) throws IOException {
+        return readSegment(segmentId, generation);
+    }
+
     private ColumnSegment readSegment(int expectedId, int expectedGen) throws IOException {
         Path p = dir.resolve("seg_" + expectedId + "_" + expectedGen + ".omap");
         try (DataInputStream in = new DataInputStream(
@@ -607,10 +626,11 @@ public final class OmapPersistence {
         }
     }
 
-    private void cleanupObsoleteFiles(long currentWalSeq, List<ColumnSegment> activeSegments) {
+    private void cleanupObsoleteFiles(long currentWalSeq,
+            List<ColumnarStore.SegmentMeta> activeSegments) {
         Map<Integer, Integer> activeMap = new HashMap<>(activeSegments.size() * 2 + 1);
-        for (ColumnSegment seg : activeSegments) {
-            activeMap.put(seg.getSegmentId(), seg.getGeneration());
+        for (ColumnarStore.SegmentMeta meta : activeSegments) {
+            activeMap.put(meta.segmentId(), meta.generation());
         }
         try (Stream<Path> s = Files.list(dir)) {
             s.forEach(p -> {

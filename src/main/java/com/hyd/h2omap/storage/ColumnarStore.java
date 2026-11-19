@@ -51,8 +51,8 @@ public final class ColumnarStore {
 
     private final CompareMode compareMode;
 
-    /** 已冻结的段，按段号升序。 */
-    private final List<ColumnSegment> segments = new ArrayList<>();
+    /** 已冻结的段，按段号升序。惰性加载时元素的 {@code loaded} 可能为 null。 */
+    private final List<SegmentRef> segments = new ArrayList<>();
 
     private final DeltaStore delta = new DeltaStore();
 
@@ -78,6 +78,40 @@ public final class ColumnarStore {
 
     private volatile OmapPersistence persistence;
 
+    /** 只读 manifest 而不读段文件；由服务端系统属性 {@code h2.omapLazyLoad} 决定。 */
+    private volatile boolean lazyLoad;
+
+    /** 后台段加载线程，仅惰性模式下存在。 */
+    private volatile Thread lazyLoader;
+
+    private volatile boolean lazyLoaderStopped;
+
+    /** 后台加载中读段失败时保留的最后一个异常，供测试与诊断读取。 */
+    private volatile Throwable lastLazyLoadError;
+
+    /** 段加载完成后的通知，用来让 H2 的查询结果缓存失效。 */
+    private volatile Runnable visibilityListener;
+
+    /** 段的持久化元数据：checkpoint 与 manifest 只需要这两个值。 */
+    public record SegmentMeta(int segmentId, int generation) {
+    }
+
+    /** 段引用：{@code loaded} 为 null 表示段内容尚未从磁盘读取。 */
+    private static final class SegmentRef {
+
+        final int segmentId;
+
+        int generation;
+
+        volatile ColumnSegment loaded;
+
+        SegmentRef(int segmentId, int generation, ColumnSegment loaded) {
+            this.segmentId = segmentId;
+            this.generation = generation;
+            this.loaded = loaded;
+        }
+    }
+
     public ColumnarStore(Column[] columns, OmapOptions options, CompareMode compareMode) {
         this.options = options;
         this.compareMode = compareMode;
@@ -92,6 +126,50 @@ public final class ColumnarStore {
 
     public void setPersistence(OmapPersistence persistence) {
         this.persistence = persistence;
+    }
+
+    /** 只登记 manifest、不读段文件。必须在 {@code recover()} 之前设置。 */
+    public void setLazyLoad(boolean lazyLoad) {
+        this.lazyLoad = lazyLoad;
+    }
+
+    public boolean isLazyLoad() {
+        return lazyLoad;
+    }
+
+    /** 段加载完成后的回调，用来让 H2 的查询结果缓存失效。 */
+    public void setVisibilityListener(Runnable listener) {
+        this.visibilityListener = listener;
+    }
+
+    /**
+     * 启动后台段加载。按段号倒序进行：段号与写入顺序同向，
+     * 所以最近写入的数据最先对查询可见。
+     */
+    public void startLazyLoading() {
+        if (!lazyLoad || lazyLoader != null) {
+            return;
+        }
+        Thread thread = new Thread(this::loadAllSegments, "omap-lazy-loader");
+        thread.setDaemon(true);
+        lazyLoaderStopped = false;
+        lazyLoader = thread;
+        thread.start();
+    }
+
+    /** 停止后台加载并等待其退出。 */
+    public void stopLazyLoading() {
+        Thread thread = lazyLoader;
+        lazyLoaderStopped = true;
+        if (thread != null) {
+            thread.interrupt();
+            try {
+                thread.join(2000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            lazyLoader = null;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -138,7 +216,9 @@ public final class ColumnarStore {
                 } else {
                     openDeletes.add(rowId);
                 }
-                rowCount--;
+                if (countedInRowCount(rowId)) {
+                    rowCount--;
+                }
                 bump();
                 OmapPersistence p = persistence;
                 if (p != null) {
@@ -275,8 +355,10 @@ public final class ColumnarStore {
                     int segId = entry.getKey();
                     int index = segId - firstId;
                     if (index >= 0 && index < segments.size()
-                            && segments.get(index) == baseSegments.get(segId)) {
-                        segments.set(index, entry.getValue());
+                            && segments.get(index).loaded == baseSegments.get(segId)) {
+                        SegmentRef ref = segments.get(index);
+                        ref.loaded = entry.getValue();
+                        ref.generation = entry.getValue().getGeneration();
                     } else {
                         return 0;
                     }
@@ -308,7 +390,7 @@ public final class ColumnarStore {
         if (p == null) {
             return;
         }
-        List<ColumnSegment> segsSnap;
+        List<SegmentMeta> segsSnap;
         int nextSegIdSnap;
         long newWalSeq;
         List<Value[]> openRowsSnap;
@@ -317,7 +399,10 @@ public final class ColumnarStore {
         Set<Long> deltaDeletesSnap;
         lock.writeLock().lock();
         try {
-            segsSnap = new ArrayList<>(segments);
+            segsSnap = new ArrayList<>(segments.size());
+            for (SegmentRef ref : segments) {
+                segsSnap.add(new SegmentMeta(ref.segmentId, ref.generation));
+            }
             nextSegIdSnap = nextSegmentId;
             openRowsSnap = new ArrayList<>(openSegment.rawRows());
             openDeletesSnap = new HashSet<>(openDeletes);
@@ -327,7 +412,7 @@ public final class ColumnarStore {
         } finally {
             lock.writeLock().unlock();
         }
-        p.writeCheckpoint(segsSnap, nextSegIdSnap, newWalSeq,
+        p.writeCheckpoint(this, segsSnap, nextSegIdSnap, newWalSeq,
                 openRowsSnap, openDeletesSnap, deltaUpdatedSnap, deltaDeletesSnap);
     }
 
@@ -335,13 +420,16 @@ public final class ColumnarStore {
     // 持久化恢复（仅在开库阶段单线程调用）
     // ------------------------------------------------------------------
 
-    public void restoreFromPersistence(List<ColumnSegment> restoredSegments, int restoredNextSegId,
+    public void restoreFromPersistence(int[] segmentIds, int[] generations,
+            ColumnSegment[] preloaded, int restoredNextSegId,
             List<Value[]> openRows, Set<Long> restoredOpenDeletes,
             Map<Long, Value[]> restoredDeltaUpdated, Set<Long> restoredDeltaDeletes) {
         lock.writeLock().lock();
         try {
             segments.clear();
-            segments.addAll(restoredSegments);
+            for (int i = 0; i < segmentIds.length; i++) {
+                segments.add(new SegmentRef(segmentIds[i], generations[i], preloaded[i]));
+            }
             nextSegmentId = restoredNextSegId;
             openSegment.clear();
             for (Value[] row : openRows) {
@@ -404,7 +492,9 @@ public final class ColumnarStore {
                 } else {
                     openDeletes.add(rowId);
                 }
-                rowCount--;
+                if (countedInRowCount(rowId)) {
+                    rowCount--;
+                }
                 bump();
             }
         } finally {
@@ -429,17 +519,13 @@ public final class ColumnarStore {
 
     private void recomputeRowCount() {
         long count = 0;
-        for (ColumnSegment seg : segments) {
-            int rc = seg.getRowCount();
-            if (seg.getDeleted().hasNull()) {
-                for (int i = 0; i < rc; i++) {
-                    if (!seg.isDeleted(i)) {
-                        count++;
-                    }
-                }
-            } else {
-                count += rc;
+        for (SegmentRef ref : segments) {
+            // 未加载段的行不计入，与读路径的可见性判定保持一致。
+            ColumnSegment seg = ref.loaded;
+            if (seg == null) {
+                continue;
             }
+            count += visibleRowsOf(seg);
         }
         for (long rowId : delta.deletedRowIds()) {
             ColumnSegment seg = segment(RowId.segmentId(rowId));
@@ -613,7 +699,119 @@ public final class ColumnarStore {
 
     /** 供测试与合并使用。 */
     List<ColumnSegment> segments() {
-        return segments;
+        List<ColumnSegment> loaded = new ArrayList<>(segments.size());
+        for (SegmentRef ref : segments) {
+            if (ref.loaded != null) {
+                loaded.add(ref.loaded);
+            }
+        }
+        return loaded;
+    }
+
+    /** 已登记的段数（含尚未加载的段）。 */
+    public int segmentCount() {
+        lock.readLock().lock();
+        try {
+            return segments.size();
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /** 已加载的段数，供惰性加载的测试断言。 */
+    public int loadedSegmentCount() {
+        lock.readLock().lock();
+        try {
+            int n = 0;
+            for (SegmentRef ref : segments) {
+                if (ref.loaded != null) {
+                    n++;
+                }
+            }
+            return n;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 后台段加载
+    // ------------------------------------------------------------------
+
+    private void loadAllSegments() {
+        OmapPersistence p = persistence;
+        if (p == null) {
+            return;
+        }
+        SegmentRef[] refs;
+        Map<Integer, List<Integer>> deletedOffsetsBySegment = new HashMap<>();
+        lock.readLock().lock();
+        try {
+            refs = segments.toArray(new SegmentRef[0]);
+            for (long rowId : delta.deletedRowIds()) {
+                deletedOffsetsBySegment
+                        .computeIfAbsent(RowId.segmentId(rowId), k -> new ArrayList<>())
+                        .add(RowId.offset(rowId));
+            }
+        } finally {
+            lock.readLock().unlock();
+        }
+        for (int i = refs.length - 1; i >= 0 && !lazyLoaderStopped; i--) {
+            SegmentRef ref = refs[i];
+            if (ref.loaded != null) {
+                continue;
+            }
+            ColumnSegment segment;
+            try {
+                segment = p.loadSegment(ref.segmentId, ref.generation);
+            } catch (Exception e) {
+                // 段文件读不出来时跳过这一段，其余段继续加载；读路径继续把该段当作不可见。
+                lastLazyLoadError = e;
+                continue;
+            }
+            publishLoaded(ref, segment, deletedOffsetsBySegment.get(ref.segmentId));
+        }
+    }
+
+    private void publishLoaded(SegmentRef ref, ColumnSegment segment, List<Integer> deletedOffsets) {
+        lock.writeLock().lock();
+        try {
+            if (ref.loaded != null) {
+                return;
+            }
+            ref.loaded = segment;
+            long added = visibleRowsOf(segment);
+            if (deletedOffsets != null) {
+                int rowCountOfSegment = segment.getRowCount();
+                for (int offset : deletedOffsets) {
+                    if (offset < rowCountOfSegment && !segment.isDeleted(offset)) {
+                        added--;
+                    }
+                }
+            }
+            rowCount += Math.max(0, added);
+            bump();
+        } finally {
+            lock.writeLock().unlock();
+        }
+        Runnable listener = visibilityListener;
+        if (listener != null) {
+            listener.run();
+        }
+    }
+
+    private static long visibleRowsOf(ColumnSegment segment) {
+        int rowCount = segment.getRowCount();
+        if (!segment.getDeleted().hasNull()) {
+            return rowCount;
+        }
+        long visible = 0;
+        for (int i = 0; i < rowCount; i++) {
+            if (!segment.isDeleted(i)) {
+                visible++;
+            }
+        }
+        return visible;
     }
 
     // ------------------------------------------------------------------
@@ -639,7 +837,7 @@ public final class ColumnarStore {
         }
         ColumnSegment segment = ColumnSegment.build(
                 nextSegmentId, openSegment.drain(), columnTypes, compareMode);
-        segments.add(segment);
+        segments.add(new SegmentRef(nextSegmentId, segment.getGeneration(), segment));
         // 段冻结后，开放段里的删除记录必须移交给 delta，否则那些行会重新可见。
         for (long rowId : openDeletes) {
             delta.markDeleted(rowId);
@@ -656,20 +854,44 @@ public final class ColumnarStore {
             return false;
         }
         ColumnSegment segment = segment(RowId.segmentId(rowId));
-        return segment != null && !segment.isDeleted(RowId.offset(rowId));
+        if (segment == null) {
+            // 段尚未加载时读不到段内删除位图；rowId 由 H2 或 WAL 提供，按存在处理，
+            // 使 WAL 重放与客户端删除能记进 delta，加载时再统一扣除。
+            return true;
+        }
+        return !segment.isDeleted(RowId.offset(rowId));
     }
 
     private boolean isFrozen(long rowId) {
         return RowId.segmentId(rowId) < nextSegmentId;
     }
 
+    /** 该行是否已计入 {@code rowCount}：未加载段的行在加载完成时才计入。 */
+    private boolean countedInRowCount(long rowId) {
+        return !isFrozen(rowId) || segment(RowId.segmentId(rowId)) != null;
+    }
+
     private ColumnSegment segment(int segmentId) {
         int index = segmentId - firstSegmentId();
-        return index >= 0 && index < segments.size() ? segments.get(index) : null;
+        if (index < 0 || index >= segments.size()) {
+            return null;
+        }
+        // 未加载段返回 null，与“段不存在”同一条路径：读路径直接跳过该段。
+        return segments.get(index).loaded;
+    }
+
+    /** 按段号取已加载的段，供 checkpoint 写盘使用。 */
+    public ColumnSegment loadedSegment(int segmentId) {
+        lock.readLock().lock();
+        try {
+            return segment(segmentId);
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     private int firstSegmentId() {
-        return segments.isEmpty() ? nextSegmentId : segments.get(0).getSegmentId();
+        return segments.isEmpty() ? nextSegmentId : segments.get(0).segmentId;
     }
 
     private void bump() {
@@ -970,7 +1192,13 @@ public final class ColumnarStore {
     public VectorizedSnapshot takeVectorizedSnapshot(Value[] lower, Value[] upper) {
         lock.readLock().lock();
         try {
-            ColumnSegment[] segs = segments.toArray(new ColumnSegment[0]);
+            List<ColumnSegment> loadedSegments = new ArrayList<>(segments.size());
+            for (SegmentRef ref : segments) {
+                if (ref.loaded != null) {
+                    loadedSegments.add(ref.loaded);
+                }
+            }
+            ColumnSegment[] segs = loadedSegments.toArray(new ColumnSegment[0]);
             if (lower != null || upper != null) {
                 segs = prune(segs, lower, upper);
             }
