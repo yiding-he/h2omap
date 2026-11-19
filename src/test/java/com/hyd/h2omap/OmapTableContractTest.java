@@ -248,6 +248,35 @@ class OmapTableContractTest {
     }
 
     @Test
+    void settingsExposeOmapLazyLoadSwitch() throws SQLException {
+        // 默认关闭，行为与未加开关时一致。
+        assertEquals("false", scalar(
+                "SELECT SETTING_VALUE FROM INFORMATION_SCHEMA.SETTINGS WHERE SETTING_NAME = 'OMAP_LAZY_LOAD'"));
+        // 开关唯一的来源是服务端的系统属性，库打开时读一次。
+        String key = "h2.omapLazyLoad";
+        String previous = System.getProperty(key);
+        System.setProperty(key, "true");
+        try {
+            String name = "mem:omapLazy" + SEQ.incrementAndGet() + ";DB_CLOSE_DELAY=-1";
+            try (Connection c = DriverManager.getConnection("jdbc:h2:" + name, "sa", "")) {
+                try (ResultSet rs = c.createStatement().executeQuery(
+                        "SELECT SETTING_VALUE FROM INFORMATION_SCHEMA.SETTINGS"
+                                + " WHERE SETTING_NAME = 'OMAP_LAZY_LOAD'")) {
+                    assertTrue(rs.next());
+                    assertEquals("true", rs.getString(1));
+                }
+                c.createStatement().execute("SHUTDOWN");
+            }
+        } finally {
+            if (previous == null) {
+                System.clearProperty(key);
+            } else {
+                System.setProperty(key, previous);
+            }
+        }
+    }
+
+    @Test
     void tableDefinitionSurvivesRestart(@TempDir Path dir) throws SQLException {
         String url = "jdbc:h2:" + dir.resolve("restart");
         try (Connection first = DriverManager.getConnection(url, "sa", "")) {
