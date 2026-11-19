@@ -277,6 +277,67 @@ class OmapTableContractTest {
     }
 
     @Test
+    void lazyLoadReopensFileDatabaseAndKeepsResults(@TempDir Path dir) throws Exception {
+        String key = "h2.omapLazyLoad";
+        String previous = System.getProperty(key);
+        System.setProperty(key, "true");
+        try {
+            String url = "jdbc:h2:" + dir.resolve("lazy");
+            try (Connection first = DriverManager.getConnection(url, "sa", "")) {
+                try (Statement s = first.createStatement()) {
+                    s.execute(createTable("T", "ID INT, V VARCHAR", "\"segmentSize=50\""));
+                    try (PreparedStatement ps = first.prepareStatement(
+                            "INSERT INTO T VALUES (?, ?)")) {
+                        for (int i = 0; i < 400; i++) {
+                            ps.setInt(1, i);
+                            ps.setString(2, "v" + i);
+                            ps.addBatch();
+                        }
+                        ps.executeBatch();
+                    }
+                    s.execute("UPDATE T SET V = 'x' WHERE ID < 100");
+                    s.execute("DELETE FROM T WHERE ID >= 300");
+                }
+            }
+            // 连接断开后库已关闭，这次打开走惰性加载：先只登记 manifest，段在后台逐段读入。
+            try (Connection second = DriverManager.getConnection(url, "sa", "")) {
+                try (Statement s = second.createStatement()) {
+                    assertEquals("true", toString(s,
+                            "SELECT SETTING_VALUE FROM INFORMATION_SCHEMA.SETTINGS"
+                                    + " WHERE SETTING_NAME = 'OMAP_LAZY_LOAD'"));
+                    // 加载未完成时客户端就能写入：新行进开放段，冻结时触发 checkpoint，
+                    // 未加载的历史段不会被重写。
+                    s.execute("INSERT INTO T VALUES (1000, 'new')");
+                    for (int i = 1001; i <= 1059; i++) {
+                        s.execute("INSERT INTO T VALUES (" + i + ", 'new')");
+                    }
+                    // 加载完成前行数只包含已加载的段加新写入的行，完成后应等于真实行数。
+                    long expected = 360;
+                    long count = -1;
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline) {
+                        count = Long.parseLong(toString(s, "SELECT COUNT(*) FROM T"));
+                        if (count == expected) {
+                            break;
+                        }
+                        Thread.sleep(20);
+                    }
+                    assertEquals(expected, count);
+                    assertEquals("106620", toString(s, "SELECT SUM(ID) FROM T"));
+                    assertEquals("100", toString(s, "SELECT COUNT(*) FROM T WHERE V = 'x'"));
+                    assertEquals("v299", toString(s, "SELECT V FROM T WHERE ID = 299"));
+                }
+            }
+        } finally {
+            if (previous == null) {
+                System.clearProperty(key);
+            } else {
+                System.setProperty(key, previous);
+            }
+        }
+    }
+
+    @Test
     void tableDefinitionSurvivesRestart(@TempDir Path dir) throws SQLException {
         String url = "jdbc:h2:" + dir.resolve("restart");
         try (Connection first = DriverManager.getConnection(url, "sa", "")) {

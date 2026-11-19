@@ -6,6 +6,8 @@ package com.hyd.h2omap.storage;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import org.h2.result.Row;
 import org.h2.table.Column;
@@ -454,5 +456,43 @@ class ColumnarStoreTest {
         assertEquals("v3", store.materialize(ids[3]).getValueList()[0].getString());
         assertEquals("v7", store.materialize(ids[7]).getValueList()[0].getString());
         assertEquals("v199", store.materialize(ids[199]).getValueList()[0].getString());
+    }
+
+    /**
+     * 惰性加载：未加载的段对读路径完全不可见，已加载段正常参与。
+     *
+     * <p>后台加载在本用例中不启动（没有 persistence），所以未加载段会一直保持未加载。
+     */
+    @Test
+    void unloadedSegmentsAreInvisibleToEveryReadPath() {
+        ColumnarStore source = newStore(4, Integer.MAX_VALUE);
+        for (int i = 0; i < 12; i++) {
+            source.append(row(i, "v" + i));
+        }
+        List<ColumnSegment> built = source.segments();
+        assertEquals(3, built.size());
+
+        ColumnarStore target = newStore(4, Integer.MAX_VALUE);
+        target.setLazyLoad(true);
+        int[] segmentIds = new int[built.size()];
+        int[] generations = new int[built.size()];
+        ColumnSegment[] preloaded = new ColumnSegment[built.size()];
+        for (int i = 0; i < built.size(); i++) {
+            segmentIds[i] = built.get(i).getSegmentId();
+            generations[i] = built.get(i).getGeneration();
+            // 只把第 0 段当作已加载，其余两段保持未加载。
+            preloaded[i] = i == 0 ? built.get(0) : null;
+        }
+        target.restoreFromPersistence(segmentIds, generations, preloaded, 3,
+                List.of(), Set.of(), Map.of(), Set.of());
+
+        assertEquals(3, target.segmentCount());
+        assertEquals(1, target.loadedSegmentCount());
+        assertEquals(4, target.getRowCount());
+        assertArrayEquals(new long[] { 0, 1, 2, 3 }, target.collectVisibleRowIds(false));
+        assertEquals(1, target.takeVectorizedSnapshot().segments.length);
+        assertEquals("v2", target.materialize(2).getValueList()[1].getString());
+        // 未加载段里的行按不可见处理，不能被物化。
+        assertNull(target.materialize(5));
     }
 }
