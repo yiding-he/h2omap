@@ -27,7 +27,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | JDK | 构建与运行用 JDK 21.0.11；字节码目标 `maven.compiler.release=17` |
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变）。被替换的 3 个 H2 类按该版本源码合入，升级时必须逐类重新比对 |
 | 依赖 | 运行期只有 `com.h2database:h2`，测试用 `junit-jupiter`，构建期插件 `maven-shade-plugin` |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（61 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（17 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（62 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（18 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/`。该目录可能不存在（已排除在版本控制之外）。Maven Central 的 `h2-2.5.252-sources.jar` 内容等价，但个别文件与该 zip 相差数行，核对行号时以 zip 为准 |
 
 ## H2 侧的依据
@@ -69,7 +69,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | `org.h2.schema.Schema` | `createTable()` 增加两段判断：显式写 `ENGINE "org.h2.mvstore.db.Store"` 时清空 `data.tableEngine` 直接走 MVStore；`tableEngine == null` 且未设 `defaultTableEngine`、非开库重放（`!database.isStarting()`）、`data.id != 0`、非临时表时，默认取 `com.hyd.h2omap.engine.OmapTableEngine` |
 | `org.h2.expression.condition.Comparison` | 只新增一个 `public int getCompareType()`，供 `VectorizedFilter` 读取比较类型 |
 | `org.h2.expression.condition.ConditionInQuery` | 按 `2.5.252` 源码逐字合入，末尾新增 `getLeft()`、`isNot()`、`isAll()`、`getCompareType()` 四个访问器，供 `SubqueryFold` 读取 `IN (SELECT)` 谓词的成员 |
-| `org.h2.engine.DbSettings` | 按 `2.5.252` 源码逐字合入，加两处：构造器末尾把 `DEFAULT_TABLE_ENGINE` 的展示值写成 `com.hyd.h2omap.engine.OmapTableEngine`（`defaultTableEngine` 字段仍为 `null`，`Schema.createTable` 用它判断默认引擎路径，改的只是 `INFORMATION_SCHEMA.SETTINGS` 读的那张 map；`MV_STORE` 不动，H2 元数据确实在 MVStore 里）；新增 `public final boolean omapLazyLoad = get("OMAP_LAZY_LOAD", false)`，由服务端系统属性 `-Dh2.omapLazyLoad=true` 打开（连接串参数 `;OMAP_LAZY_LOAD=TRUE` 会被 H2 以 `Unsupported connection setting` 拒绝），库打开时读一次。该开关当前只登记取值，段的惰性加载尚未实现 |
+| `org.h2.engine.DbSettings` | 按 `2.5.252` 源码逐字合入，加两处：构造器末尾把 `DEFAULT_TABLE_ENGINE` 的展示值写成 `com.hyd.h2omap.engine.OmapTableEngine`（`defaultTableEngine` 字段仍为 `null`，`Schema.createTable` 用它判断默认引擎路径，改的只是 `INFORMATION_SCHEMA.SETTINGS` 读的那张 map；`MV_STORE` 不动，H2 元数据确实在 MVStore 里）；新增 `public final boolean omapLazyLoad = get("OMAP_LAZY_LOAD", false)`，由服务端系统属性 `-Dh2.omapLazyLoad=true` 打开（连接串参数 `;OMAP_LAZY_LOAD=TRUE` 会被 H2 以 `Unsupported connection setting` 拒绝），库打开时读一次。开关打开后 `recover()` 只登记段的 id 与 generation，段内容由后台线程逐段读入 |
 
 访问桥不替换原类，只是声明在同一个包里，用来读取包级与受保护成员：
 
@@ -184,6 +184,26 @@ wal_<seq>.log                 检查点之后的增量：insert/update/delete/tr
 
 `OmapTable.close()` 关掉 persistence，`removeChildrenAndResources()` 删除整个目录。索引不在 WAL 里：重启后 H2 重放 `ALTER TABLE ADD CONSTRAINT` 会重新调用 `addIndex`。
 
+### 惰性加载
+
+由服务端启动参数 `-Dh2.omapLazyLoad=true` 打开，默认关闭；开关关闭时 `recover()` 与改动前完全一致（开库时读完所有段），关闭后的行为不受影响。
+
+开关打开时，`recover()` 只读 `manifest.dat` 登记每段的 id 与 generation，段文件不读，随后 `ColumnarStore.startLazyLoading()` 起一个后台线程按段号**倒序**加载：段号与写入顺序同向，所以最近写入的数据最先可用。实测 800 个段 4 万行：开库 328 → 198 ms，首次查询只看到 2,150 行，约 200 ms 后补齐 4 万行且 `SUM` 正确。
+
+可见性口径：**未加载段整体不参与查询**，包括它里面的 delta 新像；行数、迭代器（行式与批量）、`collectVisibleRowIds`、`takeVectorizedSnapshot`、有序扫描都走同一个判定（`segment(int)` 对未加载段返回 `null`，读路径按“段不存在”跳过）。因此加载期间的查询结果是“已加载段的可见行加开放段的行”，随加载推进而增长，不保证等于最终行数。
+
+三处配套规则：
+
+| 规则 | 原因 |
+| --- | --- |
+| 每完成一段 `publishLoaded` 递增 store 的 modificationId，并通过 `visibilityListener` 调 `OmapTable.setModified()` | 否则 H2 的查询结果缓存会返回加载前的旧结果 |
+| `isVisible` 对未加载段的行返回 `true`，`countedInRowCount` 对这些行返回 `false` | WAL 重放与客户端删除必须能记进 delta，但这些行在加载前尚未计入 `rowCount`，不能重复扣减 |
+| `checkpoint()` 只重写 generation 变了的段，未加载段由 `loadedSegment()` 返回 `null` 时跳过 | gen 只在合并时递增，而合并要求段已加载，所以未加载段无需写盘 |
+
+合并（`compact()`）在加载期间只处理已加载段，指向未加载段的 delta 条目留在 delta 里，等该段加载后再合并；加载完成前这些改动不参与可见性。
+
+已知限制：开关打开时 `addIndex` 的回填只覆盖已加载段，唯一约束与主键点查在回填完成前不完整。当前生产表没有主键与唯一约束（`INFORMATION_SCHEMA.INDEXES` 为 0 行），暂不触发。
+
 ## 与 H2 的契约
 
 ### 必须实现的方法
@@ -279,7 +299,7 @@ src/test/java/com/hyd/h2omap/
 
 ## 当前状态与后续阶段
 
-M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成。判定依据为 61 个契约用例、17 个存储层用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
+M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成。判定依据为 62 个契约用例、18 个存储层用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
 
 阶段编号按提出顺序，M7、M8 的实际交付早于 M6。
 
