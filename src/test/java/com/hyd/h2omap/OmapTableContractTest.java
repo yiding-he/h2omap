@@ -276,6 +276,89 @@ class OmapTableContractTest {
         }
     }
 
+    /**
+     * 驻留预算开启时惰性预载不产生无效读：预载新→老装满预算即停，
+     * 装不下的段不再预载（旧实现会每个段都读入又立即逐出）。
+     * 骨架元数据随 manifest 持久化：重开后全部段立即可见且可剪枝，
+     * 开库第一次 COUNT 就是全量；老段等查询命中时按需读回且驻留稳定。
+     * 3 列表形每段约 15 KB，预算 40k 容最新两段、容不下三段。
+     * 不带主键：避免 addIndex 回填在重开时逐段读回（那是索引正确性的必要读，
+     * 与预载停止是两回事）。
+     */
+    @Test
+    void lazyLoadStopsAtResidentBudget(@TempDir Path dir) throws Exception {
+        String key = "h2.omapLazyLoad";
+        String previous = System.getProperty(key);
+        System.setProperty(key, "true");
+        try {
+            String url = "jdbc:h2:" + dir.resolve("lazyBudget");
+            try (Connection first = DriverManager.getConnection(url, "sa", "")) {
+                try (Statement s = first.createStatement()) {
+                    s.execute(createTable("T", "ID INT, V VARCHAR(64), IV INT",
+                            "\"segmentSize=50\", \"residentBytes=40k\""));
+                    String pad = "v".repeat(60);
+                    try (java.sql.PreparedStatement ps = first.prepareStatement(
+                            "INSERT INTO T VALUES (?, ?, ?)")) {
+                        for (int i = 0; i < 400; i++) {
+                            ps.setInt(1, i);
+                            ps.setString(2, pad + i);
+                            ps.setInt(3, i);
+                            ps.addBatch();
+                        }
+                        ps.executeBatch();
+                    }
+                }
+            }
+            // 重开：骨架随 manifest 恢复，行数立即是全量。
+            try (Connection second = DriverManager.getConnection(url, "sa", "");
+                    Statement s = second.createStatement()) {
+                org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                        ((org.h2.jdbc.JdbcConnection) second).getSession();
+                com.hyd.h2omap.storage.ColumnarStore store =
+                        ((com.hyd.h2omap.table.OmapTable) session.getDatabase().getMainSchema()
+                                .findTableOrView(session, "T")).getStore();
+                // 预载收尾：恰好一次探针逐出；若预载不停止，会逐个读入并逐出段 5..0，计数到 6。
+                long deadline = System.currentTimeMillis() + 10_000;
+                long evictedSeen = -1;
+                long stableSince = -1;
+                while (System.currentTimeMillis() < deadline) {
+                    long evicted = store.getEvictedSegmentCount();
+                    if (evicted != evictedSeen) {
+                        evictedSeen = evicted;
+                        stableSince = System.currentTimeMillis();
+                    } else if (store.isSegmentResident(6) && evicted >= 1
+                            && System.currentTimeMillis() - stableSince >= 500) {
+                        break;
+                    }
+                    Thread.sleep(20);
+                }
+                assertEquals(1, store.getEvictedSegmentCount(),
+                        "预算处停止的预载只应有探针段一次逐出");
+                assertTrue(store.isSegmentResident(7), "最新段应预载驻留");
+                assertTrue(store.isSegmentResident(6), "次新段应预载驻留");
+                assertFalse(store.isSegmentResident(5), "预算外的段不应被预载读入");
+                assertFalse(store.isSegmentResident(0), "最老的段不应被预载读入");
+
+                // 骨架可见：预载未完成时开库第一次 COUNT 就是全量。
+                assertEquals("400", toString(s, "SELECT COUNT(*) FROM T"));
+                assertEquals("79800", toString(s, "SELECT SUM(ID) FROM T"));
+
+                // 全表聚合后驻留集滚动到最近触碰的两段，这里不断驻留状态；
+                // 目标查询只命中段 0（骨架 zone map 剪枝）：按需读回且驻留稳定。
+                assertEquals("50", toString(s, "SELECT COUNT(*) FROM T WHERE ID < 50"));
+                assertTrue(store.isSegmentResident(0), "查询命中的老段应读回并驻留");
+                assertEquals("v".repeat(60) + "59", toString(s, "SELECT V FROM T WHERE ID = 59"));
+                assertTrue(store.isSegmentResident(0), "命中段读回后应驻留稳定");
+            }
+        } finally {
+            if (previous == null) {
+                System.clearProperty(key);
+            } else {
+                System.setProperty(key, previous);
+            }
+        }
+    }
+
     @Test
     void lazyLoadReopensFileDatabaseAndKeepsResults(@TempDir Path dir) throws Exception {
         String key = "h2.omapLazyLoad";
@@ -299,7 +382,8 @@ class OmapTableContractTest {
                     s.execute("DELETE FROM T WHERE ID >= 300");
                 }
             }
-            // 连接断开后库已关闭，这次打开走惰性加载：先只登记 manifest，段在后台逐段读入。
+            // 连接断开后库已关闭，这次打开走惰性加载：先只登记 manifest 与骨架，段在后台逐段读入。
+            // 骨架随 manifest 恢复：未加载段也计入行数且可剪枝，开库第一次 COUNT 就是全量。
             try (Connection second = DriverManager.getConnection(url, "sa", "")) {
                 try (Statement s = second.createStatement()) {
                     assertEquals("true", toString(s,
@@ -307,11 +391,12 @@ class OmapTableContractTest {
                                     + " WHERE SETTING_NAME = 'OMAP_LAZY_LOAD'"));
                     // 加载未完成时客户端就能写入：新行进开放段，冻结时触发 checkpoint，
                     // 未加载的历史段不会被重写。
+                    assertEquals("300", toString(s, "SELECT COUNT(*) FROM T"));
                     s.execute("INSERT INTO T VALUES (1000, 'new')");
                     for (int i = 1001; i <= 1059; i++) {
                         s.execute("INSERT INTO T VALUES (" + i + ", 'new')");
                     }
-                    // 加载完成前行数只包含已加载的段加新写入的行，完成后应等于真实行数。
+                    // 新写入的行立即计入；全量行数不再依赖后台加载进度。
                     long expected = 360;
                     long count = -1;
                     long deadline = System.currentTimeMillis() + 10_000;

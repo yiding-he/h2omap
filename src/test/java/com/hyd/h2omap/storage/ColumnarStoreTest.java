@@ -553,7 +553,7 @@ class ColumnarStoreTest {
             // 只把第 0 段当作已加载，其余两段保持未加载。
             preloaded[i] = i == 0 ? built.get(0) : null;
         }
-        target.restoreFromPersistence(segmentIds, generations, preloaded, 3,
+        target.restoreFromPersistence(segmentIds, generations, preloaded, null, 3,
                 List.of(), Set.of(), Map.of(), Set.of());
 
         assertEquals(3, target.segmentCount());
