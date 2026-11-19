@@ -1840,6 +1840,62 @@ class OmapTableContractTest {
         }
     }
 
+    /**
+     * 段级部分聚合缓存（MOR 批次 3）：同签名同段的聚合命中缓存；
+     * 含改动行的段按「generation + delta 版本」失效，其余段不受跨段写影响。
+     */
+    @Test
+    void segmentAggCacheReusesPartials() throws Exception {
+        execute("CREATE TABLE T (ID INT PRIMARY KEY, CAT VARCHAR(8), IV INT, DV DOUBLE) "
+                + "ENGINE \"" + ENGINE + "\" WITH \"segmentSize=8\", \"compactionMinRows=1000\"");
+        execute("CREATE TABLE T_MV (ID INT PRIMARY KEY, CAT VARCHAR(8), IV INT, DV DOUBLE) "
+                + "ENGINE \"org.h2.mvstore.db.Store\"");
+        for (int i = 1; i <= 40; i++) {
+            String vals = i + ", 'c" + (i % 4) + "', " + (i * 10) + ", " + (i * 0.5);
+            execute("INSERT INTO T VALUES (" + vals + ")");
+            execute("INSERT INTO T_MV VALUES (" + vals + ")");
+        }
+
+        org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                ((org.h2.jdbc.JdbcConnection) conn).getSession();
+        com.hyd.h2omap.table.OmapTable table = (com.hyd.h2omap.table.OmapTable)
+                session.getDatabase().getMainSchema().findTableOrView(session, "T");
+        com.hyd.h2omap.vectorized.SegmentAggCache cache = table.getStore().getAggCache();
+
+        // 同一模板列表跑多轮：全局聚合、单列分组、常量过滤、组合过滤、IN 两档。
+        // 过滤常量都取值在全段值域内，避免段级剪枝使各轮命中数不可精确断言。
+        String[] templates = {
+                "SELECT COUNT(*), SUM(IV), MIN(IV), MAX(IV), AVG(IV) FROM %s",
+                "SELECT CAT, COUNT(*), SUM(IV) FROM %s GROUP BY CAT ORDER BY CAT",
+                "SELECT COUNT(*) FROM %s WHERE IV > 0",
+                "SELECT CAT, SUM(IV) FROM %s WHERE IV > 0 AND CAT LIKE 'c1%%' GROUP BY CAT ORDER BY CAT",
+                "SELECT COUNT(*) FROM %s WHERE CAT IN ('c1', 'c2')",
+                "SELECT COUNT(*) FROM %s WHERE CAT IN ('c3')",
+        };
+
+        // 排除 H2 结果缓存的干扰：命中断言要求每次都真正进入执行器
+        try (java.sql.Connection qc = DriverManager.getConnection(
+                "jdbc:h2:" + dbName + ";QUERY_CACHE_SIZE=0", "sa", "");
+                Statement s = qc.createStatement()) {
+            assertQueriesMatch(s, templates);
+            assertEquals(0, cache.hitCount(), "首轮只填充，不应命中");
+
+            assertQueriesMatch(s, templates);
+            assertEquals(30, cache.hitCount(), "5 个已冻结段 × 6 个查询应全部命中");
+
+            // 改动只落在段 0（ID 1..8）：该段必须失效重算，其余 4 段继续命中
+            for (String t : new String[] { "T", "T_MV" }) {
+                execute("UPDATE " + t + " SET IV = IV + 1000 WHERE ID IN (2, 3)");
+                execute("DELETE FROM " + t + " WHERE ID = 5");
+            }
+            assertQueriesMatch(s, templates);
+            assertEquals(54, cache.hitCount(), "只有段 0 失效：30 + 4 段 × 6 查询 = 54");
+
+            assertQueriesMatch(s, templates);
+            assertEquals(84, cache.hitCount(), "段 0 重算后再次全量命中：54 + 30 = 84");
+        }
+    }
+
     private static void assertQueriesMatch(Statement s, String[] templates) throws SQLException {
         for (String template : templates) {
             String expected = collectRows(s, String.format(template, "T_MV"));
