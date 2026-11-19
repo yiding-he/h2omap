@@ -232,6 +232,22 @@ class OmapTableContractTest {
     }
 
     @Test
+    void settingsReportOmapAsDefaultTableEngine() throws SQLException {
+        // 库刚打开、还没有任何表时就应该表达真实的默认引擎。
+        assertEquals(ENGINE, scalar(
+                "SELECT SETTING_VALUE FROM INFORMATION_SCHEMA.SETTINGS WHERE SETTING_NAME = 'DEFAULT_TABLE_ENGINE'"));
+        // MV_STORE 不动：H2 的元数据确实在 MVStore 里。
+        assertEquals("true", scalar(
+                "SELECT SETTING_VALUE FROM INFORMATION_SCHEMA.SETTINGS WHERE SETTING_NAME = 'MV_STORE'"));
+        // 只改展示值，建表路径仍然由 Schema.createTable 决定：不写 ENGINE 的普通表依旧走本引擎。
+        execute("CREATE TABLE PLAIN(ID INT)");
+        execute("INSERT INTO PLAIN VALUES (1)");
+        assertEquals("1", scalar("SELECT COUNT(*) FROM PLAIN"));
+        assertEquals(ENGINE, scalar(
+                "SELECT SETTING_VALUE FROM INFORMATION_SCHEMA.SETTINGS WHERE SETTING_NAME = 'DEFAULT_TABLE_ENGINE'"));
+    }
+
+    @Test
     void tableDefinitionSurvivesRestart(@TempDir Path dir) throws SQLException {
         String url = "jdbc:h2:" + dir.resolve("restart");
         try (Connection first = DriverManager.getConnection(url, "sa", "")) {
