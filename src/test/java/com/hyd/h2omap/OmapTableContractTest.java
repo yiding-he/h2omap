@@ -1896,6 +1896,48 @@ class OmapTableContractTest {
         }
     }
 
+    /**
+     * 预算小于单个段估算内存的边界域：每个段读回后立即被逐出，所有读路径
+     * 都退回「读一份仅供本次使用」的临时读，行仍完整可见。
+     */
+    @Test
+    void evictionBelowOneSegmentBudgetKeepsPointQueriesCorrect(@TempDir Path dir) throws Exception {
+        String url = "jdbc:h2:" + dir.resolve("evict1");
+        String pad = "v".repeat(60);
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            s.execute(createTable("T", "ID INT PRIMARY KEY, V VARCHAR(64), IV INT",
+                    "\"segmentSize=50\", \"compactionMinRows=100000\", \"residentBytes=1\""));
+            for (int i = 0; i < 200; i++) {
+                s.execute("INSERT INTO T VALUES (" + i + ", '" + pad + i + "', " + i + ")");
+            }
+            // 扫描路径：向量化与行式都退回临时读。
+            assertEquals("200", toString(s, "SELECT COUNT(*) FROM T"));
+            assertEquals("19900", toString(s, "SELECT SUM(ID) FROM T"));
+            assertEquals("1225", toString(s, "SELECT SUM(ID) FROM T WHERE ID < 50"));
+            assertEquals("100", toString(s, "SELECT COUNT(DISTINCT V) FROM T WHERE ID < 100"));
+            // 点查路径：读回后立即被逐出，临时读仍能物化出行。
+            assertEquals("125", toString(s, "SELECT IV FROM T WHERE ID = 125"));
+            assertEquals("0", toString(s, "SELECT IV FROM T WHERE ID = 0"));
+            assertEquals(pad + "199", toString(s, "SELECT V FROM T WHERE ID = 199"));
+            // 逐出段上的更新与删除。
+            s.execute("UPDATE T SET IV = -1 WHERE ID = 125");
+            assertEquals("-1", toString(s, "SELECT IV FROM T WHERE ID = 125"));
+            s.execute("DELETE FROM T WHERE ID = 125");
+            assertEquals("199", toString(s, "SELECT COUNT(*) FROM T"));
+        }
+        // 重启后同样正确。
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            assertEquals("199", toString(s, "SELECT COUNT(*) FROM T"));
+            assertEquals("19775", toString(s, "SELECT SUM(ID) FROM T"));
+            // 删除过的行不再命中。
+            try (java.sql.ResultSet rs = s.executeQuery("SELECT IV FROM T WHERE ID = 125")) {
+                assertFalse(rs.next());
+            }
+        }
+    }
+
     private static void assertQueriesMatch(Statement s, String[] templates) throws SQLException {
         for (String template : templates) {
             String expected = collectRows(s, String.format(template, "T_MV"));

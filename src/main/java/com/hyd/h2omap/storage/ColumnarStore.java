@@ -723,20 +723,26 @@ public final class ColumnarStore {
      * @return 行，不存在或已删除时返回 null
      */
     public Row materialize(long rowId) {
-        ensureFrozenSegmentResident(rowId);
+        ColumnSegment transientSegment = null;
+        if (isFrozen(rowId) && ensureFrozenSegmentResident(rowId)) {
+            // 预算容不下单个段：读回后立即被逐出，读一份仅供本次物化。
+            transientSegment = readSegmentTransient(segments.get(RowId.segmentId(rowId)));
+        }
         lock.readLock().lock();
         try {
             Value[] values;
             if (isFrozen(rowId)) {
                 int segId = RowId.segmentId(rowId);
                 SegmentRef ref = segments.get(segId);
-                ColumnSegment segment = ref == null ? null : ref.loaded;
+                ColumnSegment segment = transientSegment != null ? transientSegment : ref == null ? null : ref.loaded;
                 int offset = RowId.offset(rowId);
                 if (segment == null || offset >= segment.getRowCount()
                         || segment.isDeleted(offset)) {
                     return null;
                 }
-                touchRef(ref);
+                if (transientSegment == null && ref != null) {
+                    touchRef(ref);
+                }
                 if (delta.hasSegmentDelta(segId)) {
                     if (delta.isSegmentRowDeleted(rowId)) {
                         return null;
@@ -766,9 +772,10 @@ public final class ColumnarStore {
 
     /**
      * 逐出段的行被点查命中时先把段读回。读回后该段拥有最新的访问序号，
-     * 紧接着的预算逐出不会先选它。
+     * 紧接着的预算逐出不会先选它。返回 true 表示读回后段仍未驻留
+     * （预算容不下单个段），调用方需要退回临时读。
      */
-    private void ensureFrozenSegmentResident(long rowId) {
+    private boolean ensureFrozenSegmentResident(long rowId) {
         SegmentRef evicted = null;
         lock.readLock().lock();
         try {
@@ -781,8 +788,16 @@ public final class ColumnarStore {
         } finally {
             lock.readLock().unlock();
         }
-        if (evicted != null) {
-            ensureResident(evicted);
+        if (evicted == null) {
+            return false;
+        }
+        ensureResident(evicted);
+        lock.readLock().lock();
+        try {
+            SegmentRef ref = segments.get(RowId.segmentId(rowId));
+            return ref == null || ref.loaded == null;
+        } finally {
+            lock.readLock().unlock();
         }
     }
 
