@@ -27,7 +27,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | JDK | 构建与运行用 JDK 21.0.11；字节码目标 `maven.compiler.release=17` |
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变）。被替换的 3 个 H2 类按该版本源码合入，升级时必须逐类重新比对 |
 | 依赖 | 运行期只有 `com.h2database:h2`，测试用 `junit-jupiter`，构建期插件 `maven-shade-plugin` |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（69 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（22 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（70 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（24 个用例）、`src/test/java/com/hyd/h2omap/persistence/ValueCodecTest.java`（3 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/`。该目录可能不存在（已排除在版本控制之外）。Maven Central 的 `h2-2.5.252-sources.jar` 内容等价，但个别文件与该 zip 相差数行，核对行号时以 zip 为准 |
 
 ## H2 侧的依据
@@ -276,7 +276,7 @@ src/main/java/com/hyd/h2omap/
 ├── index/         扫描索引、rowId 索引、游标
 ├── storage/       列段、开放段缓冲、delta、rowId 编码、延迟行
 ├── persistence/   WAL 增量日志、增量列段快照与重启恢复
-├── vector/        列向量（含字典向量与数组列）、ValueVector 回退、null 位图
+├── vector/        列向量（含字典向量、数组列与 CLOB 打包）、ValueVector 回退、null 位图
 ├── vectorized/    单表过滤与聚合下推、谓词编译、子查询折叠（SubqueryFold）、段级部分聚合缓存（SegmentAggCache）
 └── stats/         zone map
 
@@ -292,6 +292,7 @@ src/test/java/com/hyd/h2omap/
 ├── OmapTableContractTest.java    H2 接入契约
 ├── storage/ColumnarStoreTest.java 存储层
 ├── vector/ValueVectorTest.java   回退向量
+├── persistence/ValueCodecTest.java 段向量编码往返
 └── bench/                        测试数据生成与规模验证
 ```
 
@@ -310,7 +311,7 @@ src/test/java/com/hyd/h2omap/
 
 ## 当前状态与后续阶段
 
-M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成，M12（Merge-on-Read 与冷热分层）四个批次全部交付。判定依据为 69 个契约用例、22 个存储层用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
+M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成，M12（Merge-on-Read 与冷热分层）四个批次全部交付；M13（CLOB 打包存储，方案 B2）已完成。判定依据为 70 个契约用例、24 个存储层用例、3 个编码用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
 
 阶段编号按提出顺序，M7、M8 的实际交付早于 M6。
 
@@ -329,12 +330,14 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 | M10 子查询下推 | `WHERE` 里的子查询谓词折进向量化过滤：不相关标量子查询/EXISTS 常量化、`IN (SELECT)` 集合化、关联标量聚合预计算、关联 EXISTS 半连接 | 完成 |
 | M11 段级剪枝与有序 LIMIT | 向量化快照按过滤条件给出的列值区间跳过不相交的段；`ORDER BY` 单列加 `LIMIT` 时按段边界排序扫描、用堆取前 N 行并整段早停 | 完成 |
 | M12 Merge-on-Read 与冷热分层 | 参考 Doris/ClickHouse 的 MOR 机制支撑跨段写与冷热分层。批次 1：删除标记常驻为段级位图、全删段整体丢弃、纯删除段恢复剪枝。批次 2：更新新像移入带列向量与 zone map 的 delta rowset。批次 3：按「查询签名 × 段」的部分聚合缓存。批次 4：residentBytes 驻留预算 + 段级 LRU 逐出与同步读回 | 完成 |
+| M13 CLOB 打包存储 | 方案 B2：段内 CLOB 列复用「字节池 + 偏移」机制（ClobVector），装箱时才切出 ValueClob，消掉逐值对象开销；内容仍驻堆、不读盘，谓词语义不变；段文件新增 VEC_CLOB，旧段 VEC_VALUE 读路径不变 | 完成 |
 
 已确认的设计决策：
 
 - rowId 在插入时按「预分配的段号 + 段内偏移」编码，冻结与合并都不改变已有 rowId。
 - 专用向量包含 `INT`、`BIGINT`、`DOUBLE`、`VARCHAR`、`TIMESTAMP`，其余类型用 `ValueVector` 原样存放，保证段机制对所有类型生效。
 - `CHAR`/`VARCHAR` 列在段内按「UTF-8 字节池 + 每行前缀和偏移」存放（`VarcharVector`），不逐行持有 `String` 与 `byte[]`；段文件格式不变（每行仍是长度加字节），旧文件可直接恢复。逐行成本从「对象头 + 数组槽 + 字节数组」降到「长度 + 4 字节偏移」，15 字符高基数列实测 66 B/行降到 27 B/行。基数不超过段长四分之一且不超过 4096 的列仍走字典向量，不进入这条路径。
+- `CLOB` 列在段内同样按「UTF-8 字节池 + 每行前缀和偏移」存放（`ClobVector` 复用 `VarcharVector` 机制，装箱时才切出 `ValueClob`），消掉逐值「ValueClob + LobDataInMemory + byte[]」的对象开销：233 字符形状实测 316 B/值降到 262 B/值，按生产 2814 万个非空 CLOB 折算约 1.4 GiB。内容仍驻堆，过滤与投影路径只多一次字节切片，不读盘；等值比较照旧走 `filterGeneric` 逐值比较，LIKE 编译入口只接受 VARCHAR/CHAR 列、交回 H2 行式路径，谓词语义不变。段文件新增 `VEC_CLOB`（与 `VEC_VARCHAR` 同布局）；旧段文件里 CLOB 列的 `VEC_VALUE` 读路径不变，未合并的旧段继续以 `ValueVector` 逐值驻留，合并后转为打包形态。`BLOB` 与 `NCLOB` 仍走 `ValueVector`。
 - 数组列拆成「前缀和下标数组 `starts` + 按行拼接的元素列」两部分：`CARDINALITY` 退化为一次整数减法。元素值类型与列声明的元素类型不一致，或元素类型带扩展类型（嵌套数组）时退回 `ValueVector`；只比较元素的值类型，不比较精度，因为 H2 给 `ARRAY[]` 的元素类型是 `NULL`、给 `ARRAY['a','bb']` 的元素类型是 `CHARACTER VARYING(2)` 这样的窄类型。数组列不参与 zone map 剪枝。
 - `ARRAY_CONTAINS` 在元素列上求值：按 `starts` 的区间找每行是否有元素相等，不在行上重建 `ValueArray`；`INT`/`BIGINT`/`DOUBLE`/`VARCHAR` 元素列走原始数组，字典元素列先在字典上算出匹配位图，其余类型逐元素 `compareTo`。语义按 H2：数组为 NULL 时结果是 NULL（`ARRAY_CONTAINS` 与 `NOT ...` 两种情况都不命中），非数组首参也返回 NULL。
 - 字典向量在建段时按基数决定：`VARCHAR` 与低基数数值列尝试建字典，容量上限 `min(4096, max(64, 行数 / 4))`，超出则退回普通向量。
