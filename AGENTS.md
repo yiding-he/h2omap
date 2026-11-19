@@ -27,7 +27,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | JDK | 构建与运行用 JDK 21.0.11；字节码目标 `maven.compiler.release=17` |
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变）。被替换的 3 个 H2 类按该版本源码合入，升级时必须逐类重新比对 |
 | 依赖 | 运行期只有 `com.h2database:h2`，测试用 `junit-jupiter`，构建期插件 `maven-shade-plugin` |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（65 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（22 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（67 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（22 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/`。该目录可能不存在（已排除在版本控制之外）。Maven Central 的 `h2-2.5.252-sources.jar` 内容等价，但个别文件与该 zip 相差数行，核对行号时以 zip 为准 |
 
 ## H2 侧的依据
@@ -141,6 +141,8 @@ rowId 在 `append` 时就确定，之后不变。段号在开放段创建时预�
 delta rowset（Merge-on-Read 批次 2）：更新新像不再按行存放（`Map<rowId, Value[]>` 每行一套 `Value` 对象），而是存进 `DeltaRowset`——复用段列向量的类型特化与打包编码，内存开销与段内数据同构；位置不可变（重复更新追加新位置、旧位置标死），合并的锁外构建阶段与双重比对都以位置为锚点；每列带自己的 zone map，向量化快照里新像与查询区间不相交时整组跳过（零物化零求值），相交时才在锁内物化进 `extraRows`。行式路径的剪枝口径不变（有未回写新像的段仍不剪枝）。tail 文件格式不变：checkpoint 仍按 rowId 集合写，恢复时逐条重放进 rowset。
 
 段级部分聚合缓存（Merge-on-Read 批次 3）：`SegmentAggCache` 按「查询签名 × 段」缓存部分聚合结果，无分组时是 `AggState[]`、单列分组时是 `Map<Value, AggState[]>`。签名 = 过滤树语义签名（各谓词节点的列、比较、常量、集合内容）+ 分组键列 + 每个聚合的类型/列/算术口径/结果类型；`COUNT(DISTINCT)`、多列分组与含子查询预计算的谓词不参与。失效坐标是「段的 generation + 该段的 delta 屏蔽位版本」：合并会换 generation，未回写删除与更新新像的每次变化都递增 `DeltaStore` 的段版本；跨段写因此只使被改动的段失效，其余段在下一轮同签名聚合中直接合并缓存的部分结果（40 万行实测 26 ms → 1-2 ms）。合并部分结果时绝不与缓存对象按引用共享：`groups` 里的状态随后还会被 delta/开放段行累加，共享会污染缓存。分组部分结果基数超过 4096 不缓存；签名数量上限 64（访问序淘汰）。
+
+段级逐出（Merge-on-Read 批次 4）：表级 WITH 参数 `residentBytes` 给出冻结段驻留堆的估算字节数预算，默认 0 不逐出；仅文件模式库生效（内存库无段文件可读回，不逐出）。逐出后段仍可见、只是慢：行数、已删行数、删除位图与每列 zone map 留在堆上的骨架里，行号级读路径（行迭代器、`collectVisibleRowIds`、可见性判定、全删段丢弃）全部走骨架；需要段内容的读路径先把段同步读回——点查在 `materialize` 前、批量行读在 `nextBatch` 前（用骨架 zone map 先剪枝再读回）、向量化快照在取快照前、合并第一阶段在归组前。逐出顺序按段级 LRU：从未被查询访问的段按段号老优先，访问过的按访问序，与数据写入顺序无关，时间滚动场景自然退化为逐出最老段。预算小于查询工作集时读回后可能被后续读回逐出，此时批量与向量化路径退回「读一份仅供本次使用」的临时读，不回写驻留状态。逐出检查在段冻结的 checkpoint 之后、合并收尾与恢复收尾触发，读回后的段拥有最新访问序号，不会被紧接着的预算逐出先选中。重开库时恢复收尾把驻留裁回预算；原计划随 manifest 持久化每段 zone map 与行数已不需要：骨架在逐出时构建，重开后由全量加载后裁剪或惰性加载重建。回归防线是「随机散布写压力用例」：随机 UPDATE/DELETE/INSERT 散布全部段，每轮与 MVStore 逐查询比对，并断言无写的第二遍命中段级部分聚合缓存，防止后续机制窄化到「只改最老几段」的滚动场景。
 
 ## 向量化执行
 
@@ -308,7 +310,7 @@ src/test/java/com/hyd/h2omap/
 
 ## 当前状态与后续阶段
 
-M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成，M12（Merge-on-Read 与冷热分层）已交付批次 1、2、3。判定依据为 65 个契约用例、22 个存储层用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
+M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成，M12（Merge-on-Read 与冷热分层）四个批次全部交付。判定依据为 67 个契约用例、22 个存储层用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
 
 阶段编号按提出顺序，M7、M8 的实际交付早于 M6。
 
@@ -326,7 +328,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 | M9 数组列列式存储 | 段内数组列拆成「前缀和下标数组 + 元素列」，`CARDINALITY` 退化为整数减法；段快照新增 `VEC_ARRAY` | 完成 |
 | M10 子查询下推 | `WHERE` 里的子查询谓词折进向量化过滤：不相关标量子查询/EXISTS 常量化、`IN (SELECT)` 集合化、关联标量聚合预计算、关联 EXISTS 半连接 | 完成 |
 | M11 段级剪枝与有序 LIMIT | 向量化快照按过滤条件给出的列值区间跳过不相交的段；`ORDER BY` 单列加 `LIMIT` 时按段边界排序扫描、用堆取前 N 行并整段早停 | 完成 |
-| M12 Merge-on-Read 与冷热分层 | 参考 Doris/ClickHouse 的 MOR 机制支撑跨段写与冷热分层。批次 1：删除标记常驻为段级位图、全删段整体丢弃、纯删除段恢复剪枝。批次 2：更新新像移入带列向量与 zone map 的 delta rowset。批次 3：按「查询签名 × 段」的部分聚合缓存 | 批次 1、2、3 完成（批次 4 见「尚未实现」） |
+| M12 Merge-on-Read 与冷热分层 | 参考 Doris/ClickHouse 的 MOR 机制支撑跨段写与冷热分层。批次 1：删除标记常驻为段级位图、全删段整体丢弃、纯删除段恢复剪枝。批次 2：更新新像移入带列向量与 zone map 的 delta rowset。批次 3：按「查询签名 × 段」的部分聚合缓存。批次 4：residentBytes 驻留预算 + 段级 LRU 逐出与同步读回 | 完成 |
 
 已确认的设计决策：
 
@@ -338,6 +340,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - 字典向量在建段时按基数决定：`VARCHAR` 与低基数数值列尝试建字典，容量上限 `min(4096, max(64, 行数 / 4))`，超出则退回普通向量。
 - 行式路径的区间剪枝只作用于没有未回写更新新像的段：段的 zone map 可能落后于 delta 的新像（重开后 WAL 重放把更新放回 delta 的窗口，或合并阈值未触发的窗口），被剪段内的 delta 新像会随段一起丢。删除只会收窄值域，不改变 zone map 的有效性，纯删除段仍参与剪枝（`updatedSegments` 判定）。向量化路径不受此影响（`extraRows` 无条件保留）。
 - delta rowset 的列向量只在锁内可读：`upsert` 追加与容量翻倍都会替换或改动向量内部数组，无锁读者可能看到未完整发布的向量（实测在并发合并用例里解码出负长度）。因此向量化快照在读锁内物化活像，合并第一阶段在写锁内顺带物化；位置不可变只是让锁外的「按位置双重比对」不需要值引用比对，不意味着内容可以无锁读。
+- 段级逐出按段级 LRU（未访问段按段号老优先、访问过的按访问序）而不是固定段号序：时间滚动场景下自然退化为逐出最老段，随机访问场景下被逐出的才是真冷段；逐出后段仍可见，行数、删除位图与每列 zone map 留在堆上的骨架里，因此逐出语义不复用惰性加载的「`loaded == null` 即不可见」标记，需要段内容的读路径同步读回。
 - 冻结同步在 `append` 的写锁内完成，不交给后台线程。
 - 合并采用「就地写回」而不是「写新段」：段内保留删除位图，delta 的新值写回列向量，rowId 全程不变，因此不需要段集合快照与引用计数。
 - 合并分两阶段：写锁内按段归组 delta 改动并记下段引用，锁外 `applyDelta` 生成新段（Copy-On-Compact，先前取到的迭代器仍读旧段），写锁内替换段引用并按「rowId 加值」双重比对移除 delta 条目。
@@ -354,7 +357,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 ## 尚未实现
 
 - 并发写的后台合并线程：合并现在由写路径同步触发。
-- M12 后续批次：manifest 持久化每段 zone map 与行数 + 段级逐出（批次 4）。批次 1（删除位图与空段丢弃）、批次 2（delta rowset）与批次 3（段级部分聚合缓存）已交付。
+- M12 已全部交付（批次 1 删除位图与空段丢弃、批次 2 delta rowset、批次 3 段级部分聚合缓存、批次 4 段级 LRU 逐出）；驻留预算按估算内存而非精确占用，重开库后访问热度清零、按段号老优先。
 - 段级部分聚合缓存不覆盖 `COUNT(DISTINCT)`、多列分组、表达式分组键与投影/JOIN 里的子查询；这些形态照常逐段扫描。
 - 数组列的剪枝与按元素过滤：数组列不参与 zone map 剪枝（算值域要重建每行 `ValueArray`，而数组值域几乎不能用于跳段），`UNNEST` 与按元素过滤也没有下推路径。
 - `collectVisibleRowIds` 的数组按 `rowCount` 估计值起步并在超出时扩容，因此估计值与实际可见行数不一致时不会越界；但行数仍不可能超过 `Integer.MAX_VALUE`（`long[]` 的长度上限）。
