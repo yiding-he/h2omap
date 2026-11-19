@@ -101,7 +101,7 @@ public final class OmapOptions {
                 syncIntervalMs = parseInt(key, value);
                 break;
             case "residentBytes":
-                residentBytes = parseLong(key, value);
+                residentBytes = parseByteSize(key, value);
                 break;
             default:
                 throw DbException.getInvalidValueException("OMAP parameter name", key);
@@ -138,12 +138,47 @@ public final class OmapOptions {
         return backupDir;
     }
 
-    private static long parseLong(String key, String value) {
+    /**
+     * 解析字节数：纯数字按字节，可跟单位后缀 k/m/g（不区分大小写，按 1024 换算），
+     * 如 40960、40k、8g。
+     */
+    private static long parseByteSize(String key, String value) {
+        String s = value.trim();
+        int split = 0;
+        while (split < s.length() && Character.isDigit(s.charAt(split))) {
+            split++;
+        }
+        String number = s.substring(0, split);
+        long multiplier;
+        switch (s.substring(split).toLowerCase(java.util.Locale.ROOT)) {
+        case "":
+            multiplier = 1;
+            break;
+        case "k":
+            multiplier = 1024L;
+            break;
+        case "m":
+            multiplier = 1024L * 1024;
+            break;
+        case "g":
+            multiplier = 1024L * 1024 * 1024;
+            break;
+        default:
+            throw DbException.getInvalidValueException("OMAP parameter " + key, value);
+        }
+        if (number.isEmpty()) {
+            throw DbException.getInvalidValueException("OMAP parameter " + key, value);
+        }
+        long n;
         try {
-            return Long.parseLong(value);
+            n = Long.parseLong(number);
         } catch (NumberFormatException e) {
             throw DbException.getInvalidValueException("OMAP parameter " + key, value);
         }
+        if (n < 0 || n > Long.MAX_VALUE / multiplier) {
+            throw DbException.getInvalidValueException("OMAP parameter " + key, value);
+        }
+        return n * multiplier;
     }
 
     public int getSyncIntervalMs() {
