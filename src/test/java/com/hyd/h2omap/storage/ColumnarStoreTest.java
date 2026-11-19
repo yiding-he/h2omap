@@ -559,4 +559,67 @@ class ColumnarStoreTest {
         long[] reversed = store.collectVisibleRowIds(lower, null, true);
         assertEquals(10, reversed.length);
     }
+
+    /**
+     * MOR 批次 2：更新新像存进 delta rowset，有自己的 zone map。
+     * 与查询区间不相交时整组跳过（零物化零求值），相交时全部参与。
+     */
+    @Test
+    void deltaRowsetZoneMapSkipsUnrelatedUpdates() {
+        ColumnarStore store = newStore(10, Integer.MAX_VALUE);
+        long[] ids = new long[20];
+        for (int i = 0; i < 20; i++) {
+            ids[i] = store.append(row(i, "v" + i));
+        }
+        assertEquals(2, store.segmentCount());
+        // 段 0 的 10 行整体更新到 100+，留在 delta 不触发合并。
+        for (int i = 0; i < 10; i++) {
+            store.update(ids[i], row(100 + i, "v" + i));
+        }
+
+        // 下界 50：段 0（旧值 0..9）与段 1（旧值 10..19）都被剪，
+        // 新像值域 100..109 与区间相交 → extraRows 有 10 行。
+        ColumnarStore.VectorizedSnapshot snap = store.takeVectorizedSnapshot(
+                new Value[] { ValueInteger.get(50), null }, null);
+        assertEquals(10, snap.extraRows.size());
+
+        // 下界 200：新像值域也不相交 → extraRows 为空。
+        ColumnarStore.VectorizedSnapshot none = store.takeVectorizedSnapshot(
+                new Value[] { ValueInteger.get(200), null }, null);
+        assertEquals(0, none.extraRows.size());
+
+        // 无区间：全部活像参与。
+        ColumnarStore.VectorizedSnapshot all = store.takeVectorizedSnapshot(null, null);
+        assertEquals(10, all.extraRows.size());
+    }
+
+    /**
+     * MOR 批次 2：同一行重复更新只留一个活像（旧位置标死），
+     * 合并后按位置双重比对移除，死位置重排回收后结果仍正确。
+     */
+    @Test
+    void repeatedUpdatesKeepSingleLiveImage() {
+        ColumnarStore store = newStore(10, Integer.MAX_VALUE);
+        long[] ids = new long[20];
+        for (int i = 0; i < 20; i++) {
+            ids[i] = store.append(row(i, "v" + i));
+        }
+        assertEquals(2, store.segmentCount());
+
+        store.update(ids[3], row(30, "a"));
+        store.update(ids[3], row(31, "b"));
+        store.update(ids[3], row(32, "c"));
+        store.update(ids[4], row(40, "d"));
+        // 只有 2 个活像，前两次更新是死位置；向量化快照只看到 2 个活像。
+        assertEquals(2, store.takeVectorizedSnapshot().extraRows.size());
+        assertEquals("c", column(store.materialize(ids[3]), 1));
+        assertEquals("d", column(store.materialize(ids[4]), 1));
+
+        store.remove(ids[4]);
+        store.compact();
+        assertEquals(19, store.getRowCount());
+        assertEquals("c", column(store.materialize(ids[3]), 1));
+        assertNull(store.materialize(ids[4]));
+        assertEquals(19, store.collectVisibleRowIds(false).length);
+    }
 }

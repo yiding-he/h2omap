@@ -338,6 +338,40 @@ class OmapTableContractTest {
     }
 
     @Test
+    void vectorizedBoundsOnUpdatedRowsMatchMvStore() throws Exception {
+        try (Connection c = DriverManager.getConnection("jdbc:h2:mem:vdb_upd_bounds", "sa", "");
+                Statement s = c.createStatement()) {
+            s.execute("CREATE TABLE T(ID INT PRIMARY KEY, V INT)"
+                    + " WITH \"segmentSize=50\", \"compactionMinRows=100000\"");
+            s.execute("CREATE TABLE T_MV(ID INT PRIMARY KEY, V INT)"
+                    + " ENGINE \"org.h2.mvstore.db.Store\"");
+            for (int i = 1; i <= 200; i++) {
+                s.execute("INSERT INTO T VALUES (" + i + ", " + i + ")");
+                s.execute("INSERT INTO T_MV VALUES (" + i + ", " + i + ")");
+            }
+            // 66 行的 V 更新到 1000+，留在 delta 不触发合并；
+            // 更新前段值域 1..200，新像值域 1003..1198。
+            s.execute("UPDATE T SET V = 1000 + ID WHERE MOD(ID, 3) = 0");
+            s.execute("UPDATE T_MV SET V = 1000 + ID WHERE MOD(ID, 3) = 0");
+
+            // 下界 500：段被剪，新像与区间相交 → 66 行；旧位置被掩，不多计。
+            assertEquals(countRows(s, "SELECT ID FROM T_MV WHERE V >= 500"),
+                    countRows(s, "SELECT ID FROM T WHERE V >= 500"));
+            assertEquals(66, countRows(s, "SELECT ID FROM T WHERE V >= 500"));
+
+            // 上界 500：段参与但旧位置被掩，新像不过滤 → 134 行。
+            assertEquals(countRows(s, "SELECT ID FROM T_MV WHERE V < 500"),
+                    countRows(s, "SELECT ID FROM T WHERE V < 500"));
+            assertEquals(134, countRows(s, "SELECT ID FROM T WHERE V < 500"));
+
+            // 下界 2000：新像 zone map 也不相交 → 0 行。
+            assertEquals(0, countRows(s, "SELECT ID FROM T WHERE V >= 2000"));
+            assertEquals(toString(s, "SELECT SUM(V) FROM T_MV WHERE V >= 500"),
+                    toString(s, "SELECT SUM(V) FROM T WHERE V >= 500"));
+        }
+    }
+
+    @Test
     void fullyDeletedSegmentDroppedAndSurvivesRestart(@TempDir Path dir) throws Exception {
         String url = "jdbc:h2:" + dir.resolve("mordrop");
         try (Connection first = DriverManager.getConnection(url, "sa", "")) {
