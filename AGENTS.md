@@ -27,7 +27,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | JDK | 构建与运行用 JDK 21.0.11；字节码目标 `maven.compiler.release=17` |
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变）。被替换的 3 个 H2 类按该版本源码合入，升级时必须逐类重新比对 |
 | 依赖 | 运行期只有 `com.h2database:h2`，测试用 `junit-jupiter`，构建期插件 `maven-shade-plugin` |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（63 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（20 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（64 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（22 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/`。该目录可能不存在（已排除在版本控制之外）。Maven Central 的 `h2-2.5.252-sources.jar` 内容等价，但个别文件与该 zip 相差数行，核对行号时以 zip 为准 |
 
 ## H2 侧的依据
@@ -106,7 +106,9 @@ OmapTable
 │     每列：primitive 数组、字典向量或数组列（前缀和下标 + 元素列）+ null 位图 + zone map
 │     段级：删除位图（每行 1 bit）与已删行数计数（空段判定 O(1)）
 └── delta    : DeltaStore               行式写缓冲
-      ├── updated        已冻结段内被更新行的新像
+      ├── updated        已冻结段内被更新行的新像，存进 DeltaRowset：
+      │                     按列向量（复用段向量的类型特化与打包编码），
+      │                     位置不可变，每列带自己的 zone map
       ├── segmentDeletes 已冻结段内未回写段位图的删除标记，按段组织成位图（每行 1 bit）
       ├── dirtySegments  有改动的段号，供读路径跳过逐行查表
       └── updatedSegments 有未回写新像的段号，行式剪枝只跳过这些段
@@ -132,9 +134,11 @@ rowId 在 `append` 时就确定，之后不变。段号在开放段创建时预�
 
 迭代器是创建时刻的快照：构造时固定最后一个段号与开放段的行数。开放段在迭代期间被写满冻结时，迭代器改从段列表读它，rowId 不变；冻结之后新开的段不在本次快照内。
 
-合并（compaction）：`delta` 的改动数达到 `compactionMinRows` 时由写路径同步触发，分两阶段。第一阶段在写锁内把更新与删除按段归组，记下当时的段引用；锁外对每个受影响的段调用 `applyDelta` 生成新段（Copy-On-Compact，旧段仍对先前取到的快照有效），新段的 zone map 随建段重算；第二阶段在写锁内替换段映射里的引用、按「rowId 加值」双重比对移除 `delta` 里已写回的条目，再重算 `dirtySegments`。回写后整段全删的段直接摘除。段号与段内偏移都不变，所以 rowId 稳定；除全删段被摘除外段不删除。
+合并（compaction）：`delta` 的改动数达到 `compactionMinRows` 时由写路径同步触发，分两阶段。第一阶段在写锁内把更新与删除按段归组，活像在此阶段物化成不可变快照（列向量只在锁内可读，锁外的无锁读者可能看到未完整发布的向量），并记下当时的段引用与活像位置；锁外对每个受影响的段调用 `applyDelta` 生成新段（Copy-On-Compact，旧段仍对先前取到的快照有效），新段的 zone map 随建段重算；第二阶段在写锁内替换段映射里的引用、按不可变位置双重比对移除 `delta` 里已写回的条目（防止误删锁外期间的新更新），再重算 `dirtySegments`，死位置超过半数时重排回收 rowset。回写后整段全删的段直接摘除。段号与段内偏移都不变，所以 rowId 稳定；除全删段被摘除外段不删除。
 
 全删段丢弃（Merge-on-Read 批次 1）：段内已标记删除的行数（段位图加 delta 未回写部分）达到段行数时，写路径立即把整段从 `segments` 摘除，rowId 空洞保留不复用，行数在逐行删除时已扣过、不再调整；索引条目在每次删除时由 H2 逐行清理，摘除时无需处理。段文件在下次 checkpoint 随 manifest 摘除后由文件清理删除；恢复时 WAL 重放后由 `dropEmptySegments()` 一次性扫描补摘，惰性加载的段在加载完成时补摘。对按时间滚动的清理服务，这意味着最老的段被删空后零重写回收磁盘。
+
+delta rowset（Merge-on-Read 批次 2）：更新新像不再按行存放（`Map<rowId, Value[]>` 每行一套 `Value` 对象），而是存进 `DeltaRowset`——复用段列向量的类型特化与打包编码，内存开销与段内数据同构；位置不可变（重复更新追加新位置、旧位置标死），合并的锁外构建阶段与双重比对都以位置为锚点；每列带自己的 zone map，向量化快照里新像与查询区间不相交时整组跳过（零物化零求值），相交时才在锁内物化进 `extraRows`。行式路径的剪枝口径不变（有未回写新像的段仍不剪枝）。tail 文件格式不变：checkpoint 仍按 rowId 集合写，恢复时逐条重放进 rowset。
 
 ## 向量化执行
 
@@ -168,7 +172,7 @@ rowId 在 `append` 时就确定，之后不变。段号在开放段创建时预�
 
 可下推的聚合：`COUNT(*)`、`COUNT(...)`、`COUNT(DISTINCT ...)`、`SUM`、`MIN`、`MAX`、`AVG`，以及形如 `SUM(col * 2)` 的「单列与常量做算术再聚合」。单列分组在字典向量上走 `groupByDict()`，多列分组走 `MultiGroupKey`，`HAVING` 编译成谓词在分组结果上求值。
 
-执行基于 `ColumnarStore.takeVectorizedSnapshot()`：已冻结段按列整体扫描，删除位图折进每段的 `BitSet`，`delta` 的新像与开放段的行放进 `extraRows` 逐行求值。因此向量化只作用于「已冻结段按列扫描」这一段，`extraRows` 仍是行式路径。
+执行基于 `ColumnarStore.takeVectorizedSnapshot()`：已冻结段按列整体扫描，删除位图折进每段的 `BitSet`，`delta` 的新像与开放段的行放进 `extraRows` 逐行求值；新像整组由 delta rowset 的 zone map 判定，与查询区间不相交时整组跳过、零物化零求值。因此向量化只作用于「已冻结段按列扫描」这一段，`extraRows` 仍是行式路径。
 
 ## 持久化
 
@@ -302,7 +306,7 @@ src/test/java/com/hyd/h2omap/
 
 ## 当前状态与后续阶段
 
-M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成，M12（Merge-on-Read 与冷热分层）已交付批次 1。判定依据为 63 个契约用例、20 个存储层用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
+M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成，M12（Merge-on-Read 与冷热分层）已交付批次 1、2。判定依据为 64 个契约用例、22 个存储层用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
 
 阶段编号按提出顺序，M7、M8 的实际交付早于 M6。
 
@@ -320,7 +324,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 | M9 数组列列式存储 | 段内数组列拆成「前缀和下标数组 + 元素列」，`CARDINALITY` 退化为整数减法；段快照新增 `VEC_ARRAY` | 完成 |
 | M10 子查询下推 | `WHERE` 里的子查询谓词折进向量化过滤：不相关标量子查询/EXISTS 常量化、`IN (SELECT)` 集合化、关联标量聚合预计算、关联 EXISTS 半连接 | 完成 |
 | M11 段级剪枝与有序 LIMIT | 向量化快照按过滤条件给出的列值区间跳过不相交的段；`ORDER BY` 单列加 `LIMIT` 时按段边界排序扫描、用堆取前 N 行并整段早停 | 完成 |
-| M12 Merge-on-Read 与冷热分层 | 参考 Doris/ClickHouse 的 MOR 机制支撑跨段写与冷热分层。批次 1：删除标记常驻为段级位图、全删段整体丢弃、纯删除段恢复剪枝 | 批次 1 完成（后续批次见「尚未实现」） |
+| M12 Merge-on-Read 与冷热分层 | 参考 Doris/ClickHouse 的 MOR 机制支撑跨段写与冷热分层。批次 1：删除标记常驻为段级位图、全删段整体丢弃、纯删除段恢复剪枝。批次 2：更新新像移入带列向量与 zone map 的 delta rowset | 批次 1、2 完成（后续批次见「尚未实现」） |
 
 已确认的设计决策：
 
@@ -331,6 +335,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - `ARRAY_CONTAINS` 在元素列上求值：按 `starts` 的区间找每行是否有元素相等，不在行上重建 `ValueArray`；`INT`/`BIGINT`/`DOUBLE`/`VARCHAR` 元素列走原始数组，字典元素列先在字典上算出匹配位图，其余类型逐元素 `compareTo`。语义按 H2：数组为 NULL 时结果是 NULL（`ARRAY_CONTAINS` 与 `NOT ...` 两种情况都不命中），非数组首参也返回 NULL。
 - 字典向量在建段时按基数决定：`VARCHAR` 与低基数数值列尝试建字典，容量上限 `min(4096, max(64, 行数 / 4))`，超出则退回普通向量。
 - 行式路径的区间剪枝只作用于没有未回写更新新像的段：段的 zone map 可能落后于 delta 的新像（重开后 WAL 重放把更新放回 delta 的窗口，或合并阈值未触发的窗口），被剪段内的 delta 新像会随段一起丢。删除只会收窄值域，不改变 zone map 的有效性，纯删除段仍参与剪枝（`updatedSegments` 判定）。向量化路径不受此影响（`extraRows` 无条件保留）。
+- delta rowset 的列向量只在锁内可读：`upsert` 追加与容量翻倍都会替换或改动向量内部数组，无锁读者可能看到未完整发布的向量（实测在并发合并用例里解码出负长度）。因此向量化快照在读锁内物化活像，合并第一阶段在写锁内顺带物化；位置不可变只是让锁外的「按位置双重比对」不需要值引用比对，不意味着内容可以无锁读。
 - 冻结同步在 `append` 的写锁内完成，不交给后台线程。
 - 合并采用「就地写回」而不是「写新段」：段内保留删除位图，delta 的新值写回列向量，rowId 全程不变，因此不需要段集合快照与引用计数。
 - 合并分两阶段：写锁内按段归组 delta 改动并记下段引用，锁外 `applyDelta` 生成新段（Copy-On-Compact，先前取到的迭代器仍读旧段），写锁内替换段引用并按「rowId 加值」双重比对移除 delta 条目。
@@ -347,7 +352,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 ## 尚未实现
 
 - 并发写的后台合并线程：合并现在由写路径同步触发。
-- M12 后续批次：delta 新像移入持久化 rowset（批次 2）、段级部分聚合缓存（批次 3）、manifest 持久化每段 zone map 与行数 + 段级逐出（批次 4）。批次 1 已交付的删除位图与空段丢弃是这些批次的地基。
+- M12 后续批次：段级部分聚合缓存（批次 3）、manifest 持久化每段 zone map 与行数 + 段级逐出（批次 4）。批次 1（删除位图与空段丢弃）与批次 2（delta rowset）已交付。
 - 数组列的剪枝与按元素过滤：数组列不参与 zone map 剪枝（算值域要重建每行 `ValueArray`，而数组值域几乎不能用于跳段），`UNNEST` 与按元素过滤也没有下推路径。
 - `collectVisibleRowIds` 的数组按 `rowCount` 估计值起步并在超出时扩容，因此估计值与实际可见行数不一致时不会越界；但行数仍不可能超过 `Integer.MAX_VALUE`（`long[]` 的长度上限）。
 - 向量化路径对 `delta` 新像与开放段的行逐行求值，这些行不参与按列扫描。
