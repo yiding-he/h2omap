@@ -261,6 +261,17 @@ public class DbSettings extends SettingsBase {
     public final String defaultTableEngine = get("DEFAULT_TABLE_ENGINE", null);
 
     /**
+     * OMAP setting <code>OMAP_LAZY_LOAD</code>
+     * (default: false).
+     * Set by the server process through the system property
+     * <code>h2.omapLazyLoad</code>. When enabled, OMAP tables do not load all
+     * segment files while the database is opening; a segment becomes visible
+     * to queries only after its columns are loaded, so queries during the
+     * loading phase see only already loaded segments.
+     */
+    public final boolean omapLazyLoad = get("OMAP_LAZY_LOAD", false);
+
+    /**
      * Database setting <code>MV_STORE</code>
      * (default: true).
      * Use the MVStore storage engine.
