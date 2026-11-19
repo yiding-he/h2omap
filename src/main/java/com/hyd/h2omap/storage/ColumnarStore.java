@@ -122,6 +122,28 @@ public final class ColumnarStore {
     public record SegmentMeta(int segmentId, int generation) {
     }
 
+    /**
+     * 段骨架元数据的载体：检查点写出与恢复登记共用这一形态。
+     * 骨架让未加载内容的段保持可见、可剪枝，是驻留预算与惰性加载同时开启的前提。
+     */
+    public static final class SkeletonData {
+
+        public final int rowCount;
+
+        public final int deletedCount;
+
+        public final NullBitmap deleted;
+
+        public final ZoneMap[] zoneMaps;
+
+        public SkeletonData(int rowCount, int deletedCount, NullBitmap deleted, ZoneMap[] zoneMaps) {
+            this.rowCount = rowCount;
+            this.deletedCount = deletedCount;
+            this.deleted = deleted;
+            this.zoneMaps = zoneMaps;
+        }
+    }
+
     /** 段引用：{@code loaded} 为 null 且 {@code skeleton} 非 null 表示已逐出；两者都为 null 表示惰性加载中。 */
     private static final class SegmentRef {
 
@@ -171,6 +193,13 @@ public final class ColumnarStore {
             for (int c = 0; c < zoneMaps.length; c++) {
                 this.zoneMaps[c] = segment.getZoneMap(c);
             }
+        }
+
+        SegmentSkeleton(SkeletonData data) {
+            this.rowCount = data.rowCount;
+            this.deletedCount = data.deletedCount;
+            this.deleted = data.deleted;
+            this.zoneMaps = data.zoneMaps;
         }
     }
 
@@ -530,7 +559,7 @@ public final class ColumnarStore {
     // ------------------------------------------------------------------
 
     public void restoreFromPersistence(int[] segmentIds, int[] generations,
-            ColumnSegment[] preloaded, int restoredNextSegId,
+            ColumnSegment[] preloaded, SkeletonData[] skeletons, int restoredNextSegId,
             List<Value[]> openRows, Set<Long> restoredOpenDeletes,
             Map<Long, Value[]> restoredDeltaUpdated, Set<Long> restoredDeltaDeletes) {
         lock.writeLock().lock();
@@ -541,6 +570,9 @@ public final class ColumnarStore {
                 if (preloaded[i] != null) {
                     ref.residentBytes = preloaded[i].getEstimatedMemory();
                     residentTotal += ref.residentBytes;
+                } else if (skeletons != null && skeletons[i] != null) {
+                    // 骨架在恢复时登记：未加载内容的段对全部读路径可见且可剪枝。
+                    ref.skeleton = new SegmentSkeleton(skeletons[i]);
                 }
                 segments.put(segmentIds[i], ref);
             }
@@ -639,21 +671,26 @@ public final class ColumnarStore {
     private void recomputeRowCount() {
         long count = 0;
         for (SegmentRef ref : segments.values()) {
-            // 未加载段的行不计入，与读路径的可见性判定保持一致。
+            // 未加载且无骨架的段（旧格式 manifest）不计入，与读路径的可见性判定保持一致；
+            // 有骨架的段按骨架计入，保证可见性与剪枝从开库就完整。
             ColumnSegment seg = ref.loaded;
-            if (seg == null) {
-                continue;
+            if (seg != null) {
+                count += visibleRowsOf(seg);
+            } else if (ref.skeleton != null) {
+                count += ref.skeleton.rowCount - ref.skeleton.deletedCount;
             }
-            count += visibleRowsOf(seg);
         }
         for (Map.Entry<Integer, DeltaStore.SegmentDeleteBitmap> entry : delta.segmentDeleteEntries()) {
-            ColumnSegment seg = segment(entry.getKey());
-            if (seg == null) {
+            SegmentRef ref = segments.get(entry.getKey());
+            ColumnSegment seg = ref != null ? ref.loaded : null;
+            NullBitmap deleted = seg != null ? seg.getDeleted()
+                    : ref != null && ref.skeleton != null ? ref.skeleton.deleted : null;
+            if (deleted == null) {
                 continue;
             }
             for (int off = entry.getValue().bits.nextSetBit(0); off >= 0;
                     off = entry.getValue().bits.nextSetBit(off + 1)) {
-                if (!seg.isDeleted(off)) {
+                if (!deleted.isNull(off)) {
                     count--;
                 }
             }
@@ -925,6 +962,10 @@ public final class ColumnarStore {
             lock.readLock().unlock();
         }
         for (int i = refs.length - 1; i >= 0 && !lazyLoaderStopped; i--) {
+            if (options.getResidentBytes() > 0 && getResidentBytes() >= options.getResidentBytes()) {
+                // 驻留预算已装满：继续预载只会载入即逐出，老段等查询按需读回。
+                break;
+            }
             SegmentRef ref = refs[i];
             if (ref.loaded != null) {
                 continue;
@@ -937,33 +978,46 @@ public final class ColumnarStore {
                 lastLazyLoadError = e;
                 continue;
             }
-            publishLoaded(ref, segment, deletedOffsetsBySegment.get(ref.segmentId));
+            boolean published = publishLoaded(ref, segment, deletedOffsetsBySegment.get(ref.segmentId));
+            if (published && ref.loaded == null) {
+                // 刚发布的段被预算立即逐出：预算装不下更多段，再预载都是无效读；
+                // 全删段被丢弃时 ref.loaded 仍非空，不会误判。
+                break;
+            }
         }
     }
 
-    private void publishLoaded(SegmentRef ref, ColumnSegment segment, List<Integer> deletedOffsets) {
+    private boolean publishLoaded(SegmentRef ref, ColumnSegment segment, List<Integer> deletedOffsets) {
         lock.writeLock().lock();
         try {
             if (ref.loaded != null) {
-                return;
+                return false;
             }
-            ref.loaded = segment;
-            ref.residentBytes = segment.getEstimatedMemory();
-            residentTotal += ref.residentBytes;
-            long added = visibleRowsOf(segment);
-            if (deletedOffsets != null) {
-                int rowCountOfSegment = segment.getRowCount();
-                for (int offset : deletedOffsets) {
-                    if (offset < rowCountOfSegment && !segment.isDeleted(offset)) {
-                        added--;
+            if (ref.skeleton != null) {
+                // 骨架已在恢复时计入行数并保证可见性：这里只挂内容，不动可见性与结果缓存。
+                ref.loaded = segment;
+                ref.residentBytes = segment.getEstimatedMemory();
+                residentTotal += ref.residentBytes;
+                evictLocked();
+            } else {
+                ref.loaded = segment;
+                ref.residentBytes = segment.getEstimatedMemory();
+                residentTotal += ref.residentBytes;
+                long added = visibleRowsOf(segment);
+                if (deletedOffsets != null) {
+                    int rowCountOfSegment = segment.getRowCount();
+                    for (int offset : deletedOffsets) {
+                        if (offset < rowCountOfSegment && !segment.isDeleted(offset)) {
+                            added--;
+                        }
                     }
                 }
+                rowCount += Math.max(0, added);
+                // 加载后该段可能整段已删：与写路径同一条丢弃判定。
+                dropSegmentIfEmpty(ref.segmentId);
+                bump();
+                evictLocked();
             }
-            rowCount += Math.max(0, added);
-            // 加载后该段可能整段已删：与写路径同一条丢弃判定。
-            dropSegmentIfEmpty(ref.segmentId);
-            bump();
-            evictLocked();
         } finally {
             lock.writeLock().unlock();
         }
@@ -971,6 +1025,7 @@ public final class ColumnarStore {
         if (listener != null) {
             listener.run();
         }
+        return true;
     }
 
     private static long visibleRowsOf(ColumnSegment segment) {
@@ -1201,6 +1256,34 @@ public final class ColumnarStore {
     }
 
     /** 按段号取已加载的段，供 checkpoint 写盘使用。 */
+    /**
+     * 检查点要写进 manifest 的骨架元数据；段既无内容也无骨架时返回 null。
+     */
+    public SkeletonData segmentSkeletonData(int segmentId) {
+        lock.readLock().lock();
+        try {
+            SegmentRef ref = segments.get(segmentId);
+            if (ref == null) {
+                return null;
+            }
+            ColumnSegment seg = ref.loaded;
+            if (seg != null) {
+                ZoneMap[] zones = new ZoneMap[seg.getColumnCount()];
+                for (int c = 0; c < zones.length; c++) {
+                    zones[c] = seg.getZoneMap(c);
+                }
+                return new SkeletonData(seg.getRowCount(), seg.getDeletedCount(), seg.getDeleted(), zones);
+            }
+            SegmentSkeleton sk = ref.skeleton;
+            if (sk == null) {
+                return null;
+            }
+            return new SkeletonData(sk.rowCount, sk.deletedCount, sk.deleted, sk.zoneMaps);
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
     public ColumnSegment loadedSegment(int segmentId) {
         lock.readLock().lock();
         try {

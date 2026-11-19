@@ -82,6 +82,13 @@ public final class ZoneMap {
     }
 
     /**
+     * 由检查点写出的 min/max 重建；两者为 null 时表示恒相交（不参与剪枝）。
+     */
+    public static ZoneMap restore(Value min, Value max, CompareMode compareMode) {
+        return new ZoneMap(min, max, compareMode);
+    }
+
+    /**
      * 尝试 O(1) 增量更新 zone map。
      *
      * @return 更新后的 zone map（未改变边界时返回 {@code this}）；返回 {@code null} 表示需要全列重算

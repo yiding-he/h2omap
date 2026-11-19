@@ -8,6 +8,7 @@ import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
+import java.io.DataInput;
 import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
@@ -37,7 +38,9 @@ import org.h2.value.CompareMode;
 import org.h2.value.Value;
 
 import com.hyd.h2omap.storage.ColumnSegment;
+import com.hyd.h2omap.stats.ZoneMap;
 import com.hyd.h2omap.storage.ColumnarStore;
+import com.hyd.h2omap.vector.NullBitmap;
 import com.hyd.h2omap.vector.ColumnVector;
 import com.hyd.h2omap.vector.NullBitmap;
 
@@ -47,6 +50,8 @@ import com.hyd.h2omap.vector.NullBitmap;
 public final class OmapPersistence {
 
     private static final int MANIFEST_MAGIC = 0x4F4D4150; // OMAP
+    /** v2：每段可选附带骨架元数据（行数、删除位图、每列 zone map）。 */
+    private static final int MANIFEST_MAGIC_V2 = 0x4F4D4151;
     private static final int SEGMENT_MAGIC = 0x4F534547;  // OSEG
     private static final int TAIL_MAGIC = 0x4F544149;     // OTAI
 
@@ -121,6 +126,7 @@ public final class OmapPersistence {
             int[] segmentIds = new int[0];
             int[] generations = new int[0];
             ColumnSegment[] preloaded = new ColumnSegment[0];
+            ColumnarStore.SkeletonData[] skeletons = new ColumnarStore.SkeletonData[0];
             int nextSegmentId = 0;
             long manifestWalSeq = 0;
             List<Value[]> openRows = new ArrayList<>();
@@ -133,7 +139,8 @@ public final class OmapPersistence {
                 try (DataInputStream in = new DataInputStream(
                         new BufferedInputStream(Files.newInputStream(manifestPath)))) {
                     int magic = in.readInt();
-                    if (magic != MANIFEST_MAGIC) {
+                    boolean v2 = magic == MANIFEST_MAGIC_V2;
+                    if (magic != MANIFEST_MAGIC && !v2) {
                         throw new IOException("Invalid manifest magic: " + magic);
                     }
                     nextSegmentId = in.readInt();
@@ -142,12 +149,16 @@ public final class OmapPersistence {
                     segmentIds = new int[segCount];
                     generations = new int[segCount];
                     preloaded = new ColumnSegment[segCount];
+                    skeletons = new ColumnarStore.SkeletonData[segCount];
                     for (int i = 0; i < segCount; i++) {
                         int segId = in.readInt();
                         int gen = in.readInt();
                         segmentIds[i] = segId;
                         generations[i] = gen;
                         persistedSegments.put(segId, gen);
+                        if (v2 && in.readBoolean()) {
+                            skeletons[i] = readSkeleton(in);
+                        }
                         if (!store.isLazyLoad()) {
                             preloaded[i] = readSegment(segId, gen);
                         }
@@ -160,7 +171,7 @@ public final class OmapPersistence {
             }
 
             store.restoreFromPersistence(
-                    segmentIds, generations, preloaded, nextSegmentId,
+                    segmentIds, generations, preloaded, skeletons, nextSegmentId,
                     openRows, openDeletes, deltaUpdated, deltaDeletes);
 
             // 按 walSeq 升序重放所有 >= manifestWalSeq 的 WAL 文件
@@ -352,13 +363,18 @@ public final class OmapPersistence {
                 Path manifestDst = dir.resolve("manifest.dat");
                 try (DataOutputStream out = new DataOutputStream(
                         new BufferedOutputStream(Files.newOutputStream(manifestTmp)))) {
-                    out.writeInt(MANIFEST_MAGIC);
+                    out.writeInt(MANIFEST_MAGIC_V2);
                     out.writeInt(nextSegmentId);
                     out.writeLong(checkpointWalSeq);
                     out.writeInt(segmentsSnapshot.size());
                     for (ColumnarStore.SegmentMeta meta : segmentsSnapshot) {
                         out.writeInt(meta.segmentId());
                         out.writeInt(meta.generation());
+                        ColumnarStore.SkeletonData sk = store.segmentSkeletonData(meta.segmentId());
+                        out.writeBoolean(sk != null);
+                        if (sk != null) {
+                            writeSkeleton(out, sk);
+                        }
                     }
                 }
                 Files.move(manifestTmp, manifestDst, StandardCopyOption.REPLACE_EXISTING,
@@ -370,6 +386,43 @@ public final class OmapPersistence {
                 throw DbException.convertIOException(e, dir.toString());
             }
         }
+    }
+
+    /**
+     * 骨架元数据的磁盘形态：行数、已删行数、删除位图、列数与每列 zone map 的 min/max。
+     * zone map 的 min/max 为 null 表示该列恒相交，不参与剪枝。
+     */
+    private void writeSkeleton(DataOutputStream out, ColumnarStore.SkeletonData sk) throws IOException {
+        out.writeInt(sk.rowCount);
+        out.writeInt(sk.deletedCount);
+        ckptCodec.writeNullBitmap(out, sk.deleted);
+        out.writeInt(sk.zoneMaps.length);
+        for (ZoneMap zone : sk.zoneMaps) {
+            Value min = zone.getMin();
+            out.writeBoolean(min != null);
+            if (min != null) {
+                ckptCodec.writeValue(out, min);
+            }
+            Value max = zone.getMax();
+            out.writeBoolean(max != null);
+            if (max != null) {
+                ckptCodec.writeValue(out, max);
+            }
+        }
+    }
+
+    private ColumnarStore.SkeletonData readSkeleton(DataInput in) throws IOException {
+        int rowCount = in.readInt();
+        int deletedCount = in.readInt();
+        NullBitmap deleted = ckptCodec.readNullBitmap(in);
+        int columnCount = in.readInt();
+        ZoneMap[] zones = new ZoneMap[columnCount];
+        for (int c = 0; c < columnCount; c++) {
+            Value min = in.readBoolean() ? ckptCodec.readValue(in) : null;
+            Value max = in.readBoolean() ? ckptCodec.readValue(in) : null;
+            zones[c] = ZoneMap.restore(min, max, compareMode);
+        }
+        return new ColumnarStore.SkeletonData(rowCount, deletedCount, deleted, zones);
     }
 
     public void close() {
