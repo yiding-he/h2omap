@@ -10,9 +10,13 @@ import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataInput;
 import java.io.DataOutputStream;
+import java.io.DataOutput;
 import java.io.EOFException;
+import java.io.FilterInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -38,6 +42,7 @@ import org.h2.value.CompareMode;
 import org.h2.value.Value;
 
 import com.hyd.h2omap.storage.ColumnSegment;
+import com.hyd.h2omap.storage.ColumnSlice;
 import com.hyd.h2omap.stats.ZoneMap;
 import com.hyd.h2omap.storage.ColumnarStore;
 import com.hyd.h2omap.vector.NullBitmap;
@@ -49,10 +54,10 @@ import com.hyd.h2omap.vector.NullBitmap;
  */
 public final class OmapPersistence {
 
-    private static final int MANIFEST_MAGIC = 0x4F4D4150; // OMAP
-    /** v2：每段可选附带骨架元数据（行数、删除位图、每列 zone map）。 */
-    private static final int MANIFEST_MAGIC_V2 = 0x4F4D4151;
-    private static final int SEGMENT_MAGIC = 0x4F534547;  // OSEG
+    /** 每段可选附带骨架元数据（行数、删除位图、每列 zone map）。 */
+    private static final int MANIFEST_MAGIC = 0x4F4D4151;  // OMAPQ
+    /** 段文件 v2：头部带尾部目录偏移，列块顺序存放，尾部目录含每列偏移/长度/zone map。 */
+    private static final int SEGMENT_MAGIC = 0x4F534732;    // OSG2
     private static final int TAIL_MAGIC = 0x4F544149;     // OTAI
 
     private static final byte OP_INSERT = 1;
@@ -139,8 +144,7 @@ public final class OmapPersistence {
                 try (DataInputStream in = new DataInputStream(
                         new BufferedInputStream(Files.newInputStream(manifestPath)))) {
                     int magic = in.readInt();
-                    boolean v2 = magic == MANIFEST_MAGIC_V2;
-                    if (magic != MANIFEST_MAGIC && !v2) {
+                    if (magic != MANIFEST_MAGIC) {
                         throw new IOException("Invalid manifest magic: " + magic);
                     }
                     nextSegmentId = in.readInt();
@@ -156,7 +160,7 @@ public final class OmapPersistence {
                         segmentIds[i] = segId;
                         generations[i] = gen;
                         persistedSegments.put(segId, gen);
-                        if (v2 && in.readBoolean()) {
+                        if (in.readBoolean()) {
                             skeletons[i] = readSkeleton(in);
                         }
                         if (!store.isLazyLoad()) {
@@ -363,7 +367,7 @@ public final class OmapPersistence {
                 Path manifestDst = dir.resolve("manifest.dat");
                 try (DataOutputStream out = new DataOutputStream(
                         new BufferedOutputStream(Files.newOutputStream(manifestTmp)))) {
-                    out.writeInt(MANIFEST_MAGIC_V2);
+                    out.writeInt(MANIFEST_MAGIC);
                     out.writeInt(nextSegmentId);
                     out.writeLong(checkpointWalSeq);
                     out.writeInt(segmentsSnapshot.size());
@@ -567,29 +571,125 @@ public final class OmapPersistence {
         }
     }
 
+    /**
+     * 段文件布局：头部（魔数/段号/代数/行数/已删行数/目录偏移）→ 删除位图 → 列数 →
+     * 列块（沿用 {@link ValueCodec} 的 VEC_* 编码，编码标签写在列块首字节）→ 尾部列目录。
+     * 目录每项含列块的文件内偏移与长度，以及该列 zone map 的 min/max，
+     * 供全量读免重算、部分列读按列定位。
+     */
     private void writeSegment(ColumnSegment seg) throws IOException {
         String name = "seg_" + seg.getSegmentId() + "_" + seg.getGeneration() + ".omap";
         Path tmp = dir.resolve(name + ".tmp");
         Path dst = dir.resolve(name);
-        try (DataOutputStream out = new DataOutputStream(
-                new BufferedOutputStream(Files.newOutputStream(tmp)))) {
+        int cols = seg.getColumnCount();
+        long[] offsets = new long[cols];
+        int[] lengths = new int[cols];
+        ByteArrayOutputStream buf = new ByteArrayOutputStream(64 * 1024);
+        long footerOffset;
+        byte[] bytes;
+        try (DataOutputStream out = new DataOutputStream(buf)) {
             out.writeInt(SEGMENT_MAGIC);
             out.writeInt(seg.getSegmentId());
             out.writeInt(seg.getGeneration());
             out.writeInt(seg.getRowCount());
+            out.writeInt(seg.getDeletedCount());
+            out.writeLong(0L); // 尾部目录偏移，写完目录后回填
             ckptCodec.writeNullBitmap(out, seg.getDeleted());
-            int cols = seg.getColumnCount();
             out.writeInt(cols);
             for (int c = 0; c < cols; c++) {
+                offsets[c] = out.size();
                 ckptCodec.writeVector(out, seg.getColumn(c));
+                lengths[c] = out.size() - (int) offsets[c];
+            }
+            footerOffset = out.size();
+            for (int c = 0; c < cols; c++) {
+                out.writeLong(offsets[c]);
+                out.writeInt(lengths[c]);
+                writeZoneBounds(out, seg.getZoneMap(c));
             }
         }
+        bytes = buf.toByteArray();
+        patchLong(bytes, 20, footerOffset);
+        Files.write(tmp, bytes);
         Files.move(tmp, dst, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+    }
+
+    /** 尾部目录里的单列 zone map：min/max 为 null 表示恒相交，不参与剪枝。 */
+    private void writeZoneBounds(DataOutput out, ZoneMap zone) throws IOException {
+        Value min = zone.getMin();
+        out.writeBoolean(min != null);
+        if (min != null) {
+            ckptCodec.writeValue(out, min);
+        }
+        Value max = zone.getMax();
+        out.writeBoolean(max != null);
+        if (max != null) {
+            ckptCodec.writeValue(out, max);
+        }
+    }
+
+    private ZoneMap readZoneEntry(DataInput in) throws IOException {
+        Value min = in.readBoolean() ? ckptCodec.readValue(in) : null;
+        Value max = in.readBoolean() ? ckptCodec.readValue(in) : null;
+        return ZoneMap.restore(min, max, compareMode);
+    }
+
+    private static void patchLong(byte[] bytes, int offset, long value) {
+        for (int i = 0; i < 8; i++) {
+            bytes[offset + i] = (byte) (value >>> (8 * (7 - i)));
+        }
     }
 
     /** 读取单个段文件，供惰性加载按需调用。 */
     public ColumnSegment loadSegment(int segmentId, int generation) throws IOException {
         return readSegment(segmentId, generation);
+    }
+
+    /**
+     * 部分列读：按尾部目录只读请求列的列块，返回列切片，不进入驻留模型。
+     */
+    public ColumnSlice readSegmentColumns(int segmentId, int generation, int[] columnIds)
+            throws IOException {
+        Path p = dir.resolve("seg_" + segmentId + "_" + generation + ".omap");
+        try (FileChannel ch = FileChannel.open(p, StandardOpenOption.READ)) {
+            ch.position(0);
+            // 内层流不关闭：Channels.newInputStream 的 close 会连带关闭通道，由外层通道兑底。
+            DataInputStream in = new DataInputStream(
+                    new BufferedInputStream(Channels.newInputStream(ch), 64 * 1024));
+            requireSegment(in, p, segmentId, generation);
+            int rowCount = in.readInt();
+            int deletedCount = in.readInt();
+            long footerOffset = in.readLong();
+            NullBitmap deleted = ckptCodec.readNullBitmap(in);
+            int cols = in.readInt();
+            for (int colId : columnIds) {
+                if (colId < 0 || colId >= cols) {
+                    throw new IOException("Column " + colId + " out of range in " + p);
+                }
+            }
+            long[] offsets = new long[cols];
+            int[] lengths = new int[cols];
+            ZoneMap[] footerZones = new ZoneMap[cols];
+            ch.position(footerOffset);
+            in = new DataInputStream(Channels.newInputStream(ch));
+            for (int c = 0; c < cols; c++) {
+                offsets[c] = in.readLong();
+                lengths[c] = in.readInt();
+                footerZones[c] = readZoneEntry(in);
+            }
+            ColumnVector[] vectors = new ColumnVector[columnIds.length];
+            ZoneMap[] zones = new ZoneMap[columnIds.length];
+            for (int i = 0; i < columnIds.length; i++) {
+                int c = columnIds[i];
+                ch.position(offsets[c]);
+                in = new DataInputStream(new BufferedInputStream(
+                        new BoundedInputStream(ch, lengths[c]), 64 * 1024));
+                vectors[i] = ckptCodec.readVector(in);
+                zones[i] = footerZones[c];
+            }
+            return new ColumnSlice(segmentId, generation, rowCount, deletedCount, deleted,
+                    columnIds, vectors, zones);
+        }
     }
 
     /** 指定代数的段文件是否存在于磁盘，供逐出前校验。 */
@@ -599,22 +699,115 @@ public final class OmapPersistence {
 
     private ColumnSegment readSegment(int expectedId, int expectedGen) throws IOException {
         Path p = dir.resolve("seg_" + expectedId + "_" + expectedGen + ".omap");
-        try (DataInputStream in = new DataInputStream(
-                new BufferedInputStream(Files.newInputStream(p)))) {
-            int magic = in.readInt();
-            if (magic != SEGMENT_MAGIC) {
-                throw new IOException("Invalid segment magic in " + p);
-            }
-            int segId = in.readInt();
-            int gen = in.readInt();
+        try (InputStream fileIn = new BufferedInputStream(Files.newInputStream(p), 512 * 1024);
+                CountingInputStream counting = new CountingInputStream(fileIn);
+                DataInputStream in = new DataInputStream(counting)) {
+            requireSegment(in, p, expectedId, expectedGen);
             int rowCount = in.readInt();
+            int deletedCount = in.readInt();
+            long footerOffset = in.readLong();
             NullBitmap deleted = ckptCodec.readNullBitmap(in);
             int cols = in.readInt();
             ColumnVector[] vectors = new ColumnVector[cols];
             for (int c = 0; c < cols; c++) {
                 vectors[c] = ckptCodec.readVector(in);
             }
-            return ColumnSegment.restore(segId, gen, rowCount, vectors, deleted, compareMode);
+            if (counting.getPos() != footerOffset) {
+                throw new IOException("Column blocks end at " + counting.getPos()
+                        + " but footer offset is " + footerOffset + " in " + p);
+            }
+            ZoneMap[] zones = new ZoneMap[cols];
+            for (int c = 0; c < cols; c++) {
+                in.readLong(); // 列块偏移：全量读已顺序消费过，仅跳过
+                in.readInt(); // 列块长度
+                zones[c] = readZoneEntry(in);
+            }
+            return ColumnSegment.restore(expectedId, expectedGen, rowCount, vectors, zones,
+                    deleted, deletedCount, compareMode);
+        }
+    }
+
+    private void requireSegment(DataInputStream in, Path p, int expectedId, int expectedGen)
+            throws IOException {
+        int magic = in.readInt();
+        if (magic != SEGMENT_MAGIC) {
+            throw new IOException("Invalid segment magic in " + p);
+        }
+        int segId = in.readInt();
+        int gen = in.readInt();
+        if (segId != expectedId || gen != expectedGen) {
+            throw new IOException("Segment id/generation mismatch in " + p);
+        }
+    }
+
+    /** 只计已消费字节数，供全量读校验列块与尾部目录的衔接。 */
+    private static final class CountingInputStream extends FilterInputStream {
+        private long pos;
+
+        CountingInputStream(InputStream in) {
+            super(in);
+        }
+
+        @Override
+        public int read() throws IOException {
+            int r = super.read();
+            if (r >= 0) {
+                pos++;
+            }
+            return r;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            int r = super.read(b, off, len);
+            if (r > 0) {
+                pos += r;
+            }
+            return r;
+        }
+
+        long getPos() {
+            return pos;
+        }
+    }
+
+    /** 从通道当前位置起限长读取，读到列块末尾即止，不串进下一列。 */
+    private static final class BoundedInputStream extends InputStream {
+        private final FileChannel ch;
+        private long remaining;
+
+        BoundedInputStream(FileChannel ch, int length) {
+            this.ch = ch;
+            this.remaining = length;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (remaining <= 0) {
+                return -1;
+            }
+            ByteBuffer b = ByteBuffer.allocate(1);
+            int r = ch.read(b);
+            if (r <= 0) {
+                return -1;
+            }
+            remaining--;
+            return b.get(0) & 0xFF;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            if (remaining <= 0 || len <= 0) {
+                return remaining <= 0 ? -1 : 0;
+            }
+            len = (int) Math.min(len, remaining);
+            ByteBuffer bb = ByteBuffer.wrap(b, off, len);
+            int r = ch.read(bb);
+            if (r <= 0) {
+                return -1;
+            }
+            remaining -= r;
+            return r;
         }
     }
 

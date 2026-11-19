@@ -64,19 +64,12 @@ public final class ColumnSegment {
         this(segmentId, 0, rowCount, columns, zoneMaps, new NullBitmap(rowCount), 0, compareMode);
     }
 
+    /** 由段文件恢复：zone map 与删除计数直接取自文件尾部目录，不再全列重算。 */
     public static ColumnSegment restore(int segmentId, int generation, int rowCount,
-            ColumnVector[] columns, NullBitmap deleted, CompareMode compareMode) {
-        ZoneMap[] zones = new ZoneMap[columns.length];
-        for (int c = 0; c < columns.length; c++) {
-            zones[c] = ZoneMap.of(columns[c], compareMode);
-        }
-        int count = 0;
-        for (int r = 0; r < rowCount; r++) {
-            if (deleted.isNull(r)) {
-                count++;
-            }
-        }
-        return new ColumnSegment(segmentId, generation, rowCount, columns, zones, deleted, count, compareMode);
+            ColumnVector[] columns, ZoneMap[] zoneMaps, NullBitmap deleted, int deletedCount,
+            CompareMode compareMode) {
+        return new ColumnSegment(segmentId, generation, rowCount, columns, zoneMaps, deleted,
+                deletedCount, compareMode);
     }
 
     /**
