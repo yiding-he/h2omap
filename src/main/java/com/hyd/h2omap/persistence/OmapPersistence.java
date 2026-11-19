@@ -539,6 +539,11 @@ public final class OmapPersistence {
         return readSegment(segmentId, generation);
     }
 
+    /** 指定代数的段文件是否存在于磁盘，供逐出前校验。 */
+    public boolean hasSegmentFile(int segmentId, int generation) {
+        return Files.exists(dir.resolve("seg_" + segmentId + "_" + generation + ".omap"));
+    }
+
     private ColumnSegment readSegment(int expectedId, int expectedGen) throws IOException {
         Path p = dir.resolve("seg_" + expectedId + "_" + expectedGen + ".omap");
         try (DataInputStream in = new DataInputStream(

@@ -26,24 +26,29 @@ public final class OmapOptions {
     /** 后台 WAL 刷盘间隔（毫秒）。 */
     public static final int DEFAULT_SYNC_INTERVAL_MS = 200;
 
+    /** 冻结段驻留堆的估算字节数预算，0 表示不逐出。 */
+    public static final long DEFAULT_RESIDENT_BYTES = 0;
+
     private final int segmentSize;
     private final int compactionMinRows;
     private final Boolean backup;
     private final String backupDir;
     private final int syncIntervalMs;
+    private final long residentBytes;
 
     private OmapOptions(int segmentSize, int compactionMinRows,
-            Boolean backup, String backupDir, int syncIntervalMs) {
+            Boolean backup, String backupDir, int syncIntervalMs, long residentBytes) {
         this.segmentSize = segmentSize;
         this.compactionMinRows = compactionMinRows;
         this.backup = backup;
         this.backupDir = backupDir;
         this.syncIntervalMs = syncIntervalMs;
+        this.residentBytes = residentBytes;
     }
 
     public static OmapOptions defaults() {
         return new OmapOptions(DEFAULT_SEGMENT_SIZE, DEFAULT_COMPACTION_MIN_ROWS,
-                null, null, DEFAULT_SYNC_INTERVAL_MS);
+                null, null, DEFAULT_SYNC_INTERVAL_MS, DEFAULT_RESIDENT_BYTES);
     }
 
     /**
@@ -61,6 +66,7 @@ public final class OmapOptions {
         Boolean backup = null;
         String backupDir = null;
         int syncIntervalMs = DEFAULT_SYNC_INTERVAL_MS;
+        long residentBytes = DEFAULT_RESIDENT_BYTES;
         for (String param : params) {
             String text = param == null ? "" : param.trim();
             if (text.isEmpty()) {
@@ -94,14 +100,18 @@ public final class OmapOptions {
             case "syncIntervalMs":
                 syncIntervalMs = parseInt(key, value);
                 break;
+            case "residentBytes":
+                residentBytes = parseLong(key, value);
+                break;
             default:
                 throw DbException.getInvalidValueException("OMAP parameter name", key);
             }
         }
-        if (segmentSize <= 0 || compactionMinRows <= 0 || syncIntervalMs <= 0) {
+        if (segmentSize <= 0 || compactionMinRows <= 0 || syncIntervalMs <= 0 || residentBytes < 0) {
             throw DbException.getInvalidValueException("OMAP parameter", params.toString());
         }
-        return new OmapOptions(segmentSize, compactionMinRows, backup, backupDir, syncIntervalMs);
+        return new OmapOptions(segmentSize, compactionMinRows, backup, backupDir, syncIntervalMs,
+                residentBytes);
     }
 
     private static int parseInt(String key, String value) {
@@ -128,7 +138,20 @@ public final class OmapOptions {
         return backupDir;
     }
 
+    private static long parseLong(String key, String value) {
+        try {
+            return Long.parseLong(value);
+        } catch (NumberFormatException e) {
+            throw DbException.getInvalidValueException("OMAP parameter " + key, value);
+        }
+    }
+
     public int getSyncIntervalMs() {
         return syncIntervalMs;
+    }
+
+    /** 冻结段驻留堆的字节预算，0 表示不逐出。 */
+    public long getResidentBytes() {
+        return residentBytes;
     }
 }

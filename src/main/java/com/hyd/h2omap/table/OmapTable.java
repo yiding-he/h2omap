@@ -57,6 +57,8 @@ public final class OmapTable extends TableBase {
         this.indexes.add(scanIndex);
         this.persistence = initPersistence(data, options);
         if (this.persistence != null) {
+            // 先登记 persistence 再恢复：恢复收尾的预算逐出要校验段文件存在。
+            this.store.setPersistence(this.persistence);
             if (this.persistence.hasExistingData()) {
                 this.persistence.recover(store);
                 this.store.startLazyLoading();
@@ -64,7 +66,6 @@ public final class OmapTable extends TableBase {
             } else {
                 this.persistence.initEmptyWal();
             }
-            this.store.setPersistence(this.persistence);
         }
     }
 

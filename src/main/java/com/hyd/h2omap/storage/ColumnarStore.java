@@ -3,6 +3,7 @@
  */
 package com.hyd.h2omap.storage;
 
+import java.io.IOException;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -26,6 +27,8 @@ import org.h2.value.ValueNull;
 
 import com.hyd.h2omap.engine.OmapOptions;
 import com.hyd.h2omap.persistence.OmapPersistence;
+import com.hyd.h2omap.stats.ZoneMap;
+import com.hyd.h2omap.vector.NullBitmap;
 
 /**
  * 列式存储的核心容器：列段加行式 delta。
@@ -100,6 +103,18 @@ public final class ColumnarStore {
     /** 后台加载中读段失败时保留的最后一个异常，供测试与诊断读取。 */
     private volatile Throwable lastLazyLoadError;
 
+    /** 驻留段访问序号，值域从 2^40 起，保证大于任何未访问初始键（段号）。 */
+    private static final long TOUCH_BASE = 1L << 40;
+
+    /** 驻留段访问序号，正值单调递增，供 LRU 逐出排序。 */
+    private final AtomicLong touchCounter = new AtomicLong();
+
+    /** 全部驻留段的估算字节数，写锁内维护。 */
+    private long residentTotal;
+
+    /** 累计逐出段数，供测试断言。 */
+    private final AtomicLong evictedSegments = new AtomicLong();
+
     /** 段加载完成后的通知，用来让 H2 的查询结果缓存失效。 */
     private volatile Runnable visibilityListener;
 
@@ -107,7 +122,7 @@ public final class ColumnarStore {
     public record SegmentMeta(int segmentId, int generation) {
     }
 
-    /** 段引用：{@code loaded} 为 null 表示段内容尚未从磁盘读取。 */
+    /** 段引用：{@code loaded} 为 null 且 {@code skeleton} 非 null 表示已逐出；两者都为 null 表示惰性加载中。 */
     private static final class SegmentRef {
 
         final int segmentId;
@@ -116,10 +131,46 @@ public final class ColumnarStore {
 
         volatile ColumnSegment loaded;
 
+        /** 逐出后的常驻骨架；驻留时为 null。 */
+        volatile SegmentSkeleton skeleton;
+
+        /** 驻留内容的估算字节数，写锁内维护；逐出后归零。 */
+        long residentBytes;
+
+        /**
+         * LRU 键：小于 2^40 表示从未被查询访问（取段号，段号越老越优先逐出），
+         * 否则为访问序号。逐出取最小者。
+         */
+        volatile long lastTouch;
+
         SegmentRef(int segmentId, int generation, ColumnSegment loaded) {
             this.segmentId = segmentId;
             this.generation = generation;
             this.loaded = loaded;
+            this.lastTouch = segmentId;
+        }
+    }
+
+    /** 逐出时留在堆上的段级元数据：行数、删除位图与每列 zone map。 */
+    private static final class SegmentSkeleton {
+
+        final int rowCount;
+
+        final int deletedCount;
+
+        /** 与被逐出段共享同一对象：段内删除位图冻结后不再变。 */
+        final NullBitmap deleted;
+
+        final ZoneMap[] zoneMaps;
+
+        SegmentSkeleton(ColumnSegment segment) {
+            this.rowCount = segment.getRowCount();
+            this.deletedCount = segment.getDeletedCount();
+            this.deleted = segment.getDeleted();
+            this.zoneMaps = new ZoneMap[segment.getColumnCount()];
+            for (int c = 0; c < zoneMaps.length; c++) {
+                this.zoneMaps[c] = segment.getZoneMap(c);
+            }
         }
     }
 
@@ -219,8 +270,19 @@ public final class ColumnarStore {
             compact();
         } else if (froze && persistence != null) {
             checkpoint();
+            evictIfNeeded();
         }
         return rowId;
+    }
+
+    /** 驻留字节超出预算时逐出段，写路径与合并收尾调用。 */
+    private void evictIfNeeded() {
+        lock.writeLock().lock();
+        try {
+            evictLocked();
+        } finally {
+            lock.writeLock().unlock();
+        }
     }
 
     public void remove(long rowId) {
@@ -291,6 +353,7 @@ public final class ColumnarStore {
         try {
             long old = rowCount;
             segments.clear();
+            residentTotal = 0;
             delta.clear();
             aggCache.clear();
             openSegment.clear();
@@ -341,6 +404,10 @@ public final class ColumnarStore {
                     long rowId = delta.updatedRowIdAt(pos);
                     int segId = RowId.segmentId(rowId);
                     ColumnSegment seg = segment(segId);
+                    if (seg == null) {
+                        // 受影响的段已被逐出：合并需要重写段内容，先同步读回。
+                        seg = ensureResident(segments.get(segId));
+                    }
                     if (seg != null) {
                         baseSegments.putIfAbsent(segId, seg);
                         updatesBySeg.computeIfAbsent(segId, k -> new ArrayList<>())
@@ -354,6 +421,9 @@ public final class ColumnarStore {
                 for (Map.Entry<Integer, DeltaStore.SegmentDeleteBitmap> entry : delta.segmentDeleteEntries()) {
                     int segId = entry.getKey();
                     ColumnSegment seg = segment(segId);
+                    if (seg == null) {
+                        seg = ensureResident(segments.get(segId));
+                    }
                     if (seg != null) {
                         baseSegments.putIfAbsent(segId, seg);
                         List<Integer> offsets = deletesBySeg.computeIfAbsent(segId, k -> new ArrayList<>());
@@ -394,9 +464,12 @@ public final class ColumnarStore {
                     if (newSeg.getDeletedCount() >= newSeg.getRowCount()) {
                         // 回写后整段全删：直接丢弃，不再挂回段列表。
                         segments.remove(segId);
+                        residentTotal -= ref.residentBytes;
                     } else {
                         ref.loaded = newSeg;
                         ref.generation = newSeg.getGeneration();
+                        residentTotal += newSeg.getEstimatedMemory() - ref.residentBytes;
+                        ref.residentBytes = newSeg.getEstimatedMemory();
                     }
                     delta.clearSegmentDeletes(segId);
                 }
@@ -414,6 +487,7 @@ public final class ColumnarStore {
         if (persistence != null && compactedCount >= Math.max(1024, options.getCompactionMinRows())) {
             checkpoint();
         }
+        evictIfNeeded();
         return compactedCount;
     }
 
@@ -463,7 +537,12 @@ public final class ColumnarStore {
         try {
             segments.clear();
             for (int i = 0; i < segmentIds.length; i++) {
-                segments.put(segmentIds[i], new SegmentRef(segmentIds[i], generations[i], preloaded[i]));
+                SegmentRef ref = new SegmentRef(segmentIds[i], generations[i], preloaded[i]);
+                if (preloaded[i] != null) {
+                    ref.residentBytes = preloaded[i].getEstimatedMemory();
+                    residentTotal += ref.residentBytes;
+                }
+                segments.put(segmentIds[i], ref);
             }
             nextSegmentId = restoredNextSegId;
             openSegment.clear();
@@ -481,6 +560,8 @@ public final class ColumnarStore {
             }
             recomputeRowCount();
             bump();
+            // 恢复后同样遵守驻留预算：非惰性模式读入了全部段，这里裁到预算内。
+            evictLocked();
         } finally {
             lock.writeLock().unlock();
         }
@@ -642,17 +723,20 @@ public final class ColumnarStore {
      * @return 行，不存在或已删除时返回 null
      */
     public Row materialize(long rowId) {
+        ensureFrozenSegmentResident(rowId);
         lock.readLock().lock();
         try {
             Value[] values;
             if (isFrozen(rowId)) {
                 int segId = RowId.segmentId(rowId);
-                ColumnSegment segment = segment(segId);
+                SegmentRef ref = segments.get(segId);
+                ColumnSegment segment = ref == null ? null : ref.loaded;
                 int offset = RowId.offset(rowId);
                 if (segment == null || offset >= segment.getRowCount()
                         || segment.isDeleted(offset)) {
                     return null;
                 }
+                touchRef(ref);
                 if (delta.hasSegmentDelta(segId)) {
                     if (delta.isSegmentRowDeleted(rowId)) {
                         return null;
@@ -677,6 +761,28 @@ public final class ColumnarStore {
             return row;
         } finally {
             lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * 逐出段的行被点查命中时先把段读回。读回后该段拥有最新的访问序号，
+     * 紧接着的预算逐出不会先选它。
+     */
+    private void ensureFrozenSegmentResident(long rowId) {
+        SegmentRef evicted = null;
+        lock.readLock().lock();
+        try {
+            if (isFrozen(rowId)) {
+                SegmentRef ref = segments.get(RowId.segmentId(rowId));
+                if (ref != null && ref.loaded == null && ref.skeleton != null) {
+                    evicted = ref;
+                }
+            }
+        } finally {
+            lock.readLock().unlock();
+        }
+        if (evicted != null) {
+            ensureResident(evicted);
         }
     }
 
@@ -827,6 +933,8 @@ public final class ColumnarStore {
                 return;
             }
             ref.loaded = segment;
+            ref.residentBytes = segment.getEstimatedMemory();
+            residentTotal += ref.residentBytes;
             long added = visibleRowsOf(segment);
             if (deletedOffsets != null) {
                 int rowCountOfSegment = segment.getRowCount();
@@ -840,6 +948,7 @@ public final class ColumnarStore {
             // 加载后该段可能整段已删：与写路径同一条丢弃判定。
             dropSegmentIfEmpty(ref.segmentId);
             bump();
+            evictLocked();
         } finally {
             lock.writeLock().unlock();
         }
@@ -861,6 +970,116 @@ public final class ColumnarStore {
             }
         }
         return visible;
+    }
+
+    // ------------------------------------------------------------------
+    // 段级逐出（MOR 批次 4）
+    // ------------------------------------------------------------------
+
+    /**
+     * 驻留字节超出预算时逐出段。逐出后段仍可见：行数、删除位图与每列 zone map
+     * 留在骨架里，命中时从段文件同步读回。
+     * 逐出对象优先选从未被查询访问过的段（段号老的先逐出），
+     * 其次选访问时间最早的段，与数据的写入顺序无关。
+     * 调用方必须已持有写锁。
+     */
+    private void evictLocked() {
+        long budget = options.getResidentBytes();
+        if (budget <= 0 || persistence == null || residentTotal <= budget) {
+            return;
+        }
+        while (residentTotal > budget) {
+            SegmentRef victim = null;
+            for (SegmentRef ref : segments.values()) {
+                if (ref.loaded == null || !persistence.hasSegmentFile(ref.segmentId, ref.generation)) {
+                    continue;
+                }
+                if (victim == null || ref.lastTouch < victim.lastTouch) {
+                    victim = ref;
+                }
+            }
+            if (victim == null) {
+                break;
+            }
+            victim.skeleton = new SegmentSkeleton(victim.loaded);
+            victim.loaded = null;
+            residentTotal -= victim.residentBytes;
+            victim.residentBytes = 0;
+            evictedSegments.incrementAndGet();
+        }
+    }
+
+    /**
+     * 确保段驻留：已逐出时从段文件同步读回。并发下只允许一个读回生效，
+     * 读回后视为刚被访问，不会被紧接着的预算逐出立刻逐出。
+     */
+    private ColumnSegment ensureResident(SegmentRef ref) {
+        if (ref == null) {
+            return null;
+        }
+        ColumnSegment loaded = ref.loaded;
+        if (loaded != null) {
+            return loaded;
+        }
+        OmapPersistence p = persistence;
+        if (p == null || ref.skeleton == null) {
+            return null;
+        }
+        try {
+            loaded = p.loadSegment(ref.segmentId, ref.generation);
+        } catch (IOException e) {
+            throw new IllegalStateException(
+                    "逐出段读回失败: seg_" + ref.segmentId + "_" + ref.generation, e);
+        }
+        lock.writeLock().lock();
+        try {
+            if (ref.loaded != null) {
+                return ref.loaded;
+            }
+            if (ref.skeleton == null) {
+                return null;
+            }
+            ref.loaded = loaded;
+            ref.skeleton = null;
+            ref.residentBytes = loaded.getEstimatedMemory();
+            residentTotal += ref.residentBytes;
+            touchRef(ref);
+            evictLocked();
+        } finally {
+            lock.writeLock().unlock();
+        }
+        return loaded;
+    }
+
+    /** 读路径触碰一段：记下访问序号，供 LRU 逐出排序。须在锁内调用。 */
+    private void touchRef(SegmentRef ref) {
+        ref.lastTouch = TOUCH_BASE + touchCounter.incrementAndGet();
+    }
+
+    /** 该段当前是否驻留堆上。 */
+    public boolean isSegmentResident(int segmentId) {
+        lock.readLock().lock();
+        try {
+            SegmentRef ref = segments.get(segmentId);
+            return ref != null && ref.loaded != null;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /** 全部驻留段的估算字节数。 */
+    public long getResidentBytes() {
+        lock.readLock().lock();
+        try {
+            return residentTotal;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /** 累计逐出的段数，供测试断言。 */
+    public long getEvictedSegmentCount() {
+        return evictedSegments.get();
     }
 
     // ------------------------------------------------------------------
@@ -886,7 +1105,10 @@ public final class ColumnarStore {
         }
         ColumnSegment segment = ColumnSegment.build(
                 nextSegmentId, openSegment.drain(), columnTypes, compareMode);
-        segments.put(nextSegmentId, new SegmentRef(nextSegmentId, segment.getGeneration(), segment));
+        SegmentRef ref = new SegmentRef(nextSegmentId, segment.getGeneration(), segment);
+        ref.residentBytes = segment.getEstimatedMemory();
+        residentTotal += ref.residentBytes;
+        segments.put(nextSegmentId, ref);
         // 段冻结后，开放段里的删除记录必须移交给 delta，否则那些行会重新可见。
         for (long rowId : openDeletes) {
             delta.markDeleted(rowId);
@@ -902,27 +1124,65 @@ public final class ColumnarStore {
         if (delta.isSegmentRowDeleted(rowId)) {
             return false;
         }
-        ColumnSegment segment = segment(RowId.segmentId(rowId));
-        if (segment == null) {
+        int segId = RowId.segmentId(rowId);
+        SegmentRef ref = segments.get(segId);
+        if (ref == null) {
             // 段尚未加载时读不到段内删除位图；rowId 由 H2 或 WAL 提供，按存在处理，
             // 使 WAL 重放与客户端删除能记进 delta，加载时再统一扣除。
             return true;
         }
-        return !segment.isDeleted(RowId.offset(rowId));
+        if (ref.loaded != null) {
+            return !ref.loaded.isDeleted(RowId.offset(rowId));
+        }
+        // 已逐出的段读骨架里的删除位图。
+        return ref.skeleton == null || !ref.skeleton.deleted.isNull(RowId.offset(rowId));
     }
 
     private boolean isFrozen(long rowId) {
         return RowId.segmentId(rowId) < nextSegmentId;
     }
 
-    /** 该行是否已计入 {@code rowCount}：未加载段的行在加载完成时才计入。 */
+    /** 该行是否已计入 {@code rowCount}：未加载段（含逐出段）的行在加载完成时才计入。 */
     private boolean countedInRowCount(long rowId) {
-        return !isFrozen(rowId) || segment(RowId.segmentId(rowId)) != null;
+        if (!isFrozen(rowId)) {
+            return true;
+        }
+        SegmentRef ref = segments.get(RowId.segmentId(rowId));
+        return ref != null && (ref.loaded != null || ref.skeleton != null);
     }
 
     private ColumnSegment segment(int segmentId) {
         SegmentRef ref = segments.get(segmentId);
         return ref == null ? null : ref.loaded;
+    }
+
+    /** 读路径的段引用：已丢弃段与惰性未加载段返回 null；逐出段照常返回。须在锁内调用。 */
+    private SegmentRef refOf(int segmentId) {
+        SegmentRef ref = segments.get(segmentId);
+        if (ref == null || (ref.loaded == null && ref.skeleton == null)) {
+            return null;
+        }
+        return ref;
+    }
+
+    /** 段内删除位：已逐出的段读骨架位图。须在锁内调用。 */
+    private boolean refDeleted(SegmentRef ref, int offset) {
+        ColumnSegment seg = ref.loaded;
+        return seg != null ? seg.isDeleted(offset) : ref.skeleton.deleted.isNull(offset);
+    }
+
+    /** 读一份段内容供当次迭代使用，不回写驻留状态；仅批量路径预读后又被并发逐出的窗口使用。 */
+    private ColumnSegment readSegmentTransient(SegmentRef ref) {
+        OmapPersistence p = persistence;
+        if (p == null || ref.skeleton == null) {
+            return null;
+        }
+        try {
+            return p.loadSegment(ref.segmentId, ref.generation);
+        } catch (IOException e) {
+            throw new IllegalStateException(
+                    "逐出段读回失败: seg_" + ref.segmentId + "_" + ref.generation, e);
+        }
     }
 
     /** 按段号取已加载的段，供 checkpoint 写盘使用。 */
@@ -946,15 +1206,19 @@ public final class ColumnarStore {
      */
     private void dropSegmentIfEmpty(int segmentId) {
         SegmentRef ref = segments.get(segmentId);
-        if (ref == null || ref.loaded == null) {
+        if (ref == null || (ref.loaded == null && ref.skeleton == null)) {
             return;
         }
+        // 已逐出的段只有骨架，同样适用同一条丢弃判定。
         ColumnSegment seg = ref.loaded;
-        long deleted = (long) seg.getDeletedCount() + delta.segmentDeleteCount(segmentId);
-        if (deleted < seg.getRowCount()) {
+        int segRowCount = seg != null ? seg.getRowCount() : ref.skeleton.rowCount;
+        long deleted = (long) (seg != null ? seg.getDeletedCount() : ref.skeleton.deletedCount)
+                + delta.segmentDeleteCount(segmentId);
+        if (deleted < segRowCount) {
             return;
         }
         segments.remove(segmentId);
+        residentTotal -= ref.residentBytes;
         delta.clearSegmentDeletes(segmentId);
         aggCache.invalidateSegment(segmentId);
         bump();
@@ -1019,6 +1283,8 @@ public final class ColumnarStore {
 
         @Override
         public int nextBatch(ColumnarStore store, Row[] buffer) {
+            // 产行的批量路径需要段内容：先在读锁外把剩余扫描范围内的逐出段读回。
+            ensureRangeResident();
             lock.readLock().lock();
             try {
                 return reverse ? nextBatchReverse(buffer) : nextBatchForward(buffer);
@@ -1027,20 +1293,61 @@ public final class ColumnarStore {
             }
         }
 
+        /** 剩余扫描范围内的逐出段读回驻留；用骨架 zone map 先剪枝，预算容不下时批量路径退回临时读。 */
+        private void ensureRangeResident() {
+            List<SegmentRef> evicted = null;
+            lock.readLock().lock();
+            try {
+                for (SegmentRef ref : reverse
+                        ? segments.headMap(segmentId, true).values()
+                        : segments.tailMap(segmentId, true).values()) {
+                    if (ref.loaded == null && ref.skeleton != null && intersects(ref)) {
+                        if (evicted == null) {
+                            evicted = new ArrayList<>();
+                        }
+                        evicted.add(ref);
+                    }
+                }
+            } finally {
+                lock.readLock().unlock();
+            }
+            if (evicted != null) {
+                for (SegmentRef ref : evicted) {
+                    ensureResident(ref);
+                }
+            }
+        }
+
+        /** 批量路径的段内容：驻留的取驻留值；预读后又被逐出的读一份仅供本次迭代，不回写驻留状态。 */
+        private ColumnSegment residentForBatch(SegmentRef ref) {
+            if (ref == null) {
+                return null;
+            }
+            ColumnSegment seg = ref.loaded;
+            if (seg != null) {
+                return seg;
+            }
+            return ref.skeleton == null ? null : readSegmentTransient(ref);
+        }
+
         private int nextBatchForward(Row[] buffer) {
             int filled = 0;
             while (filled < buffer.length && segmentId <= lastSegmentId) {
                 boolean open = isOpen();
-                ColumnSegment segment = open ? null : segment(segmentId);
+                SegmentRef ref = open ? null : refOf(segmentId);
+                ColumnSegment segment = open ? null : residentForBatch(ref);
                 if (segment == null && !open) {
                     nextSegmentForward();
                     continue;
                 }
-                if (segment != null && !intersects(segment)) {
+                if (!open && !intersects(ref)) {
                     nextSegmentForward();
                     continue;
                 }
-                int count = countOf(open, segment);
+                int count = countOf(open, ref);
+                if (!open) {
+                    touchRef(ref);
+                }
                 if (open) {
                     boolean noDeletes = openDeletes.isEmpty();
                     while (offset < count && filled < buffer.length) {
@@ -1087,16 +1394,20 @@ public final class ColumnarStore {
             int minSegmentId = firstSegmentId();
             while (filled < buffer.length && segmentId >= minSegmentId) {
                 boolean open = isOpen();
-                ColumnSegment segment = open ? null : segment(segmentId);
+                SegmentRef ref = open ? null : refOf(segmentId);
+                ColumnSegment segment = open ? null : residentForBatch(ref);
                 if (segment == null && !open) {
                     nextSegmentReverse();
                     continue;
                 }
-                if (segment != null && !intersects(segment)) {
+                if (!open && !intersects(ref)) {
                     nextSegmentReverse();
                     continue;
                 }
-                int count = countOf(open, segment);
+                int count = countOf(open, ref);
+                if (!open) {
+                    touchRef(ref);
+                }
                 if (!started) {
                     offset = count - 1;
                     started = true;
@@ -1145,21 +1456,25 @@ public final class ColumnarStore {
         private long nextForward() {
             while (segmentId <= lastSegmentId) {
                 boolean open = isOpen();
-                ColumnSegment segment = open ? null : segment(segmentId);
-                if (segment == null && !open) {
+                SegmentRef ref = open ? null : refOf(segmentId);
+                if (ref == null && !open) {
                     nextSegmentForward();
                     continue;
                 }
-                if (segment != null && !intersects(segment)) {
+                if (!open && !intersects(ref)) {
                     nextSegmentForward();
                     continue;
                 }
-                int count = countOf(open, segment);
+                int count = countOf(open, ref);
+                if (!open) {
+                    touchRef(ref);
+                }
                 boolean hasDelta = !open && delta.hasSegmentDelta(segmentId);
                 while (offset < count) {
                     long rowId = RowId.ofSegment(segmentId, offset);
                     boolean deleted = open ? openDeletes.contains(rowId)
-                            : segment.isDeleted(offset) || (hasDelta && delta.isSegmentRowDeleted(rowId));
+                            : refDeleted(ref, offset)
+                                    || (hasDelta && delta.isSegmentRowDeleted(rowId));
                     offset++;
                     if (!deleted) {
                         return rowId;
@@ -1173,16 +1488,19 @@ public final class ColumnarStore {
         private long nextReverse() {
             while (segmentId >= firstSegmentId()) {
                 boolean open = isOpen();
-                ColumnSegment segment = open ? null : segment(segmentId);
-                if (segment == null && !open) {
+                SegmentRef ref = open ? null : refOf(segmentId);
+                if (ref == null && !open) {
                     nextSegmentReverse();
                     continue;
                 }
-                if (segment != null && !intersects(segment)) {
+                if (!open && !intersects(ref)) {
                     nextSegmentReverse();
                     continue;
                 }
-                int count = countOf(open, segment);
+                int count = countOf(open, ref);
+                if (!open) {
+                    touchRef(ref);
+                }
                 if (!started) {
                     offset = count - 1;
                     started = true;
@@ -1190,7 +1508,7 @@ public final class ColumnarStore {
                 while (offset >= 0) {
                     long rowId = RowId.ofSegment(segmentId, offset);
                     boolean deleted = open ? openDeletes.contains(rowId)
-                            : segment.isDeleted(offset)
+                            : refDeleted(ref, offset)
                                     || (delta.hasSegmentDelta(segmentId) && delta.isSegmentRowDeleted(rowId));
                     offset--;
                     if (!deleted) {
@@ -1222,19 +1540,34 @@ public final class ColumnarStore {
          * 当前段要遍历的行数。创建时的开放段可能被写满并冻结，
          * 新追加的行不属于本次快照。
          */
-        private int countOf(boolean open, ColumnSegment segment) {
-            int available = open ? openSegment.rowCount() : segment.getRowCount();
+        private int countOf(boolean open, SegmentRef ref) {
+            int available;
+            if (open) {
+                available = openSegment.rowCount();
+            } else if (ref.loaded != null) {
+                available = ref.loaded.getRowCount();
+            } else {
+                available = ref.skeleton.rowCount;
+            }
             return segmentId == lastSegmentId ? Math.min(available, openRowCount) : available;
         }
 
-        private boolean intersects(ColumnSegment segment) {
+        /** 段是否可能与给定区间相交；已逐出的段用骨架里的 zone map。 */
+        private boolean intersects(SegmentRef ref) {
+            if (lower == null && upper == null) {
+                return true;
+            }
             // 只有未回写的更新新像会让段的 zone map 失真（重开后 WAL 重放把更新放回 delta，
             // 段文件与其中的 zone map 仍是合并前的；未重开时合并也会先改段后清 delta）。
             // 删除只会收窄值域，不改变 zone map 的有效性，纯删除段仍参与边界剪枝。
-            if (delta.hasSegmentUpdates(segment.getSegmentId())) {
+            if (delta.hasSegmentUpdates(ref.segmentId)) {
                 return true;
             }
-            return ColumnarStore.intersects(segment, lower, upper, valueTypes.length);
+            ColumnSegment seg = ref.loaded;
+            if (seg != null) {
+                return ColumnarStore.intersects(seg, lower, upper, valueTypes.length);
+            }
+            return skeletonIntersects(ref.skeleton, lower, upper);
         }
     }
 
@@ -1273,12 +1606,18 @@ public final class ColumnarStore {
      * @return 快照，{@code segments} 只含可能与区间相交的段
      */
     public VectorizedSnapshot takeVectorizedSnapshot(Value[] lower, Value[] upper) {
+        reloadEvictedForSnapshot(lower, upper);
         lock.readLock().lock();
         try {
             List<ColumnSegment> loadedSegments = new ArrayList<>(segments.size());
             for (SegmentRef ref : segments.values()) {
-                if (ref.loaded != null) {
-                    loadedSegments.add(ref.loaded);
+                ColumnSegment seg = ref.loaded;
+                if (seg == null && ref.skeleton != null && refNeeded(ref, lower, upper)) {
+                    // 预读后又被预算逐出：读一份仅供本次快照，不回写驻留状态。
+                    seg = readSegmentTransient(ref);
+                }
+                if (seg != null) {
+                    loadedSegments.add(seg);
                 }
             }
             ColumnSegment[] segs = loadedSegments.toArray(new ColumnSegment[0]);
@@ -1355,12 +1694,73 @@ public final class ColumnarStore {
             for (ColumnSegment seg : segs) {
                 versions.put(seg.getSegmentId(), delta.segmentVersion(seg.getSegmentId()));
             }
+            // 剪枝后实际参与扫描的段记一次访问，供 LRU 逐出排序。
+            for (ColumnSegment seg : segs) {
+                SegmentRef ref = segments.get(seg.getSegmentId());
+                if (ref != null) {
+                    touchRef(ref);
+                }
+            }
             return new VectorizedSnapshot(
                     segs, masked != null ? masked : Map.of(), extra != null ? extra : List.of(),
                     versions);
         } finally {
             lock.readLock().unlock();
         }
+    }
+
+    /** 快照是否需要该段：无界时全要；有界时用骨架 zone map 判定，未回写更新的段必须保留。 */
+    private boolean refNeeded(SegmentRef ref, Value[] lower, Value[] upper) {
+        if (lower == null && upper == null) {
+            return true;
+        }
+        return delta.hasSegmentUpdates(ref.segmentId)
+                || skeletonIntersects(ref.skeleton, lower, upper);
+    }
+
+    /**
+     * 逐出段进入向量化快照前先读回：向量化路径需要段内容，骨架只服务行号级读路径。
+     * 剪枝判定用骨架里的 zone map，与驻留段同一条规则。
+     */
+    private void reloadEvictedForSnapshot(Value[] lower, Value[] upper) {
+        List<SegmentRef> evicted = null;
+        lock.readLock().lock();
+        try {
+            for (SegmentRef ref : segments.values()) {
+                if (ref.loaded != null || ref.skeleton == null) {
+                    continue;
+                }
+                boolean needed = (lower == null && upper == null)
+                        || delta.hasSegmentUpdates(ref.segmentId)
+                        || skeletonIntersects(ref.skeleton, lower, upper);
+                if (needed) {
+                    if (evicted == null) {
+                        evicted = new ArrayList<>();
+                    }
+                    evicted.add(ref);
+                }
+            }
+        } finally {
+            lock.readLock().unlock();
+        }
+        if (evicted != null) {
+            for (SegmentRef ref : evicted) {
+                ensureResident(ref);
+            }
+        }
+    }
+
+    /** 骨架的 zone map 是否可能与给定区间相交。 */
+    private boolean skeletonIntersects(SegmentSkeleton skeleton, Value[] lower, Value[] upper) {
+        int columns = Math.min(valueTypes.length, skeleton.zoneMaps.length);
+        for (int c = 0; c < columns; c++) {
+            Value low = bound(lower, c);
+            Value high = bound(upper, c);
+            if ((low != null || high != null) && !skeleton.zoneMaps[c].mayIntersect(low, high)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private boolean rowsetIntersects(Value[] lower, Value[] upper) {
