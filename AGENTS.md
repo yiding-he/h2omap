@@ -27,7 +27,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | JDK | 构建与运行用 JDK 21.0.11；字节码目标 `maven.compiler.release=17` |
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变）。被替换的 3 个 H2 类按该版本源码合入，升级时必须逐类重新比对 |
 | 依赖 | 运行期只有 `com.h2database:h2`，测试用 `junit-jupiter`，构建期插件 `maven-shade-plugin` |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（59 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（17 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（60 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（17 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/`。该目录可能不存在（已排除在版本控制之外）。Maven Central 的 `h2-2.5.252-sources.jar` 内容等价，但个别文件与该 zip 相差数行，核对行号时以 zip 为准 |
 
 ## H2 侧的依据
@@ -61,7 +61,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 
 ## 对 H2 的局部替换与打包
 
-`TableEngine` 只能替换表的存储与索引，读路径下推与默认引擎都要改动 H2 自身。本分支因此替换了 4 个 H2 类，另加 3 个访问桥；替换类随本项目源码编译，`maven-shade-plugin` 打包时从 `com.h2database:h2` 中排除同名类（含内部类 `$*`），部署只需一个 Jar。
+`TableEngine` 只能替换表的存储与索引，读路径下推与默认引擎都要改动 H2 自身。本分支因此替换了 5 个 H2 类，另加 3 个访问桥；替换类随本项目源码编译，`maven-shade-plugin` 打包时从 `com.h2database:h2` 中排除同名类（含内部类 `$*`），部署只需一个 Jar。
 
 | 替换的类 | 改动 |
 | --- | --- |
@@ -69,6 +69,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | `org.h2.schema.Schema` | `createTable()` 增加两段判断：显式写 `ENGINE "org.h2.mvstore.db.Store"` 时清空 `data.tableEngine` 直接走 MVStore；`tableEngine == null` 且未设 `defaultTableEngine`、非开库重放（`!database.isStarting()`）、`data.id != 0`、非临时表时，默认取 `com.hyd.h2omap.engine.OmapTableEngine` |
 | `org.h2.expression.condition.Comparison` | 只新增一个 `public int getCompareType()`，供 `VectorizedFilter` 读取比较类型 |
 | `org.h2.expression.condition.ConditionInQuery` | 按 `2.5.252` 源码逐字合入，末尾新增 `getLeft()`、`isNot()`、`isAll()`、`getCompareType()` 四个访问器，供 `SubqueryFold` 读取 `IN (SELECT)` 谓词的成员 |
+| `org.h2.engine.DbSettings` | 按 `2.5.252` 源码逐字合入，构造器末尾追加一行：把 `DEFAULT_TABLE_ENGINE` 的展示值写成 `com.hyd.h2omap.engine.OmapTableEngine`。`defaultTableEngine` 字段仍为 `null`（`Schema.createTable` 用它判断默认引擎路径），改的只是 `INFORMATION_SCHEMA.SETTINGS` 读的那张 map；`MV_STORE` 不动，H2 元数据确实在 MVStore 里 |
 
 访问桥不替换原类，只是声明在同一个包里，用来读取包级与受保护成员：
 
@@ -278,7 +279,7 @@ src/test/java/com/hyd/h2omap/
 
 ## 当前状态与后续阶段
 
-M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成。判定依据为 59 个契约用例、17 个存储层用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
+M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成。判定依据为 60 个契约用例、17 个存储层用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
 
 阶段编号按提出顺序，M7、M8 的实际交付早于 M6。
 
