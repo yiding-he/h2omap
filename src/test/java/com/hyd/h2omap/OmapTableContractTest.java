@@ -1696,6 +1696,61 @@ class OmapTableContractTest {
     }
 
     /**
+     * CLOB 列（方案 B2）：段内打包为「字节池 + 偏移」（ClobVector 复用 VarcharVector
+     * 机制），装箱时才生成 ValueClob，消掉逐值对象开销；过滤与投影路径不读盘。
+     * 覆盖 NULL、变长更新、删除、合并、真实重启（VEC_CLOB 段格式往返）、
+ * LIKE 与等值过滤，并与 MVStore 逐查询比对。
+     */
+    @Test
+    void clobColumnSurvivesRestartAndCompaction() throws Exception {
+        // 不设 DB_CLOSE_DELAY：关掉最后一个连接即关闭数据库，第二次连接真正从段文件恢复
+        Path dir = java.nio.file.Files.createTempDirectory("h2omap_clob_persist_");
+        String url = "jdbc:h2:" + dir.resolve("clob_db").toAbsolutePath();
+        String[] templates = {
+                "SELECT ID, C FROM %s ORDER BY ID",
+                "SELECT ID FROM %s WHERE C LIKE '长值-%%' ORDER BY ID",
+                "SELECT ID FROM %s WHERE C = 'q' ORDER BY ID",
+                "SELECT ID FROM %s WHERE C IS NULL ORDER BY ID",
+                "SELECT COUNT(*) FROM %s WHERE ID >= 200 AND C LIKE '值%%'",
+        };
+        String pad = "值".repeat(60);
+        String expectedBefore;
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            for (String table : new String[] { "T", "T_MV" }) {
+                String engine = table.equals("T_MV") ? " ENGINE \"org.h2.mvstore.db.Store\"" : "";
+                s.execute("CREATE TABLE " + table + "(ID BIGINT PRIMARY KEY, C CLOB)"
+                        + engine + " WITH \"segmentSize=128\", \"compactionMinRows=20\"");
+                for (int i = 1; i <= 400; i++) {
+                    s.execute("INSERT INTO " + table + " VALUES (" + i + ", '" + pad + i + "')");
+                }
+                s.execute("UPDATE " + table + " SET C = CONCAT('长值-', C) WHERE MOD(ID, 7) = 0");
+                s.execute("UPDATE " + table + " SET C = 'q' WHERE MOD(ID, 11) = 1");
+                s.execute("UPDATE " + table + " SET C = NULL WHERE MOD(ID, 13) = 0");
+                s.execute("DELETE FROM " + table + " WHERE MOD(ID, 17) = 0");
+                // 再写满一段：冻结与检查点把合并结果写进段文件，重启后段里的 zone map 与列值一致
+                for (int i = 401; i <= 528; i++) {
+                    s.execute("INSERT INTO " + table + " VALUES (" + i + ", '" + pad + i + "')");
+                }
+            }
+            assertQueriesMatch(s, templates);
+            assertEquals("长值-" + pad + "7", toString(s, "SELECT C FROM T WHERE ID = 7"));
+            // 类型不丢：JDBC 侧仍是 CLOB。
+            try (java.sql.ResultSet rs = s.executeQuery("SELECT C FROM T WHERE ID = 7")) {
+                rs.next();
+                assertEquals(java.sql.Types.CLOB, rs.getMetaData().getColumnType(1));
+            }
+            expectedBefore = collectRows(s, "SELECT ID, C FROM T ORDER BY ID");
+        }
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            assertEquals(expectedBefore, collectRows(s, "SELECT ID, C FROM T ORDER BY ID"));
+            assertQueriesMatch(s, templates);
+            assertEquals("长值-" + pad + "7", toString(s, "SELECT C FROM T WHERE ID = 7"));
+        }
+    }
+
+    /**
      * 行式路径的区间剪枝不丢 delta 新像：段的 zone map 可能落后于 delta
      * （更新量低于合并阈值时新像留在段外；重开后 WAL 重放又把它放回 delta），
      * 被剪段内已更新行必须仍可见。DISTINCT 拒绝向量化下推，走 H2 行式路径。

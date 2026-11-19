@@ -13,6 +13,7 @@ import org.h2.result.Row;
 import org.h2.table.Column;
 import org.h2.value.TypeInfo;
 import org.h2.value.CompareMode;
+import org.h2.value.ValueClob;
 import org.h2.value.Value;
 import org.h2.value.ValueArray;
 import org.h2.value.ValueInteger;
@@ -22,6 +23,7 @@ import org.junit.jupiter.api.Test;
 
 import com.hyd.h2omap.engine.OmapOptions;
 import com.hyd.h2omap.vector.ArrayVector;
+import com.hyd.h2omap.vector.ClobVector;
 import com.hyd.h2omap.vector.ColumnVector;
 import com.hyd.h2omap.vector.IntVector;
 import com.hyd.h2omap.vector.ValueVector;
@@ -400,6 +402,18 @@ class ColumnarStoreTest {
         return new Value[] { value };
     }
 
+    private static ColumnarStore newClobStore(int segmentSize, int compactionMinRows) {
+        return new ColumnarStore(
+                new Column[] { new Column("C", TypeInfo.getTypeInfo(Value.CLOB, 1 << 30, 0, null)) },
+                OmapOptions.from(List.of("segmentSize=" + segmentSize,
+                        "compactionMinRows=" + compactionMinRows)),
+                CompareMode.getInstance(null, 0));
+    }
+
+    private static Value[] clobRow(Value value) {
+        return new Value[] { value };
+    }
+
     /**
      * 高基数 VARCHAR 列：段内按「字节池 + 偏移」存放，不再逐行持有 String。
      *
@@ -455,6 +469,62 @@ class ColumnarStoreTest {
         assertEquals(ValueNull.INSTANCE, store.materialize(ids[2]).getValueList()[0]);
         assertEquals("v3", store.materialize(ids[3]).getValueList()[0].getString());
         assertEquals("v7", store.materialize(ids[7]).getValueList()[0].getString());
+        assertEquals("v199", store.materialize(ids[199]).getValueList()[0].getString());
+    }
+
+    /**
+     * CLOB 列：段内同样按「UTF-8 字节池 + 偏移」存放（ClobVector 复用 VarcharVector
+     * 机制），不再逐值持有 ValueClob + LobDataInMemory + byte[]；装箱时才切出
+     * ValueClob。每行占用应接近内容字节数，低于逐值存放的「内容 + 约 72 B 对象开销」。
+     */
+    @Test
+    void clobColumnPacksBytesAndOffsets() {
+        ColumnarStore store = newClobStore(1000, Integer.MAX_VALUE);
+        String base = "c".repeat(500);
+        long[] ids = new long[1000];
+        for (int i = 0; i < 1000; i++) {
+            Value value = i % 7 == 0 ? ValueNull.INSTANCE : ValueClob.createSmall(base + i);
+            ids[i] = store.append(clobRow(value));
+        }
+        assertEquals(1, store.segments().size());
+        ColumnVector vector = store.segments().get(0).getColumn(0);
+        assertInstanceOf(ClobVector.class, vector);
+        long perRow = vector.getEstimatedMemory() / vector.size();
+        assertTrue(perRow < 530, "打包后每行应低于 530 B，实际 " + perRow + " B");
+        for (int i = 0; i < 1000; i++) {
+            Value actual = store.materialize(ids[i]).getValueList()[0];
+            if (i % 7 == 0) {
+                assertEquals(ValueNull.INSTANCE, actual, "第 " + i + " 行应为 NULL");
+            } else {
+                assertEquals(Value.CLOB, actual.getValueType(), "第 " + i + " 行应保持 CLOB 类型");
+                assertEquals(base + i, actual.getString());
+            }
+        }
+    }
+
+    /**
+     * 合并写回时 CLOB 值长度变化（含改成 NULL）：前缀和整体调整，未改动的行仍正确。
+     */
+    @Test
+    void compactRewritesClobWithDifferentLengths() {
+        ColumnarStore store = newClobStore(200, 1);
+        long[] ids = new long[200];
+        for (int i = 0; i < 200; i++) {
+            ids[i] = store.append(clobRow(ValueClob.createSmall("v" + i)));
+        }
+        assertEquals(1, store.segments().size());
+
+        store.update(ids[0], clobRow(ValueClob.createSmall("这是一个明显更长的值")));
+        store.update(ids[1], clobRow(ValueClob.createSmall("短")));
+        store.update(ids[2], clobRow(ValueNull.INSTANCE));
+
+        assertEquals(1, store.segments().size());
+        assertEquals("这是一个明显更长的值",
+                store.materialize(ids[0]).getValueList()[0].getString());
+        assertEquals(Value.CLOB, store.materialize(ids[0]).getValueList()[0].getValueType());
+        assertEquals("短", store.materialize(ids[1]).getValueList()[0].getString());
+        assertEquals(ValueNull.INSTANCE, store.materialize(ids[2]).getValueList()[0]);
+        assertEquals("v3", store.materialize(ids[3]).getValueList()[0].getString());
         assertEquals("v199", store.materialize(ids[199]).getValueList()[0].getString());
     }
 
