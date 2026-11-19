@@ -39,6 +39,13 @@ public final class ZoneMap {
      * @return zone map；值不可比较时返回恒相交的实例
      */
     public static ZoneMap of(ColumnVector vector, CompareMode compareMode) {
+        return of(vector, 0, vector.size(), compareMode);
+    }
+
+    /**
+     * 扫描列向量的 [from, to) 区间，供部分填充的向量（delta rowset）使用。
+     */
+    public static ZoneMap of(ColumnVector vector, int from, int to, CompareMode compareMode) {
         if (vector instanceof ArrayVector) {
             // 数组列不参与剪枝：要算出值域必须把每行的 ValueArray 重建出来再比较，
             // 而数组的值域几乎不可能用于跳过段，代价与收益不相称。
@@ -46,7 +53,7 @@ public final class ZoneMap {
         }
         Value min = null;
         Value max = null;
-        for (int i = 0, n = vector.size(); i < n; i++) {
+        for (int i = from; i < to; i++) {
             Value v = vector.get(i);
             if (v == ValueNull.INSTANCE) {
                 continue;

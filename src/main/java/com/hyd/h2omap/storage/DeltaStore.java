@@ -9,14 +9,19 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 
+import org.h2.value.CompareMode;
+import org.h2.value.TypeInfo;
 import org.h2.value.Value;
+
+import com.hyd.h2omap.stats.ZoneMap;
 
 /**
  * 行式写缓冲。列段不可变，所有点改先落在这里。
  *
  * <p>两块内容：
  * <ul>
- * <li>{@code updated}：已冻结段内的行被更新后的新像；</li>
+ * <li>{@code updated}：已冻结段内的行被更新后的新像，按列存进
+ *     {@link DeltaRowset}（位置不可变、每列带 zone map）；</li>
  * <li>{@code segmentDeletes}：已冻结段内未写回段位图的删除标记，
  *     按段组织成位图（每行 1 bit），供读路径按位判定与空段判定。</li>
  * </ul>
@@ -35,7 +40,7 @@ public final class DeltaStore {
         int count;
     }
 
-    private final Map<Long, Value[]> updated = new HashMap<>();
+    private final DeltaRowset updatedRowset;
 
     private final Map<Integer, SegmentDeleteBitmap> segmentDeletes = new HashMap<>();
 
@@ -47,10 +52,14 @@ public final class DeltaStore {
     /** 未回写删除标记总数，供合并触发判断。 */
     private int deletedTotal;
 
+    public DeltaStore(TypeInfo[] columnTypes, CompareMode compareMode) {
+        this.updatedRowset = new DeltaRowset(columnTypes, compareMode);
+    }
+
     /** 标记删除。 */
     public void markDeleted(long rowId) {
         int segmentId = RowId.segmentId(rowId);
-        updated.remove(rowId);
+        updatedRowset.remove(rowId);
         SegmentDeleteBitmap bitmap = segmentDeletes.computeIfAbsent(segmentId, k -> new SegmentDeleteBitmap());
         int offset = RowId.offset(rowId);
         if (!bitmap.bits.get(offset)) {
@@ -63,14 +72,14 @@ public final class DeltaStore {
 
     /** 记录已冻结段内行的新像。 */
     public void markUpdated(long rowId, Value[] values) {
-        updated.put(rowId, values);
+        updatedRowset.upsert(rowId, values);
         int segmentId = RowId.segmentId(rowId);
         dirtySegments.add(segmentId);
         updatedSegments.add(segmentId);
     }
 
     public boolean isEmpty() {
-        return updated.isEmpty() && segmentDeletes.isEmpty();
+        return updatedRowset.isEmpty() && segmentDeletes.isEmpty();
     }
 
     public boolean hasSegmentDelta(int segmentId) {
@@ -83,28 +92,39 @@ public final class DeltaStore {
     }
 
     public Value[] getUpdated(long rowId) {
-        return updated.get(rowId);
-    }
-
-    public boolean isSegmentRowDeleted(long rowId) {
-        SegmentDeleteBitmap bitmap = segmentDeletes.get(RowId.segmentId(rowId));
-        return bitmap != null && bitmap.bits.get(RowId.offset(rowId));
+        return updatedRowset.get(rowId);
     }
 
     public int updatedSize() {
-        return updated.size();
+        return updatedRowset.liveCount();
     }
 
     public int deletedSize() {
         return deletedTotal;
     }
 
-    public Set<Map.Entry<Long, Value[]>> updatedEntries() {
-        return updated.entrySet();
+    /** 合并第一阶段取活位置快照；位置不可变，锁外读取安全。 */
+    public int[] updatedPositions() {
+        return updatedRowset.livePositions();
     }
 
-    public Map<Long, Value[]> rawUpdated() {
-        return updated;
+    public long updatedRowIdAt(int pos) {
+        return updatedRowset.rowIdAt(pos);
+    }
+
+    /** 按不可变位置物化一行，供合并的锁外构建阶段使用。 */
+    public Value[] updatedValueAt(int pos) {
+        return updatedRowset.materializeAt(pos);
+    }
+
+    /** 全部活像物化成映射，供 checkpoint 写 tail 使用。 */
+    public Map<Long, Value[]> snapshotUpdated() {
+        return updatedRowset.snapshotEntries();
+    }
+
+    /** delta rowset 某列的 zone map，供向量化快照跳过不可能命中的新像。 */
+    public ZoneMap updatedZoneMap(int column) {
+        return updatedRowset.zoneMap(column);
     }
 
     /** 未回写删除标记按段展开，调用方持有存储锁。 */
@@ -132,6 +152,12 @@ public final class DeltaStore {
         }
     }
 
+    /** 某段未回写删除位图里的行是否被标记删除。 */
+    public boolean isSegmentRowDeleted(long rowId) {
+        SegmentDeleteBitmap bitmap = segmentDeletes.get(RowId.segmentId(rowId));
+        return bitmap != null && bitmap.bits.get(RowId.offset(rowId));
+    }
+
     /** 展开成 rowId 集合，供 checkpoint 写 tail 使用。 */
     public Set<Long> deletedRowIds() {
         Set<Long> rowIds = new HashSet<>(deletedTotal * 2);
@@ -146,26 +172,29 @@ public final class DeltaStore {
     }
 
     public void clear() {
-        updated.clear();
+        updatedRowset.clear();
         segmentDeletes.clear();
         dirtySegments.clear();
         updatedSegments.clear();
         deletedTotal = 0;
     }
 
-    /** 仅当当前值引用与快照一致时移除（防止误删锁外构建期间的新更新）。 */
-    public void removeUpdatedIfSame(long rowId, Value[] expected) {
-        if (updated.get(rowId) == expected) {
-            updated.remove(rowId);
-        }
+    /** 仅当该行仍指向快照时的位置才撤掉，防止误删合并锁外期间写入的新更新。 */
+    public void removeUpdatedIfSamePosition(long rowId, int position) {
+        updatedRowset.removeIfSamePosition(rowId, position);
+    }
+
+    /** 死位置超过半数时重排回收。调用方持有写锁。 */
+    void compactRowsetIfWasteful() {
+        updatedRowset.rebuildIfWasteful();
     }
 
     /** 精确清理部分条目后重算脏段与更新段集合。 */
     public void rebuildDirtySegments() {
         dirtySegments.clear();
         updatedSegments.clear();
-        for (long rowId : updated.keySet()) {
-            int segmentId = RowId.segmentId(rowId);
+        for (int pos : updatedRowset.livePositions()) {
+            int segmentId = RowId.segmentId(updatedRowset.rowIdAt(pos));
             dirtySegments.add(segmentId);
             updatedSegments.add(segmentId);
         }

@@ -58,7 +58,7 @@ public final class ColumnarStore {
      */
     private final TreeMap<Integer, SegmentRef> segments = new TreeMap<>();
 
-    private final DeltaStore delta = new DeltaStore();
+    private final DeltaStore delta;
 
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
@@ -79,6 +79,9 @@ public final class ColumnarStore {
     private final AtomicLong prunedSegments = new AtomicLong();
 
     private final AtomicLong orderedSkippedSegments = new AtomicLong();
+
+    /** 空位置数组：rowset 被 zone map 跳过时用它替代。 */
+    private static final int[] EMPTY_POSITIONS = new int[0];
 
     private volatile OmapPersistence persistence;
 
@@ -125,6 +128,7 @@ public final class ColumnarStore {
             columnTypes[i] = columns[i].getType();
             valueTypes[i] = columnTypes[i].getValueType();
         }
+        this.delta = new DeltaStore(columnTypes, compareMode);
         this.openSegment = new SegmentBuilder();
     }
 
@@ -308,7 +312,9 @@ public final class ColumnarStore {
             Map<Integer, ColumnSegment> baseSegments = new HashMap<>();
             Map<Integer, List<Map.Entry<Integer, Value[]>>> updatesBySeg = new HashMap<>();
             Map<Integer, List<Integer>> deletesBySeg = new HashMap<>();
-            List<Map.Entry<Long, Value[]>> updateSnap = new ArrayList<>();
+            int[] snapPositions;
+            long[] snapRowIds;
+            int snapCount = 0;
             int foldedDeletes = 0;
 
             lock.writeLock().lock();
@@ -316,17 +322,23 @@ public final class ColumnarStore {
                 if (delta.updatedSize() == 0 && delta.deletedSize() == 0) {
                     return 0;
                 }
-                for (Map.Entry<Long, Value[]> entry : delta.updatedEntries()) {
-                    long rowId = entry.getKey();
+                // 列向量只在锁内安全，第一阶段就把活像物化成不可变快照；
+                // 第三阶段按不可变位置双重比对，锁外期间的新更新不会被误删。
+                int[] positions = delta.updatedPositions();
+                snapPositions = new int[positions.length];
+                snapRowIds = new long[positions.length];
+                for (int pos : positions) {
+                    long rowId = delta.updatedRowIdAt(pos);
                     int segId = RowId.segmentId(rowId);
                     ColumnSegment seg = segment(segId);
                     if (seg != null) {
                         baseSegments.putIfAbsent(segId, seg);
                         updatesBySeg.computeIfAbsent(segId, k -> new ArrayList<>())
                                 .add(new AbstractMap.SimpleImmutableEntry<>(
-                                        RowId.offset(rowId), entry.getValue()));
-                        updateSnap.add(new AbstractMap.SimpleImmutableEntry<>(
-                                rowId, entry.getValue()));
+                                        RowId.offset(rowId), delta.updatedValueAt(pos)));
+                        snapPositions[snapCount] = pos;
+                        snapRowIds[snapCount] = rowId;
+                        snapCount++;
                     }
                 }
                 for (Map.Entry<Integer, DeltaStore.SegmentDeleteBitmap> entry : delta.segmentDeleteEntries()) {
@@ -378,12 +390,13 @@ public final class ColumnarStore {
                     }
                     delta.clearSegmentDeletes(segId);
                 }
-                for (Map.Entry<Long, Value[]> entry : updateSnap) {
-                    delta.removeUpdatedIfSame(entry.getKey(), entry.getValue());
+                for (int i = 0; i < snapCount; i++) {
+                    delta.removeUpdatedIfSamePosition(snapRowIds[i], snapPositions[i]);
                 }
                 delta.rebuildDirtySegments();
+                delta.compactRowsetIfWasteful();
                 bump();
-                compactedCount = (long) updateSnap.size() + foldedDeletes;
+                compactedCount = (long) snapCount + foldedDeletes;
             } finally {
                 lock.writeLock().unlock();
             }
@@ -418,7 +431,7 @@ public final class ColumnarStore {
             nextSegIdSnap = nextSegmentId;
             openRowsSnap = new ArrayList<>(openSegment.rawRows());
             openDeletesSnap = new HashSet<>(openDeletes);
-            deltaUpdatedSnap = new HashMap<>(delta.rawUpdated());
+            deltaUpdatedSnap = delta.snapshotUpdated();
             deltaDeletesSnap = new HashSet<>(delta.deletedRowIds());
             newWalSeq = p.rotateWal();
         } finally {
@@ -1270,6 +1283,22 @@ public final class ColumnarStore {
                     }
                 }
             }
+            List<Value[]> openRows = null;
+            int openCount = openSegment.rowCount();
+            if (openCount > 0) {
+                openRows = new ArrayList<>(openCount);
+                if (openDeletes.isEmpty()) {
+                    for (int r = 0; r < openCount; r++) {
+                        openRows.add(openSegment.rowValues(r));
+                    }
+                } else {
+                    for (int r = 0; r < openCount; r++) {
+                        if (!openDeletes.contains(RowId.ofSegment(nextSegmentId, r))) {
+                            openRows.add(openSegment.rowValues(r));
+                        }
+                    }
+                }
+            }
             List<Value[]> extra = null;
             if (!delta.isEmpty()) {
                 if (masked == null) {
@@ -1279,29 +1308,30 @@ public final class ColumnarStore {
                     masked.computeIfAbsent(entry.getKey(), k -> new BitSet())
                             .or(entry.getValue().bits);
                 }
-                extra = new ArrayList<>(delta.updatedSize() + openSegment.rowCount());
-                for (Map.Entry<Long, Value[]> entry : delta.updatedEntries()) {
-                    long rowId = entry.getKey();
+                int[] rowsetPositions = delta.updatedPositions();
+                for (int pos : rowsetPositions) {
+                    long rowId = delta.updatedRowIdAt(pos);
                     masked.computeIfAbsent(RowId.segmentId(rowId), k -> new BitSet())
                             .set(RowId.offset(rowId));
-                    extra.add(entry.getValue());
+                }
+                // 新像有自己的 zone map：与查询区间不相交时整组跳过，零物化零求值。
+                if (rowsetPositions.length > 0 && (lower != null || upper != null)
+                        && !rowsetIntersects(lower, upper)) {
+                    rowsetPositions = EMPTY_POSITIONS;
+                }
+                // 列向量只在锁内安全，这里在锁内把活像物化成不可变快照。
+                for (int pos : rowsetPositions) {
+                    if (extra == null) {
+                        extra = new ArrayList<>();
+                    }
+                    extra.add(delta.updatedValueAt(pos));
                 }
             }
-            int openCount = openSegment.rowCount();
-            if (openCount > 0) {
+            if (openRows != null) {
                 if (extra == null) {
-                    extra = new ArrayList<>(openCount);
-                }
-                if (openDeletes.isEmpty()) {
-                    for (int r = 0; r < openCount; r++) {
-                        extra.add(openSegment.rowValues(r));
-                    }
+                    extra = openRows;
                 } else {
-                    for (int r = 0; r < openCount; r++) {
-                        if (!openDeletes.contains(RowId.ofSegment(nextSegmentId, r))) {
-                            extra.add(openSegment.rowValues(r));
-                        }
-                    }
+                    extra.addAll(openRows);
                 }
             }
             return new VectorizedSnapshot(
@@ -1309,6 +1339,19 @@ public final class ColumnarStore {
         } finally {
             lock.readLock().unlock();
         }
+    }
+
+    private boolean rowsetIntersects(Value[] lower, Value[] upper) {
+        for (int c = 0; c < valueTypes.length; c++) {
+            Value low = lower == null ? null : lower[c];
+            Value high = upper == null ? null : upper[c];
+            if (low != null || high != null) {
+                if (!delta.updatedZoneMap(c).mayIntersect(low, high)) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     private ColumnSegment[] prune(ColumnSegment[] segs, Value[] lower, Value[] upper) {
