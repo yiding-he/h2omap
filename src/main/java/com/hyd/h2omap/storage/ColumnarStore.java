@@ -314,6 +314,25 @@ public final class ColumnarStore {
         }
     }
 
+    /**
+     * 运行时修改驻留预算：调小立即逐出超预算的段；调大不重启预载，由后续查询自然填驻留。
+     * evictLocked 自带预算判断：预算 0（不逐出）或未超预算时空转。
+     */
+    public void setResidentBudget(long bytes) {
+        lock.writeLock().lock();
+        try {
+            options.setResidentBytes(bytes);
+            evictLocked();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /** 当前驻留预算，0 表示不逐出。 */
+    public long getResidentBudget() {
+        return options.getResidentBytes();
+    }
+
     public void remove(long rowId) {
         boolean needCompact = false;
         lock.writeLock().lock();

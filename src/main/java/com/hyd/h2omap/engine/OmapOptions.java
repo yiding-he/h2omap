@@ -34,7 +34,9 @@ public final class OmapOptions {
     private final Boolean backup;
     private final String backupDir;
     private final int syncIntervalMs;
-    private final long residentBytes;
+
+    /** 驻留预算可被 ALTER TABLE SET RESIDENT_BYTES 运行时修改，因此非 final。 */
+    private volatile long residentBytes;
 
     private OmapOptions(int segmentSize, int compactionMinRows,
             Boolean backup, String backupDir, int syncIntervalMs, long residentBytes) {
@@ -140,9 +142,9 @@ public final class OmapOptions {
 
     /**
      * 解析字节数：纯数字按字节，可跟单位后缀 k/m/g（不区分大小写，按 1024 换算），
-     * 如 40960、40k、8g。
+     * 如 40960、40k、8g。建表 WITH 参数与 ALTER TABLE SET RESIDENT_BYTES 共用。
      */
-    private static long parseByteSize(String key, String value) {
+    public static long parseByteSize(String key, String value) {
         String s = value.trim();
         int split = 0;
         while (split < s.length() && Character.isDigit(s.charAt(split))) {
@@ -188,5 +190,10 @@ public final class OmapOptions {
     /** 冻结段驻留堆的字节预算，0 表示不逐出。 */
     public long getResidentBytes() {
         return residentBytes;
+    }
+
+    /** 运行时修改驻留预算，调用方负责保证值非负。 */
+    public void setResidentBytes(long residentBytes) {
+        this.residentBytes = residentBytes;
     }
 }

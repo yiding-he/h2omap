@@ -69,6 +69,8 @@
                 <filter>
                   <artifact>com.h2database:h2</artifact>
                   <excludes>
+                    <exclude>org/h2/command/Parser.class</exclude>
+                    <exclude>org/h2/command/Parser$*.class</exclude>
                     <exclude>org/h2/command/query/Select.class</exclude>
                     <exclude>org/h2/command/query/Select$*.class</exclude>
                     <exclude>org/h2/expression/condition/Comparison.class</exclude>

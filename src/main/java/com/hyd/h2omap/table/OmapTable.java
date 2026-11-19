@@ -46,8 +46,12 @@ public final class OmapTable extends TableBase {
 
     private final OmapPersistence persistence;
 
+    /** 与 TableBase 共享的 WITH 参数列表（同一个 ArrayList 实例）；建表时没有 WITH 子句则为 null。 */
+    private final ArrayList<String> engineParams;
+
     public OmapTable(CreateTableData data, OmapOptions options) {
         super(data);
+        this.engineParams = data.tableEngineParams;
         this.store = new ColumnarStore(getColumns(), options, getCompareMode());
         // 惰性加载由服务端启动参数决定，默认关闭。
         this.store.setLazyLoad(database.getSettings().omapLazyLoad);
@@ -67,6 +71,44 @@ public final class OmapTable extends TableBase {
                 this.persistence.initEmptyWal();
             }
         }
+    }
+
+    /**
+     * 运行时修改驻留预算并同步进建表 SQL：调小立即逐出，调大由后续查询自然填满。
+     * 持久化由命令层调 database.updateMeta 完成。
+     */
+    public void applyResidentBudget(long bytes) {
+        store.setResidentBudget(bytes);
+        if (engineParams != null) {
+            String param = "residentBytes=" + bytes;
+            for (int i = 0; i < engineParams.size(); i++) {
+                String text = engineParams.get(i);
+                if (text != null && text.trim().startsWith("residentBytes=")) {
+                    engineParams.set(i, param);
+                    return;
+                }
+            }
+            engineParams.add(param);
+        }
+    }
+
+    @Override
+    public String getCreateSQL() {
+        return appendRuntimeParams(super.getCreateSQL());
+    }
+
+    @Override
+    public String getCreateSQLForMeta() {
+        return appendRuntimeParams(super.getCreateSQLForMeta());
+    }
+
+    /** 建表时没有 WITH 子句的表，运行期新增的 residentBytes 只能在渲染结果末尾追加。 */
+    private String appendRuntimeParams(String sql) {
+        if (sql == null || engineParams != null) {
+            return sql;
+        }
+        long bytes = store.getResidentBudget();
+        return bytes == 0 ? sql : sql + "\nWITH \"residentBytes=" + bytes + '"';
     }
 
     private OmapPersistence initPersistence(CreateTableData data, OmapOptions options) {
