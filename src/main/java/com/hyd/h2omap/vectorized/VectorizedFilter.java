@@ -93,6 +93,14 @@ public final class VectorizedFilter {
          */
         default void collectBounds(Value[] lower, Value[] upper) {
         }
+
+        /**
+         * 本节点的判定语义签名，供段级部分聚合缓存复用；
+         * 形态复杂或含子查询预计算的节点保持默认 {@code null}，上层因此不缓存。
+         */
+        default String sig() {
+            return null;
+        }
     }
 
     private final Node root;
@@ -121,6 +129,15 @@ public final class VectorizedFilter {
 
     public boolean evalRow(Value[] row, SessionLocal session, CompareMode compareMode) {
         return root.evalRow(row, session, compareMode);
+    }
+
+    /** 整棵过滤树的语义签名；含不支持签名的节点（如子查询预计算）时返回 {@code null}。 */
+    public String signature() {
+        return root.sig();
+    }
+
+    private static String valueSig(Value value) {
+        return value == null ? "~" : value.getValueType() + ":" + value;
     }
 
     /**
@@ -659,6 +676,19 @@ public final class VectorizedFilter {
                 child.collectBounds(lower, upper);
             }
         }
+
+        @Override
+        public String sig() {
+            StringBuilder sb = new StringBuilder("A(");
+            for (Node child : children) {
+                String childSig = child.sig();
+                if (childSig == null) {
+                    return null;
+                }
+                sb.append(childSig).append(';');
+            }
+            return sb.append(')').toString();
+        }
     }
 
     private static final class OrNode implements Node {
@@ -730,6 +760,15 @@ public final class VectorizedFilter {
         public boolean evalRow(Value[] row, SessionLocal session, CompareMode compareMode) {
             return left.evalRow(row, session, compareMode)
                     || right.evalRow(row, session, compareMode);
+        }
+
+        @Override
+        public String sig() {
+            String leftSig = left.sig();
+            String rightSig = right.sig();
+            return leftSig == null || rightSig == null
+                    ? null
+                    : "O(" + leftSig + "|" + rightSig + ")";
         }
     }
 
@@ -1050,6 +1089,11 @@ public final class VectorizedFilter {
             return v != ValueNull.INSTANCE
                     && matchCompare(v.compareTo(constant, session, compareMode), cmpType);
         }
+
+        @Override
+        public String sig() {
+            return "C" + col + ',' + cmpType + ',' + valueSig(constant);
+        }
     }
 
     private static final class ArithLongCmpNode implements Node {
@@ -1066,6 +1110,11 @@ public final class VectorizedFilter {
             this.arithConst = arithConst;
             this.cmpType = cmpType;
             this.target = target;
+        }
+
+        @Override
+        public String sig() {
+            return "L" + col + ',' + arithOp + ',' + arithConst + ',' + cmpType + ',' + target;
         }
 
         @Override
@@ -1249,6 +1298,19 @@ public final class VectorizedFilter {
             long h = key * 0x9E3779B97F4A7C15L;
             return h ^ (h >>> 32);
         }
+
+        /** 全部元素的有序快照，供签名使用（开放寻址的槽位顺序不稳定）。 */
+        long[] values() {
+            long[] out = new long[size];
+            int p = 0;
+            for (int i = 0; i < keys.length; i++) {
+                if (used[i]) {
+                    out[p++] = keys[i];
+                }
+            }
+            java.util.Arrays.sort(out);
+            return out;
+        }
     }
 
     static final class InNode implements Node {
@@ -1270,6 +1332,20 @@ public final class VectorizedFilter {
             this.not = not;
             this.set = set;
             this.longSet = longSet;
+        }
+
+        @Override
+        public String sig() {
+            if (longSet != null) {
+                return "I" + col + ',' + not + ",long" + java.util.Arrays.toString(longSet.values());
+            }
+            String[] valueSigs = new String[set.size()];
+            int p = 0;
+            for (Value v : set) {
+                valueSigs[p++] = valueSig(v);
+            }
+            java.util.Arrays.sort(valueSigs);
+            return "I" + col + ',' + not + ',' + java.util.Arrays.toString(valueSigs);
         }
 
         @Override
@@ -1405,6 +1481,11 @@ public final class VectorizedFilter {
         }
 
         @Override
+        public String sig() {
+            return "N" + col + ',' + not;
+        }
+
+        @Override
         public int filterSegment(ColumnSegment segment, int[] sel, int selCount, boolean fullRange,
                 BitSet masked, SessionLocal session, CompareMode compareMode) {
             NullBitmap nulls = segment.getColumn(col).nulls();
@@ -1456,6 +1537,11 @@ public final class VectorizedFilter {
             this.col = col;
             this.cmpType = cmpType;
             this.target = target;
+        }
+
+        @Override
+        public String sig() {
+            return "K" + col + ',' + cmpType + ',' + target;
         }
 
         @Override
@@ -1517,6 +1603,11 @@ public final class VectorizedFilter {
             this.col = col;
             this.target = target;
             this.negate = negate;
+        }
+
+        @Override
+        public String sig() {
+            return "T" + col + ',' + valueSig(target) + ',' + negate;
         }
 
         @Override
@@ -1760,6 +1851,11 @@ public final class VectorizedFilter {
             this.pattern = pattern;
             this.escapeChar = escapeChar;
             this.negate = negate;
+        }
+
+        @Override
+        public String sig() {
+            return "W" + col + ',' + pattern + ',' + (int) escapeChar + ',' + negate;
         }
 
         private boolean matchString(String s) {

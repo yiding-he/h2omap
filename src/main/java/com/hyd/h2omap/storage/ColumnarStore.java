@@ -60,6 +60,10 @@ public final class ColumnarStore {
 
     private final DeltaStore delta;
 
+    /** 段级部分聚合缓存（MOR 批次 3）：签名 × 段的部分聚合结果。 */
+    private final com.hyd.h2omap.vectorized.SegmentAggCache aggCache =
+            new com.hyd.h2omap.vectorized.SegmentAggCache();
+
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
     private final Object compactMonitor = new Object();
@@ -130,6 +134,11 @@ public final class ColumnarStore {
         }
         this.delta = new DeltaStore(columnTypes, compareMode);
         this.openSegment = new SegmentBuilder();
+    }
+
+    /** 段级部分聚合缓存，按「签名 × 段」失效，跨段写只使被改动的段失效。 */
+    public com.hyd.h2omap.vectorized.SegmentAggCache getAggCache() {
+        return aggCache;
     }
 
     public void setPersistence(OmapPersistence persistence) {
@@ -283,6 +292,7 @@ public final class ColumnarStore {
             long old = rowCount;
             segments.clear();
             delta.clear();
+            aggCache.clear();
             openSegment.clear();
             openDeletes.clear();
             rowCount = 0;
@@ -534,6 +544,7 @@ public final class ColumnarStore {
         try {
             segments.clear();
             delta.clear();
+            aggCache.clear();
             openSegment.clear();
             openDeletes.clear();
             nextSegmentId = restoredNextSegId;
@@ -945,6 +956,7 @@ public final class ColumnarStore {
         }
         segments.remove(segmentId);
         delta.clearSegmentDeletes(segmentId);
+        aggCache.invalidateSegment(segmentId);
         bump();
     }
 
@@ -1236,11 +1248,16 @@ public final class ColumnarStore {
         public final Map<Integer, BitSet> maskedBySegment;
         public final List<Value[]> extraRows;
 
+        /** 每段的 delta 屏蔽位版本，供部分聚合缓存判定条目是否仍有效。 */
+        public final Map<Integer, Long> deltaVersions;
+
         VectorizedSnapshot(ColumnSegment[] segments,
-                Map<Integer, BitSet> maskedBySegment, List<Value[]> extraRows) {
+                Map<Integer, BitSet> maskedBySegment, List<Value[]> extraRows,
+                Map<Integer, Long> deltaVersions) {
             this.segments = segments;
             this.maskedBySegment = maskedBySegment;
             this.extraRows = extraRows;
+            this.deltaVersions = deltaVersions;
         }
     }
 
@@ -1334,8 +1351,13 @@ public final class ColumnarStore {
                     extra.addAll(openRows);
                 }
             }
+            Map<Integer, Long> versions = new HashMap<>(segs.length * 2);
+            for (ColumnSegment seg : segs) {
+                versions.put(seg.getSegmentId(), delta.segmentVersion(seg.getSegmentId()));
+            }
             return new VectorizedSnapshot(
-                    segs, masked != null ? masked : Map.of(), extra != null ? extra : List.of());
+                    segs, masked != null ? masked : Map.of(), extra != null ? extra : List.of(),
+                    versions);
         } finally {
             lock.readLock().unlock();
         }

@@ -8,6 +8,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.h2.value.CompareMode;
 import org.h2.value.TypeInfo;
@@ -49,6 +50,9 @@ public final class DeltaStore {
     /** 有未回写更新新像的段。纯删除段的 zone map 不会失真，仍可参与边界剪枝。 */
     private final Set<Integer> updatedSegments = new HashSet<>();
 
+    /** 每段的 delta 屏蔽位版本：未回写删除或更新新像变化时递增，供部分聚合缓存判定失效。 */
+    private final Map<Integer, Long> segmentVersions = new ConcurrentHashMap<>();
+
     /** 未回写删除标记总数，供合并触发判断。 */
     private int deletedTotal;
 
@@ -68,6 +72,7 @@ public final class DeltaStore {
             deletedTotal++;
         }
         dirtySegments.add(segmentId);
+        segmentVersions.merge(segmentId, 1L, Long::sum);
     }
 
     /** 记录已冻结段内行的新像。 */
@@ -76,6 +81,7 @@ public final class DeltaStore {
         int segmentId = RowId.segmentId(rowId);
         dirtySegments.add(segmentId);
         updatedSegments.add(segmentId);
+        segmentVersions.merge(segmentId, 1L, Long::sum);
     }
 
     public boolean isEmpty() {
@@ -171,11 +177,17 @@ public final class DeltaStore {
         return rowIds;
     }
 
+    /** 某段的 delta 屏蔽位版本，随未回写删除与更新新像的每次变化递增。 */
+    public long segmentVersion(int segmentId) {
+        return segmentVersions.getOrDefault(segmentId, 0L);
+    }
+
     public void clear() {
         updatedRowset.clear();
         segmentDeletes.clear();
         dirtySegments.clear();
         updatedSegments.clear();
+        segmentVersions.clear();
         deletedTotal = 0;
     }
 

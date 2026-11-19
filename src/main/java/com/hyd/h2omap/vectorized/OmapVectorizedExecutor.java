@@ -515,14 +515,22 @@ public final class OmapVectorizedExecutor {
 
         OmapTable table = (OmapTable) tableFilter.getTable();
         CompareMode compareMode = table.getCompareMode();
+
+        // 段级部分聚合缓存：多列分组暂不参与；含 DISTINCT 聚合或无签名形态时不缓存。
+        String cacheSig = groupCount <= 1
+                ? buildCacheSignature(filter, groupKeyCols, groupCount, aggSpecs)
+                : null;
+        SegmentAggCache aggCache = cacheSig != null ? table.getStore().getAggCache() : null;
+
         ColumnarStore.VectorizedSnapshot snap = takeSnapshot(table, filter, tableFilter);
 
         if (groupCount == 0) {
             executeGlobal(snap, filter, havingPred, aggSpecs, aggCount, resultColumnCount,
-                    result, session, compareMode);
+                    result, session, compareMode, aggCache, cacheSig);
         } else if (groupCount == 1) {
             executeSingleGroup(snap, filter, havingPred, groupKeyCols[0], groupResultIdxs[0],
-                    groupByCopies, aggSpecs, aggCount, resultColumnCount, result, session, compareMode);
+                    groupByCopies, aggSpecs, aggCount, resultColumnCount, result, session, compareMode,
+                    aggCache, cacheSig);
         } else {
             executeMultiGroup(snap, filter, havingPred, groupKeyCols, groupResultIdxs,
                     groupByCopies, aggSpecs, aggCount, resultColumnCount, result, session, compareMode);
@@ -655,7 +663,9 @@ public final class OmapVectorizedExecutor {
             int resultColumnCount,
             LocalResult result,
             SessionLocal session,
-            CompareMode compareMode) {
+            CompareMode compareMode,
+            SegmentAggCache aggCache,
+            String cacheSig) {
         AggState[] states = new AggState[aggCount];
         for (int a = 0; a < aggCount; a++) {
             states[a] = new AggState(specs[a]);
@@ -667,32 +677,50 @@ public final class OmapVectorizedExecutor {
             if (segCount == 0) {
                 continue;
             }
-            BitSet masked = snap.maskedBySegment.get(seg.getSegmentId());
-            if (filter == null && (masked == null || masked.isEmpty())) {
-                for (int a = 0; a < aggCount; a++) {
-                    states[a].accumulateSegmentFull(seg, segCount, session, compareMode);
+            int segId = seg.getSegmentId();
+            long segVer = snap.deltaVersions.getOrDefault(segId, 0L);
+            AggState[] partial = null;
+            if (aggCache != null) {
+                SegmentAggCache.Entry cached = aggCache.lookup(cacheSig, segId,
+                        seg.getGeneration(), segVer);
+                if (cached != null) {
+                    partial = (AggState[]) cached.partial;
                 }
-                continue;
             }
-            if (sel == null || sel.length < segCount) {
-                sel = new int[segCount];
-            }
-            int selCount;
-            if (filter != null) {
-                selCount = filter.filterSegment(seg, sel, masked, session, compareMode);
-            } else {
-                selCount = 0;
-                for (int i = 0; i < segCount; i++) {
-                    if (!masked.get(i)) {
-                        sel[selCount++] = i;
+            if (partial == null) {
+                partial = newStates(specs, aggCount);
+                BitSet masked = snap.maskedBySegment.get(segId);
+                if (filter == null && (masked == null || masked.isEmpty())) {
+                    for (int a = 0; a < aggCount; a++) {
+                        partial[a].accumulateSegmentFull(seg, segCount, session, compareMode);
+                    }
+                } else {
+                    if (sel == null || sel.length < segCount) {
+                        sel = new int[segCount];
+                    }
+                    int selCount;
+                    if (filter != null) {
+                        selCount = filter.filterSegment(seg, sel, masked, session, compareMode);
+                    } else {
+                        selCount = 0;
+                        for (int i = 0; i < segCount; i++) {
+                            if (!masked.get(i)) {
+                                sel[selCount++] = i;
+                            }
+                        }
+                    }
+                    if (selCount > 0) {
+                        for (int a = 0; a < aggCount; a++) {
+                            partial[a].accumulateSegmentSel(seg, sel, selCount, session, compareMode);
+                        }
                     }
                 }
-            }
-            if (selCount == 0) {
-                continue;
+                if (aggCache != null) {
+                    aggCache.store(cacheSig, segId, seg.getGeneration(), segVer, partial);
+                }
             }
             for (int a = 0; a < aggCount; a++) {
-                states[a].accumulateSegmentSel(seg, sel, selCount, session, compareMode);
+                states[a].merge(partial[a], session, compareMode);
             }
         }
 
@@ -733,7 +761,9 @@ public final class OmapVectorizedExecutor {
             int resultColumnCount,
             LocalResult result,
             SessionLocal session,
-            CompareMode compareMode) {
+            CompareMode compareMode,
+            SegmentAggCache aggCache,
+            String cacheSig) {
         Map<Value, AggState[]> groups = new HashMap<>();
         int[] sel = null;
 
@@ -742,53 +772,69 @@ public final class OmapVectorizedExecutor {
             if (segCount == 0) {
                 continue;
             }
-            BitSet masked = snap.maskedBySegment.get(seg.getSegmentId());
-            boolean full = filter == null && (masked == null || masked.isEmpty());
-            int selCount;
-            if (full) {
-                selCount = segCount;
-            } else {
-                if (sel == null || sel.length < segCount) {
-                    sel = new int[segCount];
+            int segId = seg.getSegmentId();
+            long segVer = snap.deltaVersions.getOrDefault(segId, 0L);
+            Map<Value, AggState[]> partial = null;
+            if (aggCache != null) {
+                SegmentAggCache.Entry cached = aggCache.lookup(cacheSig, segId,
+                        seg.getGeneration(), segVer);
+                if (cached != null) {
+                    partial = castGroupPartial(cached.partial);
                 }
-                if (filter != null) {
-                    selCount = filter.filterSegment(seg, sel, masked, session, compareMode);
+            }
+            if (partial == null) {
+                partial = new HashMap<>();
+                BitSet masked = snap.maskedBySegment.get(segId);
+                boolean full = filter == null && (masked == null || masked.isEmpty());
+                int selCount;
+                if (full) {
+                    selCount = segCount;
                 } else {
-                    selCount = 0;
-                    for (int i = 0; i < segCount; i++) {
-                        if (!masked.get(i)) {
-                            sel[selCount++] = i;
+                    if (sel == null || sel.length < segCount) {
+                        sel = new int[segCount];
+                    }
+                    if (filter != null) {
+                        selCount = filter.filterSegment(seg, sel, masked, session, compareMode);
+                    } else {
+                        selCount = 0;
+                        for (int i = 0; i < segCount; i++) {
+                            if (!masked.get(i)) {
+                                sel[selCount++] = i;
+                            }
                         }
                     }
                 }
-            }
-            if (selCount == 0) {
-                continue;
-            }
-
-            ColumnVector keyVec = seg.getColumn(groupKeyCol);
-            if (keyVec instanceof DictVarcharVector) {
-                DictVarcharVector dv = (DictVarcharVector) keyVec;
-                groupByDict(seg, dv.rawCodes(), dv.rawDict(), dv.dictSize(),
-                        sel, selCount, full, specs, aggCount, groups, session, compareMode);
-            } else if (keyVec instanceof DictValueVector) {
-                DictValueVector dv = (DictValueVector) keyVec;
-                groupByDict(seg, dv.rawCodes(), dv.rawDict(), dv.dictSize(),
-                        sel, selCount, full, specs, aggCount, groups, session, compareMode);
-            } else {
-                for (int i = 0; i < selCount; i++) {
-                    int idx = full ? i : sel[i];
-                    Value key = keyVec.get(idx);
-                    AggState[] states = groups.get(key);
-                    if (states == null) {
-                        states = newStates(specs, aggCount);
-                        groups.put(key, states);
-                    }
-                    for (int a = 0; a < aggCount; a++) {
-                        states[a].accumulateAt(seg, idx, session, compareMode);
+                if (selCount > 0) {
+                    ColumnVector keyVec = seg.getColumn(groupKeyCol);
+                    if (keyVec instanceof DictVarcharVector) {
+                        DictVarcharVector dv = (DictVarcharVector) keyVec;
+                        groupByDict(seg, dv.rawCodes(), dv.rawDict(), dv.dictSize(),
+                                sel, selCount, full, specs, aggCount, partial, session, compareMode);
+                    } else if (keyVec instanceof DictValueVector) {
+                        DictValueVector dv = (DictValueVector) keyVec;
+                        groupByDict(seg, dv.rawCodes(), dv.rawDict(), dv.dictSize(),
+                                sel, selCount, full, specs, aggCount, partial, session, compareMode);
+                    } else {
+                        for (int i = 0; i < selCount; i++) {
+                            int idx = full ? i : sel[i];
+                            Value key = keyVec.get(idx);
+                            AggState[] states = partial.get(key);
+                            if (states == null) {
+                                states = newStates(specs, aggCount);
+                                partial.put(key, states);
+                            }
+                            for (int a = 0; a < aggCount; a++) {
+                                states[a].accumulateAt(seg, idx, session, compareMode);
+                            }
+                        }
                     }
                 }
+                // 高基数分组的段级部分结果本身就太大，不缓存。
+                if (aggCache != null && partial.size() <= SegmentAggCache.MAX_GROUP_KEYS) {
+                    aggCache.store(cacheSig, segId, seg.getGeneration(), segVer, partial);
+                }
             }
+            mergeGroupPartials(groups, partial, specs, aggCount, session, compareMode);
         }
 
         for (Value[] row : snap.extraRows) {
@@ -837,6 +883,67 @@ public final class OmapVectorizedExecutor {
             }
             result.addRow(out);
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<Value, AggState[]> castGroupPartial(Object partial) {
+        return (Map<Value, AggState[]>) partial;
+    }
+
+    private static void mergeGroupPartials(Map<Value, AggState[]> groups,
+            Map<Value, AggState[]> partial, AggSpec[] specs, int aggCount,
+            SessionLocal session, CompareMode compareMode) {
+        for (Map.Entry<Value, AggState[]> entry : partial.entrySet()) {
+            AggState[] target = groups.get(entry.getKey());
+            if (target == null) {
+                target = newStates(specs, aggCount);
+                groups.put(entry.getKey(), target);
+            }
+            // 不按引用共享：partial 可能是缓存里的对象，groups 的状态随后还会被
+            // extraRows 累加，共享引用会污染缓存的部分结果。
+            AggState[] source = entry.getValue();
+            for (int a = 0; a < target.length; a++) {
+                target[a].merge(source[a], session, compareMode);
+            }
+        }
+    }
+
+    /**
+     * 构造「过滤 × 分组键 × 聚合口径」的查询签名，作为段级部分聚合缓存的键。
+     *
+     * <p>签名必须完整覆盖语义：过滤树的列、比较与常量，分组键列，每个聚合的
+     * 类型、列、算术口径与结果类型。含 DISTINCT 聚合或无签名过滤形态
+     * （子查询预计算等）时返回 {@code null}，该查询不参与缓存。
+     */
+    private static String buildCacheSignature(VectorizedFilter filter, int[] groupKeyCols,
+            int groupCount, AggSpec[] specs) {
+        String filterSig = filter == null ? "" : filter.signature();
+        if (filterSig == null) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder(filterSig).append("|g");
+        for (int g = 0; g < groupCount; g++) {
+            sb.append(groupKeyCols[g]).append(',');
+        }
+        sb.append('|');
+        for (AggSpec spec : specs) {
+            if (spec.distinct) {
+                return null;
+            }
+            sb.append(spec.type.ordinal()).append(',')
+                    .append(spec.col).append(',')
+                    .append(spec.rightCol).append(',')
+                    .append(spec.arithOp).append(',')
+                    .append(spec.colOnLeft).append(',')
+                    .append(spec.resultType.getValueType()).append(',');
+            if (spec.arithConst != null) {
+                sb.append(spec.arithConst.getValueType()).append(':')
+                        .append(spec.arithConst).append(';');
+            } else {
+                sb.append(';');
+            }
+        }
+        return sb.toString();
     }
 
     private static void executeMultiGroup(
