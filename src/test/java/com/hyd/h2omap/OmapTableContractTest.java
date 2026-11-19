@@ -338,6 +338,56 @@ class OmapTableContractTest {
     }
 
     @Test
+    void fullyDeletedSegmentDroppedAndSurvivesRestart(@TempDir Path dir) throws Exception {
+        String url = "jdbc:h2:" + dir.resolve("mordrop");
+        try (Connection first = DriverManager.getConnection(url, "sa", "")) {
+            try (Statement s = first.createStatement()) {
+                s.execute(createTable("T", "ID INT, V VARCHAR",
+                        "\"segmentSize=50\", \"compactionMinRows=100000\""));
+                try (PreparedStatement ps = first.prepareStatement(
+                        "INSERT INTO T VALUES (?, ?)")) {
+                    for (int i = 0; i < 300; i++) {
+                        ps.setInt(1, i);
+                        ps.setString(2, "v" + i);
+                        ps.addBatch();
+                    }
+                    ps.executeBatch();
+                }
+                assertEquals("300", toString(s, "SELECT COUNT(*) FROM T"));
+                // 删掉中间一整段（ID 50..99 恰为段 1），再删掉段 0 的一半（不丢段）。
+                s.execute("DELETE FROM T WHERE ID BETWEEN 50 AND 99");
+                s.execute("DELETE FROM T WHERE ID < 25");
+                assertEquals("225", toString(s, "SELECT COUNT(*) FROM T"));
+            }
+        }
+
+        // 重开：全删段在 WAL 重放后整段摘除，段号空洞保留，幸存行不受影响。
+        try (Connection second = DriverManager.getConnection(url, "sa", "")) {
+            try (Statement s = second.createStatement()) {
+                assertEquals("225", toString(s, "SELECT COUNT(*) FROM T"));
+                assertEquals("40825", toString(s, "SELECT SUM(ID) FROM T"));
+                assertEquals("v30", toString(s, "SELECT V FROM T WHERE ID = 30"));
+                assertEquals("v100", toString(s, "SELECT V FROM T WHERE ID = 100"));
+                assertEquals("0", toString(s, "SELECT COUNT(*) FROM T WHERE ID = 60"));
+                assertEquals("0", toString(s, "SELECT COUNT(*) FROM T WHERE ID = 10"));
+            }
+        }
+
+        // 再写入触发 checkpoint：被丢弃段不再进 manifest，其段文件被清理。
+        try (Connection third = DriverManager.getConnection(url, "sa", "")) {
+            try (Statement s = third.createStatement()) {
+                s.execute("INSERT INTO T SELECT ID + 300, 'w' || ID FROM T");
+                assertEquals("450", toString(s, "SELECT COUNT(*) FROM T"));
+            }
+        }
+        Path tableDir = dir.resolve("mordrop.omap/PUBLIC_T");
+        try (var files = java.nio.file.Files.list(tableDir)) {
+            assertTrue(files.noneMatch(p -> p.getFileName().toString().startsWith("seg_1_")),
+                    "被丢弃段的段文件应随 checkpoint 清理");
+        }
+    }
+
+    @Test
     void tableDefinitionSurvivesRestart(@TempDir Path dir) throws SQLException {
         String url = "jdbc:h2:" + dir.resolve("restart");
         try (Connection first = DriverManager.getConnection(url, "sa", "")) {

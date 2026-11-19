@@ -495,4 +495,68 @@ class ColumnarStoreTest {
         // 未加载段里的行按不可见处理，不能被物化。
         assertNull(target.materialize(5));
     }
+
+    /**
+     * MOR 批次 1：全删段整体丢弃，中间段丢弃后段号出现空洞，
+     * 幸存行的 rowId 与内容不变，后续合并不受影响。
+     */
+    @Test
+    void fullyDeletedSegmentsAreDroppedIndividually() {
+        ColumnarStore store = newStore(10, Integer.MAX_VALUE);
+        long[] ids = new long[40];
+        for (int i = 0; i < 40; i++) {
+            ids[i] = store.append(row(i, "v" + i));
+        }
+        assertEquals(4, store.segmentCount());
+
+        // 删掉第 0 段与第 2 段的全部行，中间段也整段丢弃。
+        for (int i = 0; i < 10; i++) {
+            store.remove(ids[i]);
+        }
+        for (int i = 20; i < 30; i++) {
+            store.remove(ids[i]);
+        }
+
+        assertEquals(2, store.segmentCount());
+        assertEquals(20, store.getRowCount());
+        assertEquals(20, store.collectVisibleRowIds(false).length);
+        assertEquals("v15", column(store.materialize(ids[15]), 1));
+        assertEquals("v39", column(store.materialize(ids[39]), 1));
+        assertNull(store.materialize(ids[5]));
+        assertNull(store.materialize(ids[25]));
+
+        // 幸存段的更新照常合并，段号空洞不影响段定位。
+        store.update(ids[15], row(15, "x"));
+        store.compact();
+        assertEquals(20, store.getRowCount());
+        assertEquals("x", column(store.materialize(ids[15]), 1));
+        assertEquals("v16", column(store.materialize(ids[16]), 1));
+    }
+
+    /**
+     * MOR 批次 1：纯删除段参与边界剪枝（删除只收窄值域，zone map 仍有效），
+     * 被删除一半的段在区间查询下不能丢幸存行。
+     */
+    @Test
+    void deleteOnlySegmentsKeepBoundsQueriesCorrect() {
+        ColumnarStore store = newStore(10, Integer.MAX_VALUE);
+        long[] ids = new long[20];
+        for (int i = 0; i < 20; i++) {
+            ids[i] = store.append(row(i, "v" + i));
+        }
+        // 两段各删一半，都有幸存行，都不丢弃。
+        for (int i = 5; i < 15; i++) {
+            store.remove(ids[i]);
+        }
+        assertEquals(2, store.segmentCount());
+
+        Value[] lower = new Value[] { ValueInteger.get(0), null };
+        long[] visible = store.collectVisibleRowIds(lower, null, false);
+        assertEquals(10, visible.length);
+        assertEquals(10, store.getRowCount());
+        assertEquals("v0", column(store.materialize(ids[0]), 1));
+        assertEquals("v19", column(store.materialize(ids[19]), 1));
+        long[] reversed = store.collectVisibleRowIds(lower, null, true);
+        assertEquals(10, reversed.length);
+    }
 }
