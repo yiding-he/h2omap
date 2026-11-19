@@ -12,6 +12,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -51,8 +52,11 @@ public final class ColumnarStore {
 
     private final CompareMode compareMode;
 
-    /** 已冻结的段，按段号升序。惰性加载时元素的 {@code loaded} 可能为 null。 */
-    private final List<SegmentRef> segments = new ArrayList<>();
+    /**
+     * 已冻结的段，按段号升序。惰性加载时元素的 {@code loaded} 可能为 null。
+     * 按段号映射而不是按下标：全删段会从中间被整体丢弃，段号不再连续。
+     */
+    private final TreeMap<Integer, SegmentRef> segments = new TreeMap<>();
 
     private final DeltaStore delta = new DeltaStore();
 
@@ -211,6 +215,7 @@ public final class ColumnarStore {
         lock.writeLock().lock();
         try {
             if (isVisible(rowId)) {
+                int segId = RowId.segmentId(rowId);
                 if (isFrozen(rowId)) {
                     delta.markDeleted(rowId);
                 } else {
@@ -219,6 +224,8 @@ public final class ColumnarStore {
                 if (countedInRowCount(rowId)) {
                     rowCount--;
                 }
+                // 全删段立即整体丢弃：rowId 空洞保留，行数已在上面逐行扣过。
+                dropSegmentIfEmpty(segId);
                 bump();
                 OmapPersistence p = persistence;
                 if (p != null) {
@@ -302,7 +309,7 @@ public final class ColumnarStore {
             Map<Integer, List<Map.Entry<Integer, Value[]>>> updatesBySeg = new HashMap<>();
             Map<Integer, List<Integer>> deletesBySeg = new HashMap<>();
             List<Map.Entry<Long, Value[]>> updateSnap = new ArrayList<>();
-            List<Long> deleteSnap = new ArrayList<>();
+            int foldedDeletes = 0;
 
             lock.writeLock().lock();
             try {
@@ -322,14 +329,19 @@ public final class ColumnarStore {
                                 rowId, entry.getValue()));
                     }
                 }
-                for (long rowId : delta.deletedRowIds()) {
-                    int segId = RowId.segmentId(rowId);
+                for (Map.Entry<Integer, DeltaStore.SegmentDeleteBitmap> entry : delta.segmentDeleteEntries()) {
+                    int segId = entry.getKey();
                     ColumnSegment seg = segment(segId);
                     if (seg != null) {
                         baseSegments.putIfAbsent(segId, seg);
-                        deletesBySeg.computeIfAbsent(segId, k -> new ArrayList<>())
-                                .add(RowId.offset(rowId));
-                        deleteSnap.add(rowId);
+                        List<Integer> offsets = deletesBySeg.computeIfAbsent(segId, k -> new ArrayList<>());
+                        for (int off = entry.getValue().bits.nextSetBit(0); off >= 0;
+                                off = entry.getValue().bits.nextSetBit(off + 1)) {
+                            if (off < seg.getRowCount()) {
+                                offsets.add(off);
+                                foldedDeletes++;
+                            }
+                        }
                     }
                 }
             } finally {
@@ -350,28 +362,28 @@ public final class ColumnarStore {
 
             lock.writeLock().lock();
             try {
-                int firstId = firstSegmentId();
                 for (Map.Entry<Integer, ColumnSegment> entry : builtSegments.entrySet()) {
                     int segId = entry.getKey();
-                    int index = segId - firstId;
-                    if (index >= 0 && index < segments.size()
-                            && segments.get(index).loaded == baseSegments.get(segId)) {
-                        SegmentRef ref = segments.get(index);
-                        ref.loaded = entry.getValue();
-                        ref.generation = entry.getValue().getGeneration();
-                    } else {
+                    SegmentRef ref = segments.get(segId);
+                    if (ref == null || ref.loaded != baseSegments.get(segId)) {
                         return 0;
                     }
+                    ColumnSegment newSeg = entry.getValue();
+                    if (newSeg.getDeletedCount() >= newSeg.getRowCount()) {
+                        // 回写后整段全删：直接丢弃，不再挂回段列表。
+                        segments.remove(segId);
+                    } else {
+                        ref.loaded = newSeg;
+                        ref.generation = newSeg.getGeneration();
+                    }
+                    delta.clearSegmentDeletes(segId);
                 }
                 for (Map.Entry<Long, Value[]> entry : updateSnap) {
                     delta.removeUpdatedIfSame(entry.getKey(), entry.getValue());
                 }
-                for (long rowId : deleteSnap) {
-                    delta.removeDeleted(rowId);
-                }
                 delta.rebuildDirtySegments();
                 bump();
-                compactedCount = (long) updateSnap.size() + deleteSnap.size();
+                compactedCount = (long) updateSnap.size() + foldedDeletes;
             } finally {
                 lock.writeLock().unlock();
             }
@@ -400,7 +412,7 @@ public final class ColumnarStore {
         lock.writeLock().lock();
         try {
             segsSnap = new ArrayList<>(segments.size());
-            for (SegmentRef ref : segments) {
+            for (SegmentRef ref : segments.values()) {
                 segsSnap.add(new SegmentMeta(ref.segmentId, ref.generation));
             }
             nextSegIdSnap = nextSegmentId;
@@ -428,7 +440,7 @@ public final class ColumnarStore {
         try {
             segments.clear();
             for (int i = 0; i < segmentIds.length; i++) {
-                segments.add(new SegmentRef(segmentIds[i], generations[i], preloaded[i]));
+                segments.put(segmentIds[i], new SegmentRef(segmentIds[i], generations[i], preloaded[i]));
             }
             nextSegmentId = restoredNextSegId;
             openSegment.clear();
@@ -487,6 +499,7 @@ public final class ColumnarStore {
         lock.writeLock().lock();
         try {
             if (isVisible(rowId)) {
+                int segId = RowId.segmentId(rowId);
                 if (isFrozen(rowId)) {
                     delta.markDeleted(rowId);
                 } else {
@@ -495,6 +508,7 @@ public final class ColumnarStore {
                 if (countedInRowCount(rowId)) {
                     rowCount--;
                 }
+                dropSegmentIfEmpty(segId);
                 bump();
             }
         } finally {
@@ -519,7 +533,7 @@ public final class ColumnarStore {
 
     private void recomputeRowCount() {
         long count = 0;
-        for (SegmentRef ref : segments) {
+        for (SegmentRef ref : segments.values()) {
             // 未加载段的行不计入，与读路径的可见性判定保持一致。
             ColumnSegment seg = ref.loaded;
             if (seg == null) {
@@ -527,10 +541,16 @@ public final class ColumnarStore {
             }
             count += visibleRowsOf(seg);
         }
-        for (long rowId : delta.deletedRowIds()) {
-            ColumnSegment seg = segment(RowId.segmentId(rowId));
-            if (seg != null && !seg.isDeleted(RowId.offset(rowId))) {
-                count--;
+        for (Map.Entry<Integer, DeltaStore.SegmentDeleteBitmap> entry : delta.segmentDeleteEntries()) {
+            ColumnSegment seg = segment(entry.getKey());
+            if (seg == null) {
+                continue;
+            }
+            for (int off = entry.getValue().bits.nextSetBit(0); off >= 0;
+                    off = entry.getValue().bits.nextSetBit(off + 1)) {
+                if (!seg.isDeleted(off)) {
+                    count--;
+                }
             }
         }
         count += openSegment.rowCount() - openDeletes.size();
@@ -700,7 +720,7 @@ public final class ColumnarStore {
     /** 供测试与合并使用。 */
     List<ColumnSegment> segments() {
         List<ColumnSegment> loaded = new ArrayList<>(segments.size());
-        for (SegmentRef ref : segments) {
+        for (SegmentRef ref : segments.values()) {
             if (ref.loaded != null) {
                 loaded.add(ref.loaded);
             }
@@ -723,7 +743,7 @@ public final class ColumnarStore {
         lock.readLock().lock();
         try {
             int n = 0;
-            for (SegmentRef ref : segments) {
+            for (SegmentRef ref : segments.values()) {
                 if (ref.loaded != null) {
                     n++;
                 }
@@ -747,11 +767,14 @@ public final class ColumnarStore {
         Map<Integer, List<Integer>> deletedOffsetsBySegment = new HashMap<>();
         lock.readLock().lock();
         try {
-            refs = segments.toArray(new SegmentRef[0]);
-            for (long rowId : delta.deletedRowIds()) {
-                deletedOffsetsBySegment
-                        .computeIfAbsent(RowId.segmentId(rowId), k -> new ArrayList<>())
-                        .add(RowId.offset(rowId));
+            refs = segments.values().toArray(new SegmentRef[0]);
+            for (Map.Entry<Integer, DeltaStore.SegmentDeleteBitmap> entry : delta.segmentDeleteEntries()) {
+                List<Integer> offsets = new ArrayList<>();
+                for (int off = entry.getValue().bits.nextSetBit(0); off >= 0;
+                        off = entry.getValue().bits.nextSetBit(off + 1)) {
+                    offsets.add(off);
+                }
+                deletedOffsetsBySegment.put(entry.getKey(), offsets);
             }
         } finally {
             lock.readLock().unlock();
@@ -790,6 +813,8 @@ public final class ColumnarStore {
                 }
             }
             rowCount += Math.max(0, added);
+            // 加载后该段可能整段已删：与写路径同一条丢弃判定。
+            dropSegmentIfEmpty(ref.segmentId);
             bump();
         } finally {
             lock.writeLock().unlock();
@@ -837,7 +862,7 @@ public final class ColumnarStore {
         }
         ColumnSegment segment = ColumnSegment.build(
                 nextSegmentId, openSegment.drain(), columnTypes, compareMode);
-        segments.add(new SegmentRef(nextSegmentId, segment.getGeneration(), segment));
+        segments.put(nextSegmentId, new SegmentRef(nextSegmentId, segment.getGeneration(), segment));
         // 段冻结后，开放段里的删除记录必须移交给 delta，否则那些行会重新可见。
         for (long rowId : openDeletes) {
             delta.markDeleted(rowId);
@@ -872,12 +897,8 @@ public final class ColumnarStore {
     }
 
     private ColumnSegment segment(int segmentId) {
-        int index = segmentId - firstSegmentId();
-        if (index < 0 || index >= segments.size()) {
-            return null;
-        }
-        // 未加载段返回 null，与“段不存在”同一条路径：读路径直接跳过该段。
-        return segments.get(index).loaded;
+        SegmentRef ref = segments.get(segmentId);
+        return ref == null ? null : ref.loaded;
     }
 
     /** 按段号取已加载的段，供 checkpoint 写盘使用。 */
@@ -891,7 +912,39 @@ public final class ColumnarStore {
     }
 
     private int firstSegmentId() {
-        return segments.isEmpty() ? nextSegmentId : segments.get(0).segmentId;
+        return segments.isEmpty() ? nextSegmentId : segments.firstKey();
+    }
+
+    /**
+     * 段内已标记删除的行数（段位图加 delta 未回写部分）达到段行数时
+     * 把整段从段列表摘除，段文件在下次 checkpoint 随 manifest 一起清理。
+     * 调用方必须已持有写锁。rowId 空洞保留，不计入任何行数调整。
+     */
+    private void dropSegmentIfEmpty(int segmentId) {
+        SegmentRef ref = segments.get(segmentId);
+        if (ref == null || ref.loaded == null) {
+            return;
+        }
+        ColumnSegment seg = ref.loaded;
+        long deleted = (long) seg.getDeletedCount() + delta.segmentDeleteCount(segmentId);
+        if (deleted < seg.getRowCount()) {
+            return;
+        }
+        segments.remove(segmentId);
+        delta.clearSegmentDeletes(segmentId);
+        bump();
+    }
+
+    /** 恢复完成后的一次性扫描：把旧版本数据里可能存在的全删段摘除。 */
+    public void dropEmptySegments() {
+        lock.writeLock().lock();
+        try {
+            for (int segId : new ArrayList<>(segments.keySet())) {
+                dropSegmentIfEmpty(segId);
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
     }
 
     private void bump() {
@@ -1150,10 +1203,10 @@ public final class ColumnarStore {
         }
 
         private boolean intersects(ColumnSegment segment) {
-            // 段的 zone map 可能落后于 delta（重开后 WAL 重放把更新放回 delta，段文件与
-            // 其中重算的 zone map 仍是合并前的；未重开时合并也会先改段后清 delta），
-            // 被剪段内的 delta 新像会随段一起丢。有 delta 改动的段不参与边界剪枝。
-            if (delta.hasSegmentDelta(segment.getSegmentId())) {
+            // 只有未回写的更新新像会让段的 zone map 失真（重开后 WAL 重放把更新放回 delta，
+            // 段文件与其中的 zone map 仍是合并前的；未重开时合并也会先改段后清 delta）。
+            // 删除只会收窄值域，不改变 zone map 的有效性，纯删除段仍参与边界剪枝。
+            if (delta.hasSegmentUpdates(segment.getSegmentId())) {
                 return true;
             }
             return ColumnarStore.intersects(segment, lower, upper, valueTypes.length);
@@ -1193,7 +1246,7 @@ public final class ColumnarStore {
         lock.readLock().lock();
         try {
             List<ColumnSegment> loadedSegments = new ArrayList<>(segments.size());
-            for (SegmentRef ref : segments) {
+            for (SegmentRef ref : segments.values()) {
                 if (ref.loaded != null) {
                     loadedSegments.add(ref.loaded);
                 }
@@ -1222,9 +1275,9 @@ public final class ColumnarStore {
                 if (masked == null) {
                     masked = new HashMap<>();
                 }
-                for (long rowId : delta.deletedRowIds()) {
-                    masked.computeIfAbsent(RowId.segmentId(rowId), k -> new BitSet())
-                            .set(RowId.offset(rowId));
+                for (Map.Entry<Integer, DeltaStore.SegmentDeleteBitmap> entry : delta.segmentDeleteEntries()) {
+                    masked.computeIfAbsent(entry.getKey(), k -> new BitSet())
+                            .or(entry.getValue().bits);
                 }
                 extra = new ArrayList<>(delta.updatedSize() + openSegment.rowCount());
                 for (Map.Entry<Long, Value[]> entry : delta.updatedEntries()) {

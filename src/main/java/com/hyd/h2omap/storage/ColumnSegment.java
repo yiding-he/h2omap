@@ -42,22 +42,26 @@ public final class ColumnSegment {
     /** 删除标记。被标记的行对读路径不可见，rowId 保留。 */
     private final NullBitmap deleted;
 
+    /** 已标记的行数，空段判定 O(1)。只在合并打标记时递增，其余不可变。 */
+    private int deletedCount;
+
     private final CompareMode compareMode;
 
     private ColumnSegment(int segmentId, int generation, int rowCount, ColumnVector[] columns,
-            ZoneMap[] zoneMaps, NullBitmap deleted, CompareMode compareMode) {
+            ZoneMap[] zoneMaps, NullBitmap deleted, int deletedCount, CompareMode compareMode) {
         this.segmentId = segmentId;
         this.generation = generation;
         this.rowCount = rowCount;
         this.columns = columns;
         this.zoneMaps = zoneMaps;
         this.deleted = deleted;
+        this.deletedCount = deletedCount;
         this.compareMode = compareMode;
     }
 
     private ColumnSegment(int segmentId, int rowCount, ColumnVector[] columns, ZoneMap[] zoneMaps,
             CompareMode compareMode) {
-        this(segmentId, 0, rowCount, columns, zoneMaps, new NullBitmap(rowCount), compareMode);
+        this(segmentId, 0, rowCount, columns, zoneMaps, new NullBitmap(rowCount), 0, compareMode);
     }
 
     public static ColumnSegment restore(int segmentId, int generation, int rowCount,
@@ -66,7 +70,13 @@ public final class ColumnSegment {
         for (int c = 0; c < columns.length; c++) {
             zones[c] = ZoneMap.of(columns[c], compareMode);
         }
-        return new ColumnSegment(segmentId, generation, rowCount, columns, zones, deleted, compareMode);
+        int count = 0;
+        for (int r = 0; r < rowCount; r++) {
+            if (deleted.isNull(r)) {
+                count++;
+            }
+        }
+        return new ColumnSegment(segmentId, generation, rowCount, columns, zones, deleted, count, compareMode);
     }
 
     /**
@@ -185,9 +195,17 @@ public final class ColumnSegment {
         return deleted.isNull(offset);
     }
 
+    /** 已标记删除的行数，空段判定用。 */
+    public int getDeletedCount() {
+        return deletedCount;
+    }
+
     /** 合并时标记某行已删除。 */
     public void markDeleted(int offset) {
-        deleted.setNull(offset);
+        if (!deleted.isNull(offset)) {
+            deleted.setNull(offset);
+            deletedCount++;
+        }
     }
 
     /** 合并时把 delta 里的新值写回本段的某一行。 */
@@ -208,17 +226,21 @@ public final class ColumnSegment {
      */
     public ColumnSegment applyDelta(List<Integer> deletedOffsets, List<Map.Entry<Integer, Value[]>> updates) {
         NullBitmap newDeleted;
+        int newDeletedCount = this.deletedCount;
         if (deletedOffsets == null || deletedOffsets.isEmpty()) {
             newDeleted = this.deleted;
         } else {
             newDeleted = this.deleted.copy();
             for (int off : deletedOffsets) {
-                newDeleted.setNull(off);
+                if (!newDeleted.isNull(off)) {
+                    newDeleted.setNull(off);
+                    newDeletedCount++;
+                }
             }
         }
         if (updates == null || updates.isEmpty()) {
             return new ColumnSegment(
-                    segmentId, generation + 1, rowCount, columns, zoneMaps, newDeleted, compareMode);
+                    segmentId, generation + 1, rowCount, columns, zoneMaps, newDeleted, newDeletedCount, compareMode);
         }
 
         ColumnVector[] newColumns = null;
@@ -265,7 +287,7 @@ public final class ColumnSegment {
 
         if (newColumns == null) {
             return new ColumnSegment(segmentId, generation + 1, rowCount, columns, zoneMaps,
-                    newDeleted, compareMode);
+                    newDeleted, newDeletedCount, compareMode);
         }
         for (int c = 0; c < columns.length; c++) {
             if (needsRebuildZone[c]) {
@@ -282,6 +304,7 @@ public final class ColumnSegment {
                 newColumns,
                 newZones != null ? newZones : zoneMaps,
                 newDeleted,
+                newDeletedCount,
                 compareMode);
     }
 

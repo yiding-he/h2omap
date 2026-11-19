@@ -175,6 +175,10 @@ public final class OmapPersistence {
                 }
             }
 
+            // WAL 重放后可能存在整段全删的段（写路径运行时已丢弃、重启后重放重现），
+            // 以及旧版本数据里合并过但未丢弃的全删段：一次性扫描摘除。
+            store.dropEmptySegments();
+
             // 打开下一序号的 WAL 接收后续写入
             openWal(maxSeq + 1);
         } catch (IOException e) {
