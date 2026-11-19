@@ -1904,6 +1904,155 @@ class OmapTableContractTest {
         }
     }
 
+    /**
+     * 随机散布写压力用例：更新、删除、插入均匀散到全部段，每轮与 MVStore 逐查询比对，
+     * 并断言无写的第二遍重复聚合命中段级部分聚合缓存。
+     * 这条用例防止后续批次把失效/回写/缓存机制窄化到「只改最老几段」的场景。
+     */
+    @Test
+    void randomSpreadWritesKeepResultsCorrect() throws Exception {
+        try (Connection c = DriverManager.getConnection(
+                "jdbc:h2:mem:omaprand;DB_CLOSE_DELAY=-1;QUERY_CACHE_SIZE=0", "sa", "");
+                Statement s = c.createStatement()) {
+            s.execute("CREATE TABLE T (ID INT PRIMARY KEY, CAT VARCHAR(8), IV INT, DV DOUBLE)"
+                    + " WITH \"segmentSize=64\", \"compactionMinRows=96\"");
+            s.execute("CREATE TABLE T_MV (ID INT PRIMARY KEY, CAT VARCHAR(8), IV INT, DV DOUBLE)"
+                    + " ENGINE \"org.h2.mvstore.db.Store\"");
+            java.util.Random rnd = new java.util.Random(20261120);
+            java.util.Set<Integer> live = new java.util.TreeSet<>();
+            for (int i = 1; i <= 512; i++) {
+                insertRandomRow(s, i, rnd);
+                live.add(i);
+            }
+            org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                    ((org.h2.jdbc.JdbcConnection) c).getSession();
+            com.hyd.h2omap.table.OmapTable table = (com.hyd.h2omap.table.OmapTable)
+                    session.getDatabase().getMainSchema().findTableOrView(session, "T");
+            com.hyd.h2omap.vectorized.SegmentAggCache cache = table.getStore().getAggCache();
+
+            String[] battery = {
+                    "SELECT COUNT(*), SUM(IV), MIN(IV), MAX(IV), AVG(IV) FROM %s WHERE IV >= 0",
+                    "SELECT CAT, COUNT(*), SUM(IV) FROM %s GROUP BY CAT ORDER BY CAT",
+                    "SELECT CAT, SUM(IV) FROM %s WHERE IV > 100 GROUP BY CAT ORDER BY CAT",
+                    "SELECT COUNT(*) FROM %s WHERE IV > 50 AND IV < 400",
+                    "SELECT DISTINCT CAT FROM %s ORDER BY CAT",
+                    "SELECT COUNT(DISTINCT CAT) FROM %s",
+            };
+            int maxId = 512;
+            for (int round = 0; round < 6; round++) {
+                java.util.List<Integer> liveList = new java.util.ArrayList<>(live);
+                for (int op = 0; op < 40; op++) {
+                    int kind = rnd.nextInt(10);
+                    int id = liveList.get(rnd.nextInt(liveList.size()));
+                    if (kind < 5) {
+                        int iv = rnd.nextInt(1000);
+                        String cat = "c" + rnd.nextInt(8);
+                        for (String t : new String[] { "T", "T_MV" }) {
+                            s.execute("UPDATE " + t + " SET IV = " + iv + ", CAT = '" + cat
+                                    + "' WHERE ID = " + id);
+                        }
+                    } else if (kind < 8) {
+                        for (String t : new String[] { "T", "T_MV" }) {
+                            s.execute("DELETE FROM " + t + " WHERE ID = " + id);
+                        }
+                        live.remove(id);
+                        liveList.remove(Integer.valueOf(id));
+                    } else {
+                        maxId++;
+                        insertRandomRow(s, maxId, rnd);
+                        live.add(maxId);
+                        liveList.add(maxId);
+                    }
+                }
+                assertQueriesMatch(s, battery);
+                long hitsAfterFill = cache.hitCount();
+                assertQueriesMatch(s, battery);
+                assertTrue(cache.hitCount() > hitsAfterFill,
+                        "无写的第二遍应命中段级部分聚合缓存，实际命中增量 "
+                                + (cache.hitCount() - hitsAfterFill));
+                // 点查走 rowId 索引与物化路径，同样逐条与 MVStore 比对。
+                for (int k = 0; k < 5; k++) {
+                    int id = liveList.get(rnd.nextInt(liveList.size()));
+                    assertEquals(toString(s, "SELECT IV, CAT FROM T_MV WHERE ID = " + id),
+                            toString(s, "SELECT IV, CAT FROM T WHERE ID = " + id));
+                }
+            }
+            assertEquals(Integer.toString(live.size()),
+                    toString(s, "SELECT COUNT(*) FROM T"));
+        }
+    }
+
+    private static void insertRandomRow(Statement s, int id, java.util.Random rnd) throws SQLException {
+        String vals = id + ", 'c" + rnd.nextInt(8) + "', " + rnd.nextInt(1000) + ", "
+                + (rnd.nextInt(2000) * 0.5);
+        s.execute("INSERT INTO T VALUES (" + vals + ")");
+        s.execute("INSERT INTO T_MV VALUES (" + vals + ")");
+    }
+
+    /**
+     * 段级逐出用例：预算 6000 字节只容得下一个段，逐出后行仍可见，
+     * 命中时同步读回；逐出顺序按访问时间而非段号新老。
+     */
+    @Test
+    void segmentEvictionKeepsRowsVisibleAndReloads(@TempDir Path dir) throws Exception {
+        String url = "jdbc:h2:" + dir.resolve("evict");
+        // 60 字符的变长列使每段估算内存稳定在约 15 KB，预算 40000 恰好容两段容不下三段；
+        // 边界相切（如 ID < 50 会连带段 1）时两段都能驻留，逐出顺序仍可判定。
+        String pad = "v".repeat(60);
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            s.execute(createTable("T", "ID INT PRIMARY KEY, V VARCHAR(64), IV INT",
+                    "\"segmentSize=50\", \"compactionMinRows=100000\", \"residentBytes=40000\""));
+            for (int i = 0; i < 400; i++) {
+                s.execute("INSERT INTO T VALUES (" + i + ", '" + pad + i + "', " + i + ")");
+            }
+            org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                    ((org.h2.jdbc.JdbcConnection) c).getSession();
+            com.hyd.h2omap.table.OmapTable table = (com.hyd.h2omap.table.OmapTable)
+                    session.getDatabase().getMainSchema().findTableOrView(session, "T");
+            com.hyd.h2omap.storage.ColumnarStore store = table.getStore();
+
+            // 400 行 = 8 个段，预算只容一段：除最新段外全部逐出。
+            assertTrue(store.getEvictedSegmentCount() >= 5, "应发生多次逐出");
+            assertTrue(store.getResidentBytes() <= 40000, "驻留字节不应超过预算");
+            assertFalse(store.isSegmentResident(0), "最老的段不应驻留");
+            assertEquals("400", toString(s, "SELECT COUNT(*) FROM T"));
+            assertEquals("79800", toString(s, "SELECT SUM(ID) FROM T"));
+
+            // 只触碰段 0（ID 0..49）：读回后段 0 驻留，且按访问时间保护，
+            // 未被访问的驻留段让位；这证明逐出按访问时间而非段号新老。
+            assertEquals("1225", toString(s, "SELECT SUM(ID) FROM T WHERE ID < 50"));
+            assertTrue(store.isSegmentResident(0), "刚被访问的段应已读回");
+            assertFalse(store.isSegmentResident(7), "未被访问的驻留段应让位");
+
+            // 再访问段 5（ID 250..299）：上一轮刚访问的段 0 比段 5 更久未访问，先让位。
+            assertEquals("13725", toString(s, "SELECT SUM(ID) FROM T WHERE ID >= 250 AND ID < 300"));
+            assertTrue(store.isSegmentResident(5));
+            assertFalse(store.isSegmentResident(0), "访问时间更早的段应先被逐出");
+
+            // 行式路径（DISTINCT）与逐出段上的点查、更新、删除。
+            assertEquals(50, countRows(s, "SELECT DISTINCT V FROM T WHERE ID >= 100 AND ID < 150"));
+            s.execute("UPDATE T SET IV = -1 WHERE ID = 125");
+            assertEquals("-1", toString(s, "SELECT IV FROM T WHERE ID = 125"));
+            s.execute("DELETE FROM T WHERE ID IN (100, 101)");
+            assertEquals("398", toString(s, "SELECT COUNT(*) FROM T"));
+        }
+        // 重启：恢复收尾把驻留裁回预算（最老先出），重开后数据与更新都完整。
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                    ((org.h2.jdbc.JdbcConnection) c).getSession();
+            com.hyd.h2omap.table.OmapTable table = (com.hyd.h2omap.table.OmapTable)
+                    session.getDatabase().getMainSchema().findTableOrView(session, "T");
+            com.hyd.h2omap.storage.ColumnarStore store = table.getStore();
+            assertFalse(store.isSegmentResident(0), "恢复后最老的段先被裁出预算");
+            assertTrue(store.isSegmentResident(7), "最新的段应驻留");
+            assertEquals("398", toString(s, "SELECT COUNT(*) FROM T"));
+            assertEquals("79599", toString(s, "SELECT SUM(ID) FROM T"));
+            assertEquals("-1", toString(s, "SELECT IV FROM T WHERE ID = 125"));
+        }
+    }
+
     private static int countRows(Statement s, String sql) throws SQLException {
         try (ResultSet rs = s.executeQuery(sql)) {
             int n = 0;
