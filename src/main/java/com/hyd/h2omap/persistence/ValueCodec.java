@@ -18,6 +18,7 @@ import org.h2.value.TypeInfo;
 import org.h2.value.Value;
 
 import com.hyd.h2omap.vector.ArrayVector;
+import com.hyd.h2omap.vector.ClobVector;
 import com.hyd.h2omap.vector.ColumnVector;
 import com.hyd.h2omap.vector.DictValueVector;
 import com.hyd.h2omap.vector.DictVarcharVector;
@@ -46,6 +47,7 @@ final class ValueCodec {
     private static final byte VEC_TIMESTAMP = 8;
 
     private static final byte VEC_ARRAY = 9;
+    private static final byte VEC_CLOB = 10;
 
     private final ValueDataType valueType;
     private final WriteBuffer writeBuffer = new WriteBuffer(4096);
@@ -114,23 +116,12 @@ final class ValueCodec {
             for (double v : arr) {
                 out.writeDouble(v);
             }
+        } else if (vec instanceof ClobVector cv) {
+            out.writeByte(VEC_CLOB);
+            writePackedText(out, cv);
         } else if (vec instanceof VarcharVector sv) {
             out.writeByte(VEC_VARCHAR);
-            NullBitmap nulls = sv.nulls();
-            writeNullBitmap(out, nulls);
-            int rows = sv.filledRows();
-            int[] starts = sv.rawStarts();
-            byte[] data = sv.rawData();
-            out.writeInt(rows);
-            for (int i = 0; i < rows; i++) {
-                if (nulls.isNull(i)) {
-                    out.writeInt(-1);
-                } else {
-                    int len = starts[i + 1] - starts[i];
-                    out.writeInt(len);
-                    out.write(data, starts[i], len);
-                }
-            }
+            writePackedText(out, sv);
         } else if (vec instanceof DictVarcharVector dv) {
             out.writeByte(VEC_DICT_VARCHAR);
             writeNullBitmap(out, dv.nulls());
@@ -195,6 +186,45 @@ final class ValueCodec {
         }
     }
 
+    /** VARCHAR 与 CLOB 共用的打包写法：null 位图 + 行数 + 每行长度加字节。 */
+    private void writePackedText(DataOutput out, VarcharVector sv) throws IOException {
+        NullBitmap nulls = sv.nulls();
+        writeNullBitmap(out, nulls);
+        int rows = sv.filledRows();
+        int[] starts = sv.rawStarts();
+        byte[] data = sv.rawData();
+        out.writeInt(rows);
+        for (int i = 0; i < rows; i++) {
+            if (nulls.isNull(i)) {
+                out.writeInt(-1);
+            } else {
+                int len = starts[i + 1] - starts[i];
+                out.writeInt(len);
+                out.write(data, starts[i], len);
+            }
+        }
+    }
+
+    /** VARCHAR 与 CLOB 共用的打包读法，返回前裁掉读缓冲尾部。 */
+    private ColumnVector readPackedText(DataInput in, NullBitmap nulls, boolean clob) throws IOException {
+        int rows = in.readInt();
+        int[] starts = new int[rows + 1];
+        byte[] data = new byte[Math.max(16, rows * 8)];
+        int pos = 0;
+        for (int i = 0; i < rows; i++) {
+            int len = in.readInt();
+            if (len >= 0) {
+                if (pos + len > data.length) {
+                    data = Arrays.copyOf(data, Math.max(pos + len, data.length * 2));
+                }
+                in.readFully(data, pos, len);
+                pos += len;
+            }
+            starts[i + 1] = pos;
+        }
+        return clob ? ClobVector.of(starts, data, nulls) : VarcharVector.of(starts, data, nulls);
+    }
+
     ColumnVector readVector(DataInput in) throws IOException {
         byte kind = in.readByte();
         NullBitmap nulls = readNullBitmap(in);
@@ -223,24 +253,10 @@ final class ValueCodec {
             }
             return DoubleVector.of(arr, nulls);
         }
-        case VEC_VARCHAR: {
-            int rows = in.readInt();
-            int[] starts = new int[rows + 1];
-            byte[] data = new byte[Math.max(16, rows * 8)];
-            int pos = 0;
-            for (int i = 0; i < rows; i++) {
-                int len = in.readInt();
-                if (len >= 0) {
-                    if (pos + len > data.length) {
-                        data = Arrays.copyOf(data, Math.max(pos + len, data.length * 2));
-                    }
-                    in.readFully(data, pos, len);
-                    pos += len;
-                }
-                starts[i + 1] = pos;
-            }
-            return VarcharVector.of(starts, data, nulls);
-        }
+        case VEC_VARCHAR:
+            return readPackedText(in, nulls, false);
+        case VEC_CLOB:
+            return readPackedText(in, nulls, true);
         case VEC_DICT_VARCHAR: {
             int dictSize = in.readInt();
             Value[] dict = new Value[dictSize];

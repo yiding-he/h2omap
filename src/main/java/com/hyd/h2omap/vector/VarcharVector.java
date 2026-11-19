@@ -14,9 +14,10 @@ import org.h2.value.ValueVarchar;
  * CHAR / VARCHAR 列：UTF-8 字节池加行偏移，不逐行持有 {@code String}。
  *
  * <p>每行占用约「长度 + 4 字节偏移」，与段文件里的写法一致；{@link #get(int)}
- * 时才解码成 {@code String} 与 {@link ValueVarchar}。
+ * 时才解码成 {@code String} 与 {@link ValueVarchar}。CLOB 列由子类
+ * {@link ClobVector} 复用同一机制，只在装箱时生成 {@code ValueClob}。
  */
-public final class VarcharVector implements ColumnVector {
+public class VarcharVector implements ColumnVector {
 
     /** 行的结束位置构成前缀和，长度是容量加一；NULL 行的起止相等。 */
     private final int[] starts;
@@ -35,7 +36,8 @@ public final class VarcharVector implements ColumnVector {
         this.nulls = new NullBitmap(capacity);
     }
 
-    private VarcharVector(int[] starts, byte[] data, int filled, NullBitmap nulls) {
+    /** 供子类 ClobVector 复用打包存储与复制。 */
+    protected VarcharVector(int[] starts, byte[] data, int filled, NullBitmap nulls) {
         this.starts = starts;
         this.data = data;
         this.filled = filled;
@@ -48,9 +50,13 @@ public final class VarcharVector implements ColumnVector {
      */
     public static VarcharVector of(int[] starts, byte[] data, NullBitmap nulls) {
         int filled = starts.length - 1;
-        int used = starts[filled];
-        byte[] trimmed = used == data.length ? data : Arrays.copyOf(data, used);
-        return new VarcharVector(starts, trimmed, filled, nulls);
+        return new VarcharVector(starts, trimToUsed(starts, data), filled, nulls);
+    }
+
+    /** 裁掉读缓冲里前缀和末尾之后的字节，供恢复入口共用。 */
+    static byte[] trimToUsed(int[] starts, byte[] data) {
+        int used = starts[starts.length - 1];
+        return used == data.length ? data : Arrays.copyOf(data, used);
     }
 
     @Override

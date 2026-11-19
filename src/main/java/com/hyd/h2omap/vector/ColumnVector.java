@@ -50,6 +50,8 @@ public interface ColumnVector {
         case Value.CHAR:
         case Value.VARCHAR:
             return new VarcharVector(capacity);
+        case Value.CLOB:
+            return new ClobVector(capacity);
         case Value.TIMESTAMP:
             return new TimestampVector(capacity);
         default:
