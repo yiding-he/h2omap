@@ -1938,6 +1938,50 @@ class OmapTableContractTest {
         }
     }
 
+    /**
+     * residentBytes 的单位后缀：k/m/g 不区分大小写，按 1024 换算；不带单位即字节；
+     * 非法后缀建表即报错。3 列表形每段约 15 KB：30k=30720 容两段容不下三段，
+     * 若被误解析为 30000 则只容一段，驻留集可以区分两者。
+     */
+    @Test
+    void residentBytesAcceptsUnitSuffixes(@TempDir Path dir) throws Exception {
+        String pad = "v".repeat(60);
+        try (Connection c = DriverManager.getConnection(
+                "jdbc:h2:" + dir.resolve("sfx"), "sa", "");
+                Statement s = c.createStatement()) {
+            // 逐出只在文件模式库生效，本用例必须建在文件库上。
+            s.execute(createTable("T_SFX", "ID INT PRIMARY KEY, V VARCHAR(64), IV INT",
+                    "\"segmentSize=50\", \"compactionMinRows=100000\", \"residentBytes=30k\""));
+            for (int i = 0; i < 200; i++) {
+                s.execute("INSERT INTO T_SFX VALUES (" + i + ", '" + pad + i + "', " + i + ")");
+            }
+            org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                    ((org.h2.jdbc.JdbcConnection) c).getSession();
+            com.hyd.h2omap.table.OmapTable t30k = (com.hyd.h2omap.table.OmapTable)
+                    session.getDatabase().getMainSchema().findTableOrView(session, "T_SFX");
+            // 30k = 30720：最新两段驻留（误解析为 30000 时只有一段驻留）。
+            assertTrue(t30k.getStore().isSegmentResident(3), "30k 应容最新两段驻留");
+            assertTrue(t30k.getStore().isSegmentResident(2), "30k 应容两段驻留，与 30000 可区分");
+            assertFalse(t30k.getStore().isSegmentResident(0), "30k 应把最老的段逐出");
+            assertEquals("200", toString(s, "SELECT COUNT(*) FROM T_SFX"));
+
+            s.execute(createTable("T_SFX2", "ID INT PRIMARY KEY, V VARCHAR(64), IV INT",
+                    "\"segmentSize=50\", \"compactionMinRows=100000\", \"residentBytes=8G\""));
+            for (int i = 0; i < 200; i++) {
+                s.execute("INSERT INTO T_SFX2 VALUES (" + i + ", '" + pad + i + "', " + i + ")");
+            }
+            com.hyd.h2omap.table.OmapTable t8g = (com.hyd.h2omap.table.OmapTable)
+                    session.getDatabase().getMainSchema().findTableOrView(session, "T_SFX2");
+            assertEquals(0, t8g.getStore().getEvictedSegmentCount(), "8G 预算下不应逐出");
+
+            // 非法后缀与缺失数字都在建表时报错，不会静默忽略。
+            assertThrows(SQLException.class, () -> s.execute(createTable("T_SFX3", "ID INT",
+                    "\"residentBytes=8x\"")));
+            assertThrows(SQLException.class, () -> s.execute(createTable("T_SFX4", "ID INT",
+                    "\"residentBytes=k\"")));
+        }
+    }
+
     private static void assertQueriesMatch(Statement s, String[] templates) throws SQLException {
         for (String template : templates) {
             String expected = collectRows(s, String.format(template, "T_MV"));
