@@ -75,6 +75,8 @@
                     <exclude>org/h2/expression/condition/Comparison$*.class</exclude>
                     <exclude>org/h2/expression/condition/ConditionInQuery.class</exclude>
                     <exclude>org/h2/expression/condition/ConditionInQuery$*.class</exclude>
+                    <exclude>org/h2/engine/DbSettings.class</exclude>
+                    <exclude>org/h2/engine/DbSettings$*.class</exclude>
                     <exclude>org/h2/schema/Schema.class</exclude>
                     <exclude>org/h2/schema/Schema$*.class</exclude>
                   </excludes>
