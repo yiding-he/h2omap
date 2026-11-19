@@ -2122,6 +2122,102 @@ class OmapTableContractTest {
         }
     }
 
+    /**
+     * ALTER TABLE SET RESIDENT_BYTES：调小立即逐出、查询仍正确（临时读）；调大由后续查询
+     * 自然填驻留（不重启预载）；改动同步进 H2 目录的建表 SQL，重开库后按新值生效。
+     */
+    @Test
+    void alterTableSetResidentBytesAppliesAndPersists(@TempDir Path dir) throws Exception {
+        String url = "jdbc:h2:" + dir.resolve("alterres");
+        String pad = "v".repeat(60);
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            s.execute(createTable("T", "ID INT PRIMARY KEY, V VARCHAR(64), IV INT",
+                    "\"segmentSize=50\", \"compactionMinRows=100000\""));
+            for (int i = 0; i < 200; i++) {
+                s.execute("INSERT INTO T VALUES (" + i + ", '" + pad + i + "', " + i + ")");
+            }
+            org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                    ((org.h2.jdbc.JdbcConnection) c).getSession();
+            com.hyd.h2omap.table.OmapTable t = (com.hyd.h2omap.table.OmapTable)
+                    session.getDatabase().getMainSchema().findTableOrView(session, "T");
+            assertTrue(t.getStore().isSegmentResident(0), "无预算时全部驻留");
+            assertTrue(t.getStore().isSegmentResident(3), "无预算时全部驻留");
+
+            // 调小到 1：立即逐出全部段。
+            s.execute("ALTER TABLE T SET RESIDENT_BYTES '1'");
+            assertFalse(t.getStore().isSegmentResident(0), "预算 1 应立即逐出");
+            assertFalse(t.getStore().isSegmentResident(3), "预算 1 应立即逐出");
+            assertEquals("200", toString(s, "SELECT COUNT(*) FROM T"));
+            assertEquals("19900", toString(s, "SELECT SUM(ID) FROM T"));
+            assertEquals("125", toString(s, "SELECT IV FROM T WHERE ID = 125"));
+            String sql = createTableSqlFromScript(s, "T");
+            assertTrue(sql.contains("residentBytes=1"), "目录 SQL 应含新预算: " + sql);
+            assertTrue(sql.contains("segmentSize=50"), "其他 WITH 参数保留: " + sql);
+
+            // 调大到 400k（= 形式）：不重启预载，由后续查询自然填驻留。
+            // 注意 COUNT(*) 在预算 1 阶段已执行过且数据未变，会命中 H2 结果缓存，
+            // 不会触碰存储层；用没执行过的新查询触发重载。
+            s.execute("ALTER TABLE T SET RESIDENT_BYTES = '400k'");
+            assertEquals("199", toString(s, "SELECT MAX(ID) FROM T"));
+            assertTrue(t.getStore().isSegmentResident(0), "400k 预算下查询后应全部驻留");
+            assertTrue(t.getStore().isSegmentResident(3), "400k 预算下查询后应全部驻留");
+            assertEquals("200", toString(s, "SELECT COUNT(*) FROM T"));
+            sql = createTableSqlFromScript(s, "T");
+            assertTrue(sql.contains("residentBytes=409600"), "单位后缀按 1024 换算: " + sql);
+        }
+        // 重开库：预算随建表 SQL 持久化，行为一致。
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            String sql = createTableSqlFromScript(s, "T");
+            assertTrue(sql.contains("residentBytes=409600"), "重开后仍应保持新预算: " + sql);
+            assertEquals("200", toString(s, "SELECT COUNT(*) FROM T"));
+            assertEquals("19900", toString(s, "SELECT SUM(ID) FROM T"));
+            assertEquals(pad + "199", toString(s, "SELECT V FROM T WHERE ID = 199"));
+        }
+    }
+
+    /**
+     * 建表时没有 WITH 子句的表：TableBase 持有不可变空参数列表，新预算只能在
+     * 渲染结果末尾追加 WITH 子句；重开后走参数列表路径，行为一致。
+     */
+    @Test
+    void alterTableSetResidentBytesWithoutWithClausePersists(@TempDir Path dir) throws Exception {
+        String url = "jdbc:h2:" + dir.resolve("alternowith");
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            s.execute(createTable("T", "ID INT PRIMARY KEY, V INT", null));
+            for (int i = 0; i < 100; i++) {
+                s.execute("INSERT INTO T VALUES (" + i + ", " + i + ")");
+            }
+            s.execute("ALTER TABLE T SET RESIDENT_BYTES '1'");
+            assertEquals("100", toString(s, "SELECT COUNT(*) FROM T"));
+            String sql = createTableSqlFromScript(s, "T");
+            assertTrue(sql.contains("residentBytes=1"), "无 WITH 子句的表也应持久化新参数: " + sql);
+        }
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            String sql = createTableSqlFromScript(s, "T");
+            assertTrue(sql.contains("residentBytes=1"), "重开后仍应保持新参数: " + sql);
+            assertEquals("100", toString(s, "SELECT COUNT(*) FROM T"));
+            assertEquals("4950", toString(s, "SELECT SUM(ID) FROM T"));
+        }
+    }
+
+    /**
+     * ALTER TABLE SET RESIDENT_BYTES 的拒绝路径：非 OMAP 表、非法后缀、NULL 值都报错；
+     * IF EXISTS 的缺失表是空操作。
+     */
+    @Test
+    void alterTableSetResidentBytesRejectsBadTargets() throws Exception {
+        execute(createTable("T", "ID INT", null));
+        execute("CREATE TABLE T_MV(ID INT) ENGINE \"org.h2.mvstore.db.Store\"");
+        assertThrows(SQLException.class, () -> execute("ALTER TABLE T_MV SET RESIDENT_BYTES '1'"));
+        assertThrows(SQLException.class, () -> execute("ALTER TABLE T SET RESIDENT_BYTES '40x'"));
+        assertThrows(SQLException.class, () -> execute("ALTER TABLE T SET RESIDENT_BYTES NULL"));
+        execute("ALTER TABLE IF EXISTS T_NOSUCH SET RESIDENT_BYTES '1'");
+    }
+
     private static void assertQueriesMatch(Statement s, String[] templates) throws SQLException {
         for (String template : templates) {
             String expected = collectRows(s, String.format(template, "T_MV"));
@@ -2301,6 +2397,20 @@ class OmapTableContractTest {
             }
         }
         return sb.toString();
+    }
+
+    /** SCRIPT 输出里找指定表的建表语句，验证 H2 目录里持久化的 SQL。 */
+    private static String createTableSqlFromScript(Statement s, String table) throws SQLException {
+        try (ResultSet rs = s.executeQuery("SCRIPT")) {
+            while (rs.next()) {
+                String row = rs.getString(1);
+                if (row != null && row.startsWith("CREATE")
+                        && (row.contains("\"" + table + "\"(") || row.contains("TABLE " + table + "("))) {
+                    return row;
+                }
+            }
+        }
+        return "";
     }
 
     private static String toString(Statement s, String sql) throws SQLException {
