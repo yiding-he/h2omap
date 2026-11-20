@@ -4,7 +4,7 @@
 
 ## 项目定位
 
-OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前端、JDBC、优化器、元数据；本项目替换表的存储与索引，并局部替换 3 个 H2 类以支撑向量化下推与默认引擎，见「对 H2 的局部替换与打包」。
+OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前端、JDBC、优化器、元数据；本项目替换表的存储与索引，并局部替换 6 个 H2 类以支撑向量化下推与默认引擎，见「对 H2 的局部替换与打包」。
 
 | 需求 | 结论 | 谁来做 |
 | --- | --- | --- |
@@ -69,7 +69,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | `org.h2.schema.Schema` | `createTable()` 增加两段判断：显式写 `ENGINE "org.h2.mvstore.db.Store"` 时清空 `data.tableEngine` 直接走 MVStore；`tableEngine == null` 且未设 `defaultTableEngine`、非开库重放（`!database.isStarting()`）、`data.id != 0`、非临时表时，默认取 `com.hyd.h2omap.engine.OmapTableEngine` |
 | `org.h2.expression.condition.Comparison` | 只新增一个 `public int getCompareType()`，供 `VectorizedFilter` 读取比较类型 |
 | `org.h2.expression.condition.ConditionInQuery` | 按 `2.5.252` 源码逐字合入，末尾新增 `getLeft()`、`isNot()`、`isAll()`、`getCompareType()` 四个访问器，供 `SubqueryFold` 读取 `IN (SELECT)` 谓词的成员 |
-| `org.h2.engine.DbSettings` | 按 `2.5.252` 源码逐字合入，加两处：构造器末尾把 `DEFAULT_TABLE_ENGINE` 的展示值写成 `com.hyd.h2omap.engine.OmapTableEngine`（`defaultTableEngine` 字段仍为 `null`，`Schema.createTable` 用它判断默认引擎路径，改的只是 `INFORMATION_SCHEMA.SETTINGS` 读的那张 map；`MV_STORE` 不动，H2 元数据确实在 MVStore 里）；新增 `public final boolean omapLazyLoad = get("OMAP_LAZY_LOAD", false)`，由服务端系统属性 `-Dh2.omapLazyLoad=true` 打开（连接串参数 `;OMAP_LAZY_LOAD=TRUE` 会被 H2 以 `Unsupported connection setting` 拒绝），库打开时读一次。开关打开后 `recover()` 只登记段的 id 与 generation，段内容由后台线程逐段读入 |
+| `org.h2.engine.DbSettings` | 按 `2.5.252` 源码逐字合入，加两处：构造器末尾把 `DEFAULT_TABLE_ENGINE` 的展示值写成 `com.hyd.h2omap.engine.OmapTableEngine`（`defaultTableEngine` 字段仍为 `null`，`Schema.createTable` 用它判断默认引擎路径，改的只是 `INFORMATION_SCHEMA.SETTINGS` 读的那张 map；`MV_STORE` 不动，H2 元数据确实在 MVStore 里）；新增 `public final boolean omapLazyLoad = get("OMAP_LAZY_LOAD", false)`，由服务端系统属性 `-Dh2.omapLazyLoad=true` 打开（连接串参数 `;OMAP_LAZY_LOAD=TRUE` 会被 H2 以 `Unsupported connection setting` 拒绝），库打开时读一次。开关打开后 `recover()` 只登记段的 id、generation 与骨架元数据，段内容由加载线程池逐段读入 |
 | `org.h2.command.Parser` | 按 `2.5.252` 源码逐字合入，只改 `parseAlterTable()` 的 `SET` 分支：先认 `RESIDENT_BYTES` 关键字就交给 `parseAlterTableSetResidentBytes()`（构造 `com.hyd.h2omap.command.OmapAlterTableSetResidentBytes`），否则保持 `parseAlterTableSet()` 原语义；其余全部逐字保留。`ParserBase` 不替换 |
 
 访问桥不替换原类，只是声明在同一个包里，用来读取包级与受保护成员：
@@ -158,11 +158,11 @@ delta rowset（Merge-on-Read 批次 2）：更新新像不再按行存放（`Map
 
 可下推的谓词：6 种 `Comparison` 比较、`BETWEEN`（`BetweenPredicate` 普通形态折叠成区间比较的 AND、`NOT BETWEEN` 折成两个取反比较的 OR，`SYMMETRIC` 与空边界交回 H2）、`AND`/`OR`（含 `ConditionAndOrN`）、`IN`、`IS NULL`/`IS NOT NULL`、`LIKE`/`NOT LIKE`、`CARDINALITY(...)`、`ARRAY_CONTAINS(数组列, 常量)`（含 `NOT`），以及比较左侧的一元与二元算术（`PLUS`、`MINUS`、`MULTIPLY`）。`ILIKE`、`REGEXP`、`= ANY(...)`/`= ALL(...)`（`ConditionInArray`）等形态交回 H2。
 
-段级剪枝：`VectorizedFilter` 从过滤条件的顶层 `AND` 合取项收集每列上下界（`ColCmpNode` 按比较类型给出，其余节点不给出），`ColumnarStore.takeVectorizedSnapshot(lower, upper)` 据此用 zone map 跳过不相交的段，任何谓词都不在被跳过的段上求值。同一列有多个合取项时只保留首次出现的界（区间取宽不取窄），因此不需要比较两个常量。
+段级剪枝：`VectorizedFilter` 从过滤条件的顶层 `AND` 合取项收集每列上下界（`ColCmpNode` 按比较类型给出，其余节点不给出），`ColumnarStore.takeVectorizedSnapshot(lower, upper, columns)` 据此用 zone map 跳过不相交的段，任何谓词都不在被跳过的段上求值。同一列有多个合取项时只保留首次出现的界（区间取宽不取窄），因此不需要比较两个常量。
 
 裸 MIN/MAX 定界：`tryExecuteGroup` 对无 `WHERE`、无 `GROUP BY`、单聚合且聚合参数为列引用的 `MIN`/`MAX` 走 `ColumnarStore.extremeColumn()`：候选段按目标方向的骨架 zone 边界排序后依次扫描，下一个段的边界已不优于当前最优值即停——时间递增数据通常扫一段即停，逐出段只读目标列，不进驻留模型。zone 边界含已删行，因此不能一次只扫全局边界最优的段（其最优行可能已删，迭代推进在任何删除形态下精确）；delta 新像与开放段的行无条件参与，扫描段内 delta 已删与已更新的旧像不参与。数组列与不可比较类型不定界，交回常规路径。
 
-逐出段的部分列读：向量化快照把「谓词列 + 聚合参数列 + 分组键 + 排序键」的列集传给 `takeVectorizedSnapshot`，拍快照不读盘——逐出段用堆上骨架构造懒加载段，行数、删除位图与 zone map 零 I/O，执行期首次读列才按段文件尾部列目录触发磁盘读取（`readSegmentColumns` → 临时 `ColumnSlice`），不进驻留模型、不触发逐出，预算稳态不被冷查询搅动，被 `canSkipSegment` 跳过或聚合缓存命中的段零读盘。无 `ORDER BY` 的 `LIMIT` 先扫驻留段与开放段/新像，驻留可见行数不足才按需读回逐出段，返回行序不再隐含段号升序（无 `ORDER BY` 时 H2 本就不保证行序）；行式路径（如 DISTINCT）经驻留通道推进到当前段时逐段读回，读回段进 LRU 由预算管理，与切片读形成对照。
+逐出段的部分列读：向量化快照把「投影列或聚合参数列 ∪ 分组键 ∪ 排序键 ∪ 谓词列」的列集传给 `takeVectorizedSnapshot`，拍快照不读盘——逐出段用堆上骨架构造懒加载段，行数、删除位图与 zone map 零 I/O，执行期首次读列才按段文件尾部列目录触发磁盘读取（`readSegmentColumns` → 临时 `ColumnSlice`），未在请求列集内的列以抛异常的 `AbsentColumnVector` 占位（意外访问显式暴露，不静默返回空值），不进驻留模型、不触发逐出，预算稳态不被冷查询搅动，被 `canSkipSegment` 跳过或聚合缓存命中的段零读盘。无 `ORDER BY` 的 `LIMIT` 先扫驻留段与开放段/新像，驻留可见行数不足才按需读回逐出段，返回行序不再隐含段号升序（无 `ORDER BY` 时 H2 本就不保证行序）；行式路径（如 DISTINCT）经驻留通道推进到当前段时逐段读回，读回段进 LRU 由预算管理，与切片读形成对照。
 
 有序模式：`ORDER BY` 单列加常量 `LIMIT` 时，段按排序列在 zone map 上的边界排序后依次扫描，用容量为 `limit + offset` 的堆留下前 N 行；堆已满且某段内最好的一行也不优于第 N 名时整段跳过。物理聚簇与排序键同向时只需扫一两段；同向不成立时结果仍正确，只是跳过不了段。多列 `ORDER BY`、排序键为表达式、`LIMIT` 缺失或超过 10000 时交回 H2。
 
@@ -204,9 +204,9 @@ manifest 与段文件都只有 v2 一种格式，旧 v1 回退分支已删除：
 
 ### 惰性加载
 
-由服务端启动参数 `-Dh2.omapLazyLoad=true` 打开，默认关闭；开关关闭时 `recover()` 与改动前完全一致（开库时读完所有段），关闭后的行为不受影响。
+由服务端启动参数 `-Dh2.omapLazyLoad=true` 打开，默认关闭；开关关闭时 `recover()` 在开库时读完所有段（M17 起经加载线程池并行读回），行为与惰性加载引入前一致。
 
-开关打开时，`recover()` 只读 `manifest.dat` 登记每段的 id、generation 与骨架元数据，段文件不读，随后 `ColumnarStore.startLazyLoading()` 的后台线程在固定并发 4（`OmapPersistence.LOAD_CONCURRENCY`）的加载线程池上按段号**倒序**加载：段号与写入顺序同向，最近写入的数据最先驻留；非惰性恢复同样经该线程池并行读回全部段，任一段读失败按段序号最小者抛出。实测 800 个段 4 万行：开库 328 → 198 ms。
+开关打开时，`recover()` 只读 `manifest.dat` 登记每段的 id、generation 与骨架元数据，段文件不读，随后 `ColumnarStore.startLazyLoading()` 在 `OmapPersistence.LOAD_CONCURRENCY`（固定 4，代码常量、无对外参数）的共享加载线程池上按段号**倒序**加载：4 个工人线程共享一个递减游标，段号与写入顺序同向，最近写入的数据最先驻留；非惰性恢复同样经该线程池并行读回全部段，任一段读失败按段序号最小者抛出。实测 800 个段 4 万行：开库 328 → 198 ms。
 
 可见性口径：骨架随 manifest 恢复后，**未加载段对全部读路径整体可见且可剪枝**——行数（骨架行数减已删行数）、删除位图与每列 zone map 都在堆上，开库第一次 `COUNT(*)` 就是全量；需要段内容的读路径（点查 `materialize`、批量 `nextBatch`、向量化快照、合并归组）按需读回。无持久化的内存库没有 manifest，未加载段整体不参与，`publishLoaded` 发布时才计入行数与递增 modificationId。预载与驻留预算（`residentBytes`）同时开启时，预载在两个条件下停止：取段前驻留量已达预算即停；本次发布触发了任何预算逐出即停（并发下预算边界最多多读「并发数 - 1」个装不下的段，此后零无效读；终驻留集与顺序预载一致，逐出永远选已加载段中 id 最小者）。全表聚合会把驻留集滚动到最近触碰的段，目标查询只读回骨架 zone map 相交的段。
 
@@ -228,7 +228,7 @@ manifest 与段文件都只有 v2 一种格式，旧 v1 回退分支已删除：
 
 `Table` 有 15 个抽象方法：`close`、`addIndex`、`removeRow`、`truncate`、`addRow`、`checkSupportAlter`、`getTableType`、`getScanIndex`、`getIndexes`、`getMaxDataModificationId`、`isDeterministic`、`canGetRowCount`、`canDrop`、`getRowCount`、`getRowCountApproximation`。
 
-`Index` 有 10 个：`close`、`add`、`remove`、`find`、`getCost`、`remove`、`truncate`、`needRebuild`、`getRowCount`、`getRowCountApproximation`。
+`Index` 有 10 个：`close`、`add`、`remove(SessionLocal, Row)`（删一行）、`find`、`getCost`、`remove(SessionLocal)`（删整个索引）、`truncate`、`needRebuild`、`getRowCount`、`getRowCountApproximation`。
 
 `Cursor` 有 4 个：`get`、`getSearchRow`、`next`、`previous`。
 
@@ -282,7 +282,7 @@ src/main/java/com/hyd/h2omap/
 ├── engine/        接入 H2：TableEngine 与 WITH 参数
 ├── table/         OmapTable，继承 TableBase
 ├── index/         扫描索引、rowId 索引、游标
-├── storage/       列段、开放段缓冲、delta、rowId 编码、延迟行
+├── storage/       列段、开放段缓冲、delta、rowId 编码、延迟行、部分列读的列切片与占位列向量
 ├── persistence/   WAL 增量日志、增量列段快照与重启恢复
 ├── vector/        列向量（含字典向量、数组列与 CLOB 打包）、ValueVector 回退、null 位图
 ├── vectorized/    单表过滤与聚合下推、谓词编译、子查询折叠（SubqueryFold）、段级部分聚合缓存（SegmentAggCache）
@@ -302,6 +302,7 @@ src/main/java/org/h2/                     被替换的 H2 类与访问桥
 src/test/java/com/hyd/h2omap/
 ├── OmapTableContractTest.java    H2 接入契约
 ├── storage/ColumnarStoreTest.java 存储层
+├── storage/SegmentFileFormatTest.java 段文件 v2 格式与部分列读
 ├── vector/ValueVectorTest.java   回退向量
 ├── persistence/ValueCodecTest.java 段向量编码往返
 └── bench/                        测试数据生成与规模验证
@@ -394,6 +395,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - 关联 `IN (SELECT ...)` 的投影为表达式时不折叠（内层投影限列引用）；关联子查询的关联键限单列等值，多关联条件、关联键为表达式、内层 `HAVING`/`GROUP BY`/`DISTINCT`/窗口、内层非 OMAP 表均回退。
 - 关联聚合预计算只接受 `COUNT(*)`/`COUNT`/`SUM`/`MIN`/`MAX`/`AVG` 且 `SUM`/`AVG` 参数为整数列；浮点与十进制求和口径、`COUNT(DISTINCT)`、聚合参数为表达式时不折叠。
 - `ILIKE`、`REGEXP` 等谓词形态未下推。
+- 锚定前缀 `LIKE 'x%'` 在向量化路径里仍逐行 `getString` 装箱后交给 `CompareLike.test`（每次加锁），未在打包字节池上直接比较前缀；`LIKE` 只参与列裁剪，不提供列值区间，因此也不参与段级剪枝，前缀查询要读全部段的该列。
 
 ## 待核对
 
