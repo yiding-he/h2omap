@@ -1738,6 +1738,91 @@ class OmapTableContractTest {
     }
 
     /**
+     * BETWEEN 谓词可下推：普通形态折叠成区间比较的 AND、NOT BETWEEN 折成 OR，
+     * 结果与 MVStore 逐查询一致；SYMMETRIC、空边界与倒置边界交回 H2 后同样正确。
+     */
+    @Test
+    void vectorizedBetweenPredicateMatchesMvStore() throws Exception {
+        execute("CREATE TABLE T (ID BIGINT PRIMARY KEY, D DATE, V INT) "
+                + "ENGINE \"" + ENGINE + "\" WITH \"segmentSize=10\"");
+        execute("CREATE TABLE T_MV (ID BIGINT PRIMARY KEY, D DATE, V INT) "
+                + "ENGINE \"org.h2.mvstore.db.Store\"");
+        for (int i = 0; i < 200; i++) {
+            // 每 5 行留一个 NULL 日：BETWEEN 与 NOT BETWEEN 对空列值的处理必须一致
+            String d = i % 5 == 0 ? "NULL" : "DATE '2026-01-" + String.format("%02d", 1 + i / 10) + "'";
+            execute("INSERT INTO T VALUES (" + i + ", " + d + ", " + i + ")");
+            execute("INSERT INTO T_MV VALUES (" + i + ", " + d + ", " + i + ")");
+        }
+
+        org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                ((org.h2.jdbc.JdbcConnection) conn).getSession();
+        com.hyd.h2omap.table.OmapTable table = (com.hyd.h2omap.table.OmapTable)
+                session.getDatabase().getMainSchema().findTableOrView(session, "T");
+        com.hyd.h2omap.storage.ColumnarStore store = table.getStore();
+
+        try (Statement s = conn.createStatement()) {
+            String unbounded = "SELECT COUNT(*) FROM %s";
+            assertEquals(toString(s, String.format(unbounded, "T_MV")),
+                    toString(s, String.format(unbounded, "T")));
+            long afterUnbounded = store.getPrunedSegmentCount();
+
+            // 窄区间 BETWEEN：应下推并剪段，结果与 MVStore 一致
+            String narrow = "SELECT COUNT(*) FROM %s "
+                    + "WHERE D BETWEEN DATE '2026-01-05' AND DATE '2026-01-08'";
+            assertEquals(toString(s, String.format(narrow, "T_MV")),
+                    toString(s, String.format(narrow, "T")));
+            assertTrue(store.getPrunedSegmentCount() > afterUnbounded,
+                    "BETWEEN 窄区间应跳过部分段，实际未跳：" + store.getPrunedSegmentCount());
+            long afterNarrow = store.getPrunedSegmentCount();
+
+            // NOT BETWEEN：与 MVStore 一致（空列值两侧都不命中）
+            String notBetween = "SELECT COUNT(*) FROM %s "
+                    + "WHERE D NOT BETWEEN DATE '2026-01-05' AND DATE '2026-01-08'";
+            assertEquals(toString(s, String.format(notBetween, "T_MV")),
+                    toString(s, String.format(notBetween, "T")));
+
+            // 两形态的并集应等于非空列值总数
+            String nonNull = "SELECT COUNT(*) FROM %s WHERE D IS NOT NULL";
+            String both = "SELECT COUNT(*) FROM %s "
+                    + "WHERE D BETWEEN DATE '2026-01-05' AND DATE '2026-01-08' "
+                    + "OR D NOT BETWEEN DATE '2026-01-05' AND DATE '2026-01-08'";
+            assertEquals(toString(s, String.format(nonNull, "T_MV")),
+                    toString(s, String.format(both, "T")));
+
+            // SYMMETRIC（含倒置边界）交回 H2 行式路径：结果仍正确
+            String symmetric = "SELECT COUNT(*) FROM %s "
+                    + "WHERE D BETWEEN SYMMETRIC DATE '2026-01-08' AND DATE '2026-01-05'";
+            assertEquals(toString(s, String.format(symmetric, "T_MV")),
+                    toString(s, String.format(symmetric, "T")));
+
+            // 倒置边界的普通 BETWEEN 是空区间；NOT BETWEEN 则恒真
+            String inverted = "SELECT COUNT(*) FROM %s "
+                    + "WHERE D BETWEEN DATE '2026-01-08' AND DATE '2026-01-05'";
+            assertEquals(toString(s, String.format(inverted, "T_MV")),
+                    toString(s, String.format(inverted, "T")));
+            String invertedNot = "SELECT COUNT(*) FROM %s "
+                    + "WHERE D NOT BETWEEN DATE '2026-01-08' AND DATE '2026-01-05'";
+            assertEquals(toString(s, String.format(nonNull, "T_MV")),
+                    toString(s, String.format(invertedNot, "T")));
+
+            // 空边界：两侧都是空结果
+            String nullBound = "SELECT COUNT(*) FROM %s "
+                    + "WHERE D BETWEEN NULL AND DATE '2026-01-08'";
+            assertEquals("0", toString(s, String.format(nullBound, "T")));
+            assertEquals("0", toString(s, String.format(nullBound, "T_MV")));
+
+            // 值下推：窄区间 BETWEEN 配合投影与排序键
+            String project = "SELECT ID, V FROM %s "
+                    + "WHERE D BETWEEN DATE '2026-01-05' AND DATE '2026-01-07' "
+                    + "AND V > 100 ORDER BY ID";
+            assertEquals(collectRows(s, String.format(project, "T_MV")),
+                    collectRows(s, String.format(project, "T")));
+            assertTrue(store.getPrunedSegmentCount() >= afterNarrow,
+                    "复合谓词不应丢失剪枝能力");
+        }
+    }
+
+    /**
      * 高基数 VARCHAR 列（段内不同值个数超过字典容量，段里存打包字节与偏移）：
      * 变长更新经合并写回、NULL、删除，重启前后都与 MVStore 逐行一致。
      */
