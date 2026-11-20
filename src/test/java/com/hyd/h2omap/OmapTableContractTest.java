@@ -2466,7 +2466,7 @@ class OmapTableContractTest {
     /**
      * 向量化查询对逐出段走部分列读：命中段不进驻留模型、不触发 LRU 逐出；
      * 全表聚合、过滤聚合、点查投影与裸 MAX 的结果与全驻留一致（含 delta 删除与更新）；
-     * 行式路径（DISTINCT）仍读回并驻留；重开后同样的查询仍正确。
+     * 行式路径（DISTINCT）经驻留通道逐段读回，扫描集超预算时先扫的段按 LRU 让位；重开后同样的查询仍正确。
      */
     @Test
     void evictedVectorizedQueriesUsePartialColumnReads(@TempDir Path dir) throws Exception {
@@ -2518,10 +2518,13 @@ class OmapTableContractTest {
             assertTrue(store.getTransientSliceReads() > sliceBefore,
                     "delta 改动后的向量化查询仍走部分列读");
 
-            // 行式路径（DISTINCT 不下推）命中的段读回并驻留，与部分列读形成对照。
-            // ID 0 与 1 已删：段 0 剩 48 行。
+            // 行式路径（DISTINCT 不下推）经驻留通道逐段读回，与部分列读形成对照：
+            // 读回段进入驻留模型由 LRU 管理，扫描集超出预算时先扫的段被后扫的段挤出，
+            // 但全程不走临时读。ID 0 与 1 已删：段 0 剩 48 行；段 2 因 delta 更新无条件参与扫描。
+            long fullBefore = store.getTransientFullReads();
             assertEquals(48, countRows(s, "SELECT DISTINCT V FROM T WHERE ID < 50"));
-            assertTrue(store.isSegmentResident(0), "行式路径仍读回并驻留");
+            assertEquals(fullBefore, store.getTransientFullReads(), "行式路径走驻留读回而非临时读");
+            assertTrue(store.isSegmentResident(2), "行式扫描最后读回的段保持驻留");
         }
         // 重开：骨架可见性不变，同样的查询仍正确。
         try (Connection c = DriverManager.getConnection(url, "sa", "");
@@ -2530,6 +2533,73 @@ class OmapTableContractTest {
             assertEquals("79799", toString(s, "SELECT SUM(ID) FROM T"));
             assertEquals("6124", toString(s, "SELECT SUM(IV) FROM T WHERE ID >= 100 AND ID < 150"));
             assertEquals("399", toString(s, "SELECT MAX(ID) FROM T"));
+        }
+    }
+
+    /**
+     * 无 ORDER BY 的 LIMIT 优先扫已驻留段：驻留段可见行数足够时零磁盘读；
+     * 不足时才按需读回逐出段补足差额（懒加载段列向量），读回不进驻留模型、不触发 LRU 逐出。
+     */
+    @Test
+    void unorderedLimitPrefersResidentSegments(@TempDir Path dir) throws Exception {
+        String url = "jdbc:h2:" + dir.resolve("unorderedlimit");
+        String pad = "v".repeat(60);
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            s.execute(createTable("T", "ID INT, V VARCHAR(64), CAT VARCHAR(8), TS TIMESTAMP",
+                    "\"segmentSize=50\", \"compactionMinRows=100000\", \"residentBytes=80000\""));
+            for (int i = 0; i < 400; i++) {
+                s.execute("INSERT INTO T VALUES (" + i + ", '" + pad + i + "', 'c" + (i % 4)
+                        + "', TIMESTAMPADD(MINUTE, " + i
+                        + ", TIMESTAMP '2026-01-01 00:00:00'))");
+            }
+            org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                    ((org.h2.jdbc.JdbcConnection) c).getSession();
+            com.hyd.h2omap.storage.ColumnarStore store =
+                    ((com.hyd.h2omap.table.OmapTable) session.getDatabase().getMainSchema()
+                            .findTableOrView(session, "T")).getStore();
+            int minResident = -1;
+            long residentRows = 0;
+            for (int seg = 0; seg <= 7; seg++) {
+                if (store.isSegmentResident(seg)) {
+                    if (minResident < 0) {
+                        minResident = seg;
+                    }
+                    residentRows += 50;
+                }
+            }
+            assertTrue(minResident > 0, "应有驻留段且最老段已逐出");
+            assertTrue(residentRows >= 100, "预算应保证至少两段驻留");
+
+            // 驻留段行数足够：零磁盘读，且返回行全部来自驻留段。
+            long sliceBefore = store.getTransientSliceReads();
+            long fullBefore = store.getTransientFullReads();
+            long evictedBefore = store.getEvictedSegmentCount();
+            try (ResultSet rs = s.executeQuery("SELECT ID FROM T LIMIT 100")) {
+                int n = 0;
+                int minId = Integer.MAX_VALUE;
+                while (rs.next()) {
+                    n++;
+                    minId = Math.min(minId, rs.getInt(1));
+                }
+                assertEquals(100, n);
+                assertTrue(minId >= minResident * 50, "LIMIT 100 全部来自驻留段");
+            }
+            assertEquals(sliceBefore, store.getTransientSliceReads(), "驻留段足够时零磁盘读");
+            assertEquals(fullBefore, store.getTransientFullReads(), "驻留段足够时零磁盘读");
+            assertEquals(evictedBefore, store.getEvictedSegmentCount(), "冷查询不触发逐出");
+
+            // 驻留行数不足：按需读回逐出段补足差额，切片读增加且读回段不进驻留模型。
+            try (ResultSet rs = s.executeQuery("SELECT ID FROM T LIMIT " + (residentRows + 50))) {
+                int n = 0;
+                while (rs.next()) {
+                    n++;
+                }
+                assertEquals((int) residentRows + 50, n);
+            }
+            assertTrue(store.getTransientSliceReads() > sliceBefore, "不足时按需读回逐出段");
+            assertFalse(store.isSegmentResident(minResident - 1), "读回段不进驻留模型");
+            assertEquals(fullBefore, store.getTransientFullReads(), "向量化路径不整段临时读");
         }
     }
 
