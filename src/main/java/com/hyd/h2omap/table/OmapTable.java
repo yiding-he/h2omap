@@ -349,6 +349,10 @@ public final class OmapTable extends TableBase {
         return store;
     }
 
+    public OmapPersistence getPersistence() {
+        return persistence;
+    }
+
     @Override
     public void close(SessionLocal session) {
         store.stopLazyLoading();

@@ -27,9 +27,14 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -66,6 +71,9 @@ public final class OmapPersistence {
     private static final Pattern WAL_PATTERN = Pattern.compile("wal_(\\d+)\\.log");
     private static final Pattern SEG_PATTERN = Pattern.compile("seg_(\\d+)_(\\d+)\\.omap");
 
+    /** 段加载线程池的并发数。 */
+    public static final int LOAD_CONCURRENCY = 4;
+
     private final Path dir;
     private final CompareMode compareMode;
     private final ValueCodec walCodec;
@@ -86,6 +94,11 @@ public final class OmapPersistence {
 
     private final ScheduledExecutorService syncExecutor;
 
+    /** 段加载线程池：恢复与惰性预载共用，首次使用时创建。 */
+    private ExecutorService loadPool;
+    /** 线程池累计执行的任务数，供测试断言批量读段确实经线程池并行执行。 */
+    private final AtomicLong poolTaskRuns = new AtomicLong();
+
     public OmapPersistence(Path dir, Database database, CompareMode compareMode, int syncIntervalMs) {
         this.dir = dir;
         this.compareMode = compareMode;
@@ -103,6 +116,33 @@ public final class OmapPersistence {
         });
         this.syncExecutor.scheduleWithFixedDelay(
                 this::syncWalQuietly, syncIntervalMs, syncIntervalMs, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * 在段加载线程池上执行一个任务。恢复与惰性预载的批量读段都经此入口，
+     * 并发数为 {@link #LOAD_CONCURRENCY}。
+     */
+    public void executeLoadTask(Runnable task) {
+        loadPool().execute(() -> {
+            poolTaskRuns.incrementAndGet();
+            task.run();
+        });
+    }
+
+    private synchronized ExecutorService loadPool() {
+        if (loadPool == null) {
+            loadPool = Executors.newFixedThreadPool(LOAD_CONCURRENCY, r -> {
+                Thread t = new Thread(r, "omap-segment-loader-" + dir.getFileName());
+                t.setDaemon(true);
+                return t;
+            });
+        }
+        return loadPool;
+    }
+
+    /** 线程池累计执行的任务数，供测试断言。 */
+    public long getPoolTaskRuns() {
+        return poolTaskRuns.get();
     }
 
     public Path getDir() {
@@ -161,10 +201,10 @@ public final class OmapPersistence {
                         if (in.readBoolean()) {
                             skeletons[i] = readSkeleton(in);
                         }
-                        if (!store.isLazyLoad()) {
-                            preloaded[i] = readSegment(segId, gen);
-                        }
                     }
+                }
+                if (!store.isLazyLoad() && segmentIds.length > 0) {
+                    loadSegmentsInParallel(segmentIds, generations, preloaded);
                 }
                 Path tailPath = dir.resolve("tail_" + manifestWalSeq + ".omap");
                 if (Files.exists(tailPath)) {
@@ -196,6 +236,53 @@ public final class OmapPersistence {
             openWal(maxSeq + 1);
         } catch (IOException e) {
             throw DbException.convertIOException(e, dir.toString());
+        }
+    }
+
+    /**
+     * 非惰性恢复：段文件在固定并发 {@link #LOAD_CONCURRENCY} 的线程池上并行读回。
+     * 任一段读失败即停止取新段，等待在途读完后抛出其中段序号最小者的异常，
+     * 与顺序恢复语义一致。
+     */
+    private void loadSegmentsInParallel(int[] segmentIds, int[] generations,
+            ColumnSegment[] preloaded) throws IOException {
+        int count = segmentIds.length;
+        AtomicInteger nextIndex = new AtomicInteger();
+        AtomicInteger failureCount = new AtomicInteger();
+        AtomicReferenceArray<IOException> failures = new AtomicReferenceArray<>(count);
+        int workers = Math.min(LOAD_CONCURRENCY, count);
+        CountDownLatch done = new CountDownLatch(workers);
+        for (int w = 0; w < workers; w++) {
+            executeLoadTask(() -> {
+                try {
+                    while (failureCount.get() == 0) {
+                        int i = nextIndex.getAndIncrement();
+                        if (i >= count) {
+                            return;
+                        }
+                        try {
+                            preloaded[i] = readSegment(segmentIds[i], generations[i]);
+                        } catch (IOException e) {
+                            failures.set(i, e);
+                            failureCount.incrementAndGet();
+                        }
+                    }
+                } finally {
+                    done.countDown();
+                }
+            });
+        }
+        try {
+            done.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("并行段加载被中断", e);
+        }
+        for (int i = 0; i < count; i++) {
+            IOException failure = failures.get(i);
+            if (failure != null) {
+                throw failure;
+            }
         }
     }
 
@@ -430,6 +517,10 @@ public final class OmapPersistence {
     public void close() {
         closed = true;
         syncExecutor.shutdownNow();
+        if (loadPool != null) {
+            loadPool.shutdownNow();
+            loadPool = null;
+        }
         synchronized (walLock) {
             if (walChannel != null) {
                 try {
