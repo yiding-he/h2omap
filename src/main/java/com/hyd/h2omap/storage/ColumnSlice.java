@@ -52,6 +52,10 @@ public final class ColumnSlice {
         return deletedCount;
     }
 
+    public NullBitmap getDeletedBitmap() {
+        return deleted;
+    }
+
     public boolean isDeleted(int row) {
         return deleted.isNull(row);
     }

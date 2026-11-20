@@ -1052,6 +1052,11 @@ final class SubqueryFold {
         }
 
         @Override
+        public void collectColumns(java.util.function.IntConsumer sink) {
+            sink.accept(keyCol);
+        }
+
+        @Override
         public int filterSegment(ColumnSegment segment, int[] sel, int selCount, boolean fullRange,
                 BitSet masked, SessionLocal session, CompareMode compareMode) {
             ColumnVector keyVec = segment.getColumn(keyCol);
@@ -1179,6 +1184,12 @@ final class SubqueryFold {
             this.sets = sets;
             this.outerKeyType = outerKeyType;
             this.longValues = longValues;
+        }
+
+        @Override
+        public void collectColumns(java.util.function.IntConsumer sink) {
+            sink.accept(keyCol);
+            sink.accept(valCol);
         }
 
         @Override
@@ -1405,6 +1416,12 @@ final class SubqueryFold {
             this.defaultCmp = emptyDefault == ValueNull.INSTANCE
                     ? new FastCmp(0, OP_NEVER)
                     : new FastCmp(emptyDefault.getLong(), cmpType);
+        }
+
+        @Override
+        public void collectColumns(java.util.function.IntConsumer sink) {
+            sink.accept(keyCol);
+            sink.accept(cmpCol);
         }
 
         private static Map<Object, FastCmp> buildFast(Map<Object, Value> results, TypeInfo cmpColType,

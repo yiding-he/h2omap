@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.TreeSet;
 
 import org.h2.command.query.QueryOrderBy;
 import org.h2.engine.SessionLocal;
@@ -124,7 +125,6 @@ public final class OmapVectorizedExecutor {
         }
 
         OmapTable table = (OmapTable) tableFilter.getTable();
-        ColumnarStore.VectorizedSnapshot snap = takeSnapshot(table, filter, tableFilter);
         CompareMode compareMode = table.getCompareMode();
         long emitted = 0;
 
@@ -152,6 +152,23 @@ public final class OmapVectorizedExecutor {
             projToUnique[i] = found;
         }
         ColumnVector[] colVecs = new ColumnVector[uniqueCount];
+
+        // 有序模式的排序键：预解析进请求列集；形态不合法时 executeOrdered 会自行回退。
+        int preSortCol = -1;
+        if (sortOrder != null) {
+            List<QueryOrderBy> orderList = sortOrder.getOrderList();
+            int[] sortTypes = sortOrder.getSortTypesWithNullOrdering();
+            if (orderList != null && orderList.size() == 1 && sortTypes != null && sortTypes.length == 1) {
+                preSortCol = VectorizedFilter.resolveColumn(orderList.get(0).expression, tableFilter);
+            }
+        }
+
+        // 部分列读：逐出段只读投影列与谓词列（有序模式另含排序键）。
+        int[] snapshotColumns = unionColumns(
+                Arrays.copyOf(uniqueProjCols, uniqueCount),
+                new int[] { preSortCol },
+                filter != null ? filter.referencedColumns() : null);
+        ColumnarStore.VectorizedSnapshot snap = takeSnapshot(table, filter, tableFilter, snapshotColumns);
 
         if (sortOrder != null) {
             return executeOrdered(session, snap, filter, sortOrder, tableFilter, projCols, projConsts,
@@ -522,7 +539,35 @@ public final class OmapVectorizedExecutor {
                 : null;
         SegmentAggCache aggCache = cacheSig != null ? table.getStore().getAggCache() : null;
 
-        ColumnarStore.VectorizedSnapshot snap = takeSnapshot(table, filter, tableFilter);
+        // 裸 MIN/MAX 单列无谓词：骨架 zone map 定界求值，只扫可能持有最优值的段，
+        // 逐出段仅读目标列；列类型或瞬态不支持时交回下方常规向量化路径。
+        if (filter == null && havingPred == null && groupCount == 0 && aggCount == 1) {
+            AggSpec spec = aggSpecs[0];
+            if (!spec.distinct && spec.arithOp == null
+                    && (spec.type == AggregateType.MIN || spec.type == AggregateType.MAX)) {
+                ColumnarStore.ExtremeValue extreme = table.getStore()
+                        .extremeColumn(spec.col, spec.type == AggregateType.MIN, session);
+                if (extreme.supported) {
+                    Value[] out = new Value[resultColumnCount];
+                    if (spec.outIdx >= 0 && spec.outIdx < resultColumnCount) {
+                        out[spec.outIdx] = extreme.value != null
+                                ? extreme.value : ValueNull.INSTANCE;
+                    }
+                    result.addRow(out);
+                    return true;
+                }
+            }
+        }
+
+        // 部分列读：逐出段只读分组键、聚合参数列与谓词列。
+        int[] aggColumns = new int[aggCount * 2];
+        for (int a = 0; a < aggCount; a++) {
+            aggColumns[a * 2] = aggSpecs[a].col;
+            aggColumns[a * 2 + 1] = aggSpecs[a].rightCol;
+        }
+        int[] snapshotColumns = unionColumns(groupKeyCols, aggColumns,
+                filter != null ? filter.referencedColumns() : null);
+        ColumnarStore.VectorizedSnapshot snap = takeSnapshot(table, filter, tableFilter, snapshotColumns);
 
         if (groupCount == 0) {
             executeGlobal(snap, filter, havingPred, aggSpecs, aggCount, resultColumnCount,
@@ -539,19 +584,40 @@ public final class OmapVectorizedExecutor {
     }
 
     /**
-     * 取向量化快照，并把过滤条件给出的列值区间交给存储层按段剪枝。
+     * 取向量化快照，并把过滤条件给出的列值区间交给存储层按段剪枝；
+     * 逐出段按请求列集做部分列读，不进驻留模型。
      *
      * <p>区间只由顶层 {@code AND} 的合取项给出，与合取项的排列顺序无关，
      * 所以不可能命中的段在任何谓词开始求值之前就被跳过。
      */
     private static ColumnarStore.VectorizedSnapshot takeSnapshot(OmapTable table, VectorizedFilter filter,
-            TableFilter tableFilter) {
+            TableFilter tableFilter, int[] columns) {
         ColumnarStore store = table.getStore();
         if (filter == null) {
-            return store.takeVectorizedSnapshot();
+            return store.takeVectorizedSnapshot(null, null, columns);
         }
         Value[][] bounds = filter.segmentBounds(tableFilter.getTable().getColumns().length);
-        return store.takeVectorizedSnapshot(bounds[0], bounds[1]);
+        return store.takeVectorizedSnapshot(bounds[0], bounds[1], columns);
+    }
+
+    /** 部分列读的请求列集：并集升序，负值（常量或无排序键）忽略。 */
+    private static int[] unionColumns(int[]... sets) {
+        TreeSet<Integer> all = new TreeSet<>();
+        for (int[] set : sets) {
+            if (set != null) {
+                for (int c : set) {
+                    if (c >= 0) {
+                        all.add(c);
+                    }
+                }
+            }
+        }
+        int[] result = new int[all.size()];
+        int i = 0;
+        for (int c : all) {
+            result[i++] = c;
+        }
+        return result;
     }
 
     private static boolean qualifyIndexCheck(List<Expression> expressions, int resultColumnCount, int havingIndex) {

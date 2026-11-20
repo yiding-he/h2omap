@@ -10,6 +10,8 @@ import java.util.BitSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.TreeSet;
+import java.util.function.IntConsumer;
 
 import org.h2.command.query.Query;
 import org.h2.command.query.Select;
@@ -101,6 +103,14 @@ public final class VectorizedFilter {
         default String sig() {
             return null;
         }
+
+        /**
+         * 收集本节点求值时会读取的表列，供快照部分列读确定请求列集。
+         *
+         * <p>漏收集的列在快照段里是占位向量，意外访问会抛异常而不是静默错值。
+         */
+        default void collectColumns(IntConsumer sink) {
+        }
     }
 
     private final Node root;
@@ -152,6 +162,18 @@ public final class VectorizedFilter {
         Value[] upper = new Value[columnCount];
         root.collectBounds(lower, upper);
         return new Value[][] { lower, upper };
+    }
+
+    /** 快照部分列读的请求列集：过滤树求值会读取的全部表列，升序去重。 */
+    public int[] referencedColumns() {
+        TreeSet<Integer> columns = new TreeSet<>();
+        root.collectColumns(columns::add);
+        int[] result = new int[columns.size()];
+        int i = 0;
+        for (int c : columns) {
+            result[i++] = c;
+        }
+        return result;
     }
 
     /** 编译过滤表达式；不支持时返回 {@code null}。 */
@@ -646,6 +668,13 @@ public final class VectorizedFilter {
         }
 
         @Override
+        public void collectColumns(IntConsumer sink) {
+            for (Node child : children) {
+                child.collectColumns(sink);
+            }
+        }
+
+        @Override
         public int filterSegment(ColumnSegment segment, int[] sel, int selCount, boolean fullRange,
                 BitSet masked, SessionLocal session, CompareMode compareMode) {
             int count = selCount;
@@ -698,6 +727,12 @@ public final class VectorizedFilter {
         OrNode(Node left, Node right) {
             this.left = left;
             this.right = right;
+        }
+
+        @Override
+        public void collectColumns(IntConsumer sink) {
+            left.collectColumns(sink);
+            right.collectColumns(sink);
         }
 
         @Override
@@ -774,6 +809,11 @@ public final class VectorizedFilter {
 
     private static final class ColCmpNode implements Node {
         private final int col;
+
+        @Override
+        public void collectColumns(IntConsumer sink) {
+            sink.accept(col);
+        }
         private final int cmpType;
         private final Value constant;
 
@@ -1098,6 +1138,11 @@ public final class VectorizedFilter {
 
     private static final class ArithLongCmpNode implements Node {
         private final int col;
+
+        @Override
+        public void collectColumns(IntConsumer sink) {
+            sink.accept(col);
+        }
         private final BinaryOperation.OpType arithOp;
         private final long arithConst;
         private final int cmpType;
@@ -1315,6 +1360,11 @@ public final class VectorizedFilter {
 
     static final class InNode implements Node {
         private final int col;
+
+        @Override
+        public void collectColumns(IntConsumer sink) {
+            sink.accept(col);
+        }
         private final boolean not;
         private final Set<Value> set;
         private final LongSet longSet;
@@ -1473,6 +1523,11 @@ public final class VectorizedFilter {
 
     private static final class NullCheckNode implements Node {
         private final int col;
+
+        @Override
+        public void collectColumns(IntConsumer sink) {
+            sink.accept(col);
+        }
         private final boolean not;
 
         NullCheckNode(int col, boolean not) {
@@ -1530,6 +1585,11 @@ public final class VectorizedFilter {
 
     private static final class CardinalityCmpNode implements Node {
         private final int col;
+
+        @Override
+        public void collectColumns(IntConsumer sink) {
+            sink.accept(col);
+        }
         private final int cmpType;
         private final int target;
 
@@ -1596,6 +1656,11 @@ public final class VectorizedFilter {
 
     private static final class ArrayContainsNode implements Node {
         private final int col;
+
+        @Override
+        public void collectColumns(IntConsumer sink) {
+            sink.accept(col);
+        }
         private final Value target;
         private final boolean negate;
 
@@ -1840,6 +1905,11 @@ public final class VectorizedFilter {
 
     private static final class LikeNode implements Node {
         private final int col;
+
+        @Override
+        public void collectColumns(IntConsumer sink) {
+            sink.accept(col);
+        }
         private final CompareLike like;
         private final String pattern;
         private final char escapeChar;

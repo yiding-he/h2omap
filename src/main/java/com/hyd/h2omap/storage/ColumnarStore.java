@@ -17,6 +17,7 @@ import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
+import org.h2.engine.SessionLocal;
 import org.h2.result.Row;
 import org.h2.table.Column;
 import org.h2.value.CompareMode;
@@ -28,6 +29,7 @@ import org.h2.value.ValueNull;
 import com.hyd.h2omap.engine.OmapOptions;
 import com.hyd.h2omap.persistence.OmapPersistence;
 import com.hyd.h2omap.stats.ZoneMap;
+import com.hyd.h2omap.vector.ColumnVector;
 import com.hyd.h2omap.vector.NullBitmap;
 
 /**
@@ -86,6 +88,15 @@ public final class ColumnarStore {
     private final AtomicLong prunedSegments = new AtomicLong();
 
     private final AtomicLong orderedSkippedSegments = new AtomicLong();
+
+    /** 裸 MIN/MAX 定界实际扫描的候选段数累计值，供测试断言命中即停。 */
+    private final AtomicLong extremeScanned = new AtomicLong();
+
+    /** 向量化快照命中逐出段时部分列读的累计次数，供测试断言切片读生效。 */
+    private final AtomicLong sliceTransientReads = new AtomicLong();
+
+    /** 整段临时读的累计次数（预算容不下单段的行式回退与合并读回），供测试断言不误走整段读。 */
+    private final AtomicLong fullTransientReads = new AtomicLong();
 
     /** 空位置数组：rowset 被 zone map 跳过时用它替代。 */
     private static final int[] EMPTY_POSITIONS = new int[0];
@@ -1262,6 +1273,7 @@ public final class ColumnarStore {
 
     /** 读一份段内容供当次迭代使用，不回写驻留状态；仅批量路径预读后又被并发逐出的窗口使用。 */
     private ColumnSegment readSegmentTransient(SegmentRef ref) {
+        fullTransientReads.incrementAndGet();
         OmapPersistence p = persistence;
         if (p == null || ref.skeleton == null) {
             return null;
@@ -1272,6 +1284,39 @@ public final class ColumnarStore {
             throw new IllegalStateException(
                     "逐出段读回失败: seg_" + ref.segmentId + "_" + ref.generation, e);
         }
+    }
+
+    /**
+     * 逐出段的部分列读：按尾部列目录只读请求列，拼成只在快照内使用的段对象。
+     *
+     * <p>未请求的列以抛异常的占位向量与恒相交的 zone map 填充，意外访问会显式暴露；
+     * 读盘失败时回退整段读，保证可用性优先。
+     */
+    private ColumnSegment readSliceTransient(SegmentRef ref, int[] columns) {
+        sliceTransientReads.incrementAndGet();
+        OmapPersistence p = persistence;
+        if (p == null || ref.skeleton == null) {
+            return null;
+        }
+        ColumnSlice slice;
+        try {
+            slice = p.readSegmentColumns(ref.segmentId, ref.generation, columns);
+        } catch (IOException e) {
+            return readSegmentTransient(ref);
+        }
+        int colCount = valueTypes.length;
+        ColumnVector[] vectors = new ColumnVector[colCount];
+        ZoneMap[] zones = new ZoneMap[colCount];
+        for (int c = 0; c < colCount; c++) {
+            vectors[c] = AbsentColumnVector.INSTANCE;
+            zones[c] = ZoneMap.restore(null, null, compareMode);
+        }
+        for (int c : columns) {
+            vectors[c] = slice.getVector(c);
+            zones[c] = slice.getZoneMap(c);
+        }
+        return ColumnSegment.restore(ref.segmentId, ref.generation, slice.getRowCount(),
+                vectors, zones, slice.getDeletedBitmap(), slice.getDeletedCount(), compareMode);
     }
 
     /** 按段号取已加载的段，供 checkpoint 写盘使用。 */
@@ -1712,7 +1757,11 @@ public final class ColumnarStore {
     }
 
     public VectorizedSnapshot takeVectorizedSnapshot() {
-        return takeVectorizedSnapshot(null, null);
+        return takeVectorizedSnapshot(null, null, null);
+    }
+
+    public VectorizedSnapshot takeVectorizedSnapshot(Value[] lower, Value[] upper) {
+        return takeVectorizedSnapshot(lower, upper, null);
     }
 
     /**
@@ -1720,10 +1769,13 @@ public final class ColumnarStore {
      *
      * @param lower 每列下界，null 元素表示该列无下界；null 表示不剪枝
      * @param upper 每列上界，null 元素表示该列无上界；null 表示不剪枝
+     * @param columns 部分列读的请求列集（列号升序），null 表示逐出段整段读回（旧语义）
      * @return 快照，{@code segments} 只含可能与区间相交的段
      */
-    public VectorizedSnapshot takeVectorizedSnapshot(Value[] lower, Value[] upper) {
-        reloadEvictedForSnapshot(lower, upper);
+    public VectorizedSnapshot takeVectorizedSnapshot(Value[] lower, Value[] upper, int[] columns) {
+        if (columns == null) {
+            reloadEvictedForSnapshot(lower, upper);
+        }
         lock.readLock().lock();
         try {
             List<ColumnSegment> loadedSegments = new ArrayList<>(segments.size());
@@ -1731,7 +1783,9 @@ public final class ColumnarStore {
                 ColumnSegment seg = ref.loaded;
                 if (seg == null && ref.skeleton != null && refNeeded(ref, lower, upper)) {
                     // 预读后又被预算逐出：读一份仅供本次快照，不回写驻留状态。
-                    seg = readSegmentTransient(ref);
+                    seg = columns != null
+                            ? readSliceTransient(ref, columns)
+                            : readSegmentTransient(ref);
                 }
                 if (seg != null) {
                     loadedSegments.add(seg);
@@ -1812,9 +1866,10 @@ public final class ColumnarStore {
                 versions.put(seg.getSegmentId(), delta.segmentVersion(seg.getSegmentId()));
             }
             // 剪枝后实际参与扫描的段记一次访问，供 LRU 逐出排序。
+            // 部分列读不进驻留模型：只触碰本来驻留的段，逐出段保持逐出。
             for (ColumnSegment seg : segs) {
                 SegmentRef ref = segments.get(seg.getSegmentId());
-                if (ref != null) {
+                if (ref != null && (columns == null || ref.loaded != null)) {
                     touchRef(ref);
                 }
             }
@@ -1833,6 +1888,181 @@ public final class ColumnarStore {
         }
         return delta.hasSegmentUpdates(ref.segmentId)
                 || skeletonIntersects(ref.skeleton, lower, upper);
+    }
+
+    /** 裸 MIN/MAX 定界求值的结果；supported=false 表示形态不支持，交回常规向量化路径。 */
+    public static final class ExtremeValue {
+
+        public final boolean supported;
+
+        public final Value value;
+
+        private ExtremeValue(boolean supported, Value value) {
+            this.supported = supported;
+            this.value = value;
+        }
+
+        static ExtremeValue unsupported() {
+            return new ExtremeValue(false, null);
+        }
+
+        static ExtremeValue of(Value value) {
+            return new ExtremeValue(true, value);
+        }
+    }
+
+    /** 裸 MIN/MAX 只对可比较标量列定界；数组、CLOB、几何等类型交回常规路径。 */
+    private static boolean comparableForExtreme(int type) {
+        switch (type) {
+        case Value.TINYINT:
+        case Value.SMALLINT:
+        case Value.INTEGER:
+        case Value.BIGINT:
+        case Value.REAL:
+        case Value.DOUBLE:
+        case Value.NUMERIC:
+        case Value.BOOLEAN:
+        case Value.CHAR:
+        case Value.VARCHAR:
+        case Value.VARCHAR_IGNORECASE:
+        case Value.DATE:
+        case Value.TIME:
+        case Value.TIME_TZ:
+        case Value.TIMESTAMP:
+        case Value.TIMESTAMP_TZ:
+        case Value.UUID:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    /** 目标方向的候选段：zone 边界与当前最优值，边界为 null 的段不参与。 */
+    private static final class ExtremeCandidate {
+
+        final SegmentRef ref;
+
+        final Value bound;
+
+        ExtremeCandidate(SegmentRef ref, Value bound) {
+            this.ref = ref;
+            this.bound = bound;
+        }
+    }
+
+    /**
+     * 裸 MIN/MAX 的定界求值：段按目标方向的 zone 边界排序后依次扫描，
+     * 当下一个段的边界已不优于当前最优值时停止——后续段的可见值不可能更优。
+     *
+     * <p>zone 边界是含已删行的下界（MIN 方向），因此不能一次性只扫全局边界最小的段：
+     * 该段的最小行可能已被删，真实最优值会落到边界更大的段里。逐段推进在任何删除
+     * 形态下都精确，时间递增数据通常扫一段即停。逐出段只读目标列，不进驻留模型。
+     *
+     * @return 目标列的最优可见值；全空或无行时为 null（与 H2 裸 MIN/MAX 语义一致）
+     */
+    public ExtremeValue extremeColumn(int columnId, boolean min, SessionLocal session) {
+        if (columnId < 0 || columnId >= valueTypes.length
+                || !comparableForExtreme(valueTypes[columnId])) {
+            return ExtremeValue.unsupported();
+        }
+        lock.readLock().lock();
+        try {
+            List<ExtremeCandidate> candidates = new ArrayList<>(segments.size());
+            for (SegmentRef ref : segments.values()) {
+                ZoneMap zone = ref.loaded != null ? ref.loaded.getZoneMap(columnId)
+                        : ref.skeleton != null ? ref.skeleton.zoneMaps[columnId] : null;
+                if (zone == null) {
+                    // 驻留与骨架都是 null 的瞬态不在既有不变式内，交回常规路径。
+                    return ExtremeValue.unsupported();
+                }
+                Value bound = min ? zone.getMin() : zone.getMax();
+                if (bound == null || bound == ValueNull.INSTANCE) {
+                    // 全 null 列的段不贡献非空值；类型门控已排除不可比较列。
+                    continue;
+                }
+                candidates.add(new ExtremeCandidate(ref, bound));
+            }
+            candidates.sort((x, y) -> {
+                int cmp = x.bound.compareTo(y.bound, session, compareMode);
+                return min ? cmp : -cmp;
+            });
+            Value best = null;
+            for (ExtremeCandidate candidate : candidates) {
+                if (best != null) {
+                    int cmp = candidate.bound.compareTo(best, session, compareMode);
+                    if (min ? cmp >= 0 : cmp <= 0) {
+                        break;
+                    }
+                }
+                best = scanSegmentExtreme(candidate.ref, columnId, min, best, session);
+            }
+            // delta 新像与开放段的行无条件参与，数量以合并阈值为上界。
+            for (int pos : delta.updatedPositions()) {
+                best = pickExtreme(delta.updatedValueAt(pos)[columnId], min, best, session);
+            }
+            int openCount = openSegment.rowCount();
+            for (int r = 0; r < openCount; r++) {
+                if (!openDeletes.contains(RowId.ofSegment(nextSegmentId, r))) {
+                    best = pickExtreme(openSegment.rowValues(r)[columnId], min, best, session);
+                }
+            }
+            return ExtremeValue.of(best);
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    private Value pickExtreme(Value v, boolean min, Value best, SessionLocal session) {
+        if (v == null || v == ValueNull.INSTANCE) {
+            return best;
+        }
+        if (best == null) {
+            return v;
+        }
+        int cmp = v.compareTo(best, session, compareMode);
+        return (min ? cmp < 0 : cmp > 0) ? v : best;
+    }
+
+    /** 扫描一个候选段的目标列可见行，逐出段只读该列；返回更新后的最优值。 */
+    private Value scanSegmentExtreme(SegmentRef ref, int columnId, boolean min, Value best,
+            SessionLocal session) {
+        extremeScanned.incrementAndGet();
+        ColumnSegment seg = ref.loaded;
+        ColumnVector vec;
+        int rowCount;
+        ColumnSlice slice = null;
+        if (seg != null) {
+            vec = seg.getColumn(columnId);
+            rowCount = seg.getRowCount();
+        } else {
+            OmapPersistence p = persistence;
+            if (p == null || ref.skeleton == null) {
+                throw new IllegalStateException(
+                        "逐出段无读回通道: seg_" + ref.segmentId + "_" + ref.generation);
+            }
+            try {
+                slice = p.readSegmentColumns(ref.segmentId, ref.generation, new int[] { columnId });
+            } catch (IOException e) {
+                throw new IllegalStateException(
+                        "逐出段读回失败: seg_" + ref.segmentId + "_" + ref.generation, e);
+            }
+            vec = slice.getVector(columnId);
+            rowCount = slice.getRowCount();
+        }
+        boolean hasDelta = delta.hasSegmentDelta(ref.segmentId);
+        for (int r = 0; r < rowCount; r++) {
+            if (seg != null ? seg.isDeleted(r) : slice.isDeleted(r)) {
+                continue;
+            }
+            if (hasDelta) {
+                long rowId = RowId.ofSegment(ref.segmentId, r);
+                if (delta.isSegmentRowDeleted(rowId) || delta.getUpdated(rowId) != null) {
+                    continue;
+                }
+            }
+            best = pickExtreme(vec.get(r), min, best, session);
+        }
+        return best;
     }
 
     /**
@@ -1933,6 +2163,21 @@ public final class ColumnarStore {
     /** 被段级 zone map 剪掉的段数累计值，供测试断言剪枝确实生效。 */
     public long getPrunedSegmentCount() {
         return prunedSegments.get();
+    }
+
+    /** 裸 MIN/MAX 定界实际扫描的候选段数累计值，供测试断言命中即停。 */
+    public long getExtremeScannedSegments() {
+        return extremeScanned.get();
+    }
+
+    /** 向量化快照命中逐出段时部分列读的累计次数，供测试断言切片读生效。 */
+    public long getTransientSliceReads() {
+        return sliceTransientReads.get();
+    }
+
+    /** 整段临时读的累计次数，供测试断言向量化路径不误走整段读。 */
+    public long getTransientFullReads() {
+        return fullTransientReads.get();
     }
 
     /** 有序扫描中因段内最好一行不优于第 N 名而整段跳过的段数，供测试断言早停生效。 */
