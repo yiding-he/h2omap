@@ -4,6 +4,7 @@
 package com.hyd.h2omap.persistence;
 
 import java.io.DataInput;
+import java.io.DataInputStream;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -317,6 +318,225 @@ final class ValueCodec {
         }
         default:
             throw new IOException("Unknown vector kind: " + kind);
+        }
+    }
+
+    /**
+     * 从内存缓冲解码一个列向量：{@code blockLen} 是该列块的总字节数。
+     * 原始数组用 {@link ByteBuffer} 视图一次批量拷贝，替代逐元素的同步单字节拼接；
+     * 打包文本按「剩余字节数 - rows*4」一次精确分配，零扩容。
+     */
+    ColumnVector readVector(ByteBuffer buf, int blockLen) throws IOException {
+        final int blockStart = buf.position();
+        byte kind = buf.get();
+        NullBitmap nulls = readNullBitmap(buf);
+        switch (kind) {
+        case VEC_INT: {
+            int len = buf.getInt();
+            return IntVector.of(readInts(buf, len), nulls);
+        }
+        case VEC_LONG: {
+            int len = buf.getInt();
+            return LongVector.of(readLongs(buf, len), nulls);
+        }
+        case VEC_DOUBLE: {
+            int len = buf.getInt();
+            double[] arr = new double[len];
+            if (len > 0) {
+                buf.asDoubleBuffer().get(arr);
+                buf.position(buf.position() + len * 8);
+            }
+            return DoubleVector.of(arr, nulls);
+        }
+        case VEC_VARCHAR:
+        case VEC_CLOB:
+            return readPackedText(buf, blockLen - (buf.position() - blockStart),
+                    kind == VEC_CLOB, nulls);
+        case VEC_DICT_VARCHAR:
+        case VEC_DICT_VALUE: {
+            DataInput vin = new BufferInput(buf);
+            int dictSize = vin.readInt();
+            Value[] dict = new Value[dictSize];
+            for (int i = 0; i < dictSize; i++) {
+                dict[i] = readValue(vin);
+            }
+            int len = buf.getInt();
+            int[] codes = readInts(buf, len);
+            return kind == VEC_DICT_VARCHAR
+                    ? DictVarcharVector.of(codes, dict, nulls)
+                    : DictValueVector.of(codes, dict, nulls);
+        }
+        case VEC_TIMESTAMP: {
+            // 落盘布局按行交错（date、nano、date、nano…），批量读也按交错次序取。
+            int len = buf.getInt();
+            long[] dates = new long[len];
+            long[] nanos = new long[len];
+            if (len > 0) {
+                java.nio.LongBuffer lb = buf.asLongBuffer();
+                for (int i = 0; i < len; i++) {
+                    dates[i] = lb.get();
+                    nanos[i] = lb.get();
+                }
+                buf.position(buf.position() + len * 16);
+            }
+            return TimestampVector.of(dates, nanos, nulls);
+        }
+        case VEC_ARRAY: {
+            DataInput vin = new BufferInput(buf);
+            int componentValueType = vin.readInt();
+            long precision = vin.readLong();
+            int scale = vin.readInt();
+            int rowCount = vin.readInt();
+            int[] starts = readInts(buf, rowCount + 1);
+            ColumnVector elements = readVector(buf, blockLen - (buf.position() - blockStart));
+            return ArrayVector.of(
+                    TypeInfo.getTypeInfo(componentValueType, precision, scale, null),
+                    starts, elements, nulls);
+        }
+        case VEC_VALUE: {
+            DataInput vin = new BufferInput(buf);
+            int len = vin.readInt();
+            List<Value> vals = new ArrayList<>(len);
+            for (int i = 0; i < len; i++) {
+                vals.add(readValue(vin));
+            }
+            return ValueVector.of(vals, nulls);
+        }
+        default:
+            throw new IOException("Unknown vector kind: " + kind);
+        }
+    }
+
+    /** 内存缓冲上的位图读法：hasNull + 字长 + long 批量。 */
+    NullBitmap readNullBitmap(ByteBuffer buf) {
+        boolean hasNull = buf.get() != 0;
+        int len = buf.getInt();
+        return NullBitmap.of(readLongs(buf, len), hasNull);
+    }
+
+    /** 内存缓冲上的打包文本读法：剩余字节数已知，按「剩余 - 4 - rows*4」一次精确分配。 */
+    private ColumnVector readPackedText(ByteBuffer buf, int remaining, boolean clob,
+            NullBitmap nulls) throws IOException {
+        int rows = buf.getInt();
+        int dataBytes = remaining - 4 - rows * 4;
+        if (dataBytes < 0) {
+            throw new IOException("Packed text block truncated");
+        }
+        int[] starts = new int[rows + 1];
+        byte[] data = new byte[dataBytes];
+        int pos = 0;
+        for (int i = 0; i < rows; i++) {
+            int len = buf.getInt();
+            if (len >= 0) {
+                buf.get(data, pos, len);
+                pos += len;
+            }
+            starts[i + 1] = pos;
+        }
+        return clob ? ClobVector.of(starts, data, nulls) : VarcharVector.of(starts, data, nulls);
+    }
+
+    private static int[] readInts(ByteBuffer buf, int len) {
+        int[] arr = new int[len];
+        if (len > 0) {
+            buf.asIntBuffer().get(arr);
+            buf.position(buf.position() + len * 4);
+        }
+        return arr;
+    }
+
+    private static long[] readLongs(ByteBuffer buf, int len) {
+        long[] arr = new long[len];
+        if (len > 0) {
+            buf.asLongBuffer().get(arr);
+            buf.position(buf.position() + len * 8);
+        }
+        return arr;
+    }
+
+    /** 把 {@link ByteBuffer} 适配成 {@link DataInput}，供逐值解码复用 {@link #readValue}。 */
+    static final class BufferInput implements DataInput {
+        private final ByteBuffer buf;
+
+        BufferInput(ByteBuffer buf) {
+            this.buf = buf;
+        }
+
+        @Override
+        public void readFully(byte[] b) {
+            buf.get(b);
+        }
+
+        @Override
+        public void readFully(byte[] b, int off, int len) {
+            buf.get(b, off, len);
+        }
+
+        @Override
+        public int skipBytes(int n) {
+            int skipped = Math.min(n, buf.remaining());
+            buf.position(buf.position() + skipped);
+            return skipped;
+        }
+
+        @Override
+        public boolean readBoolean() {
+            return buf.get() != 0;
+        }
+
+        @Override
+        public byte readByte() {
+            return buf.get();
+        }
+
+        @Override
+        public int readUnsignedByte() {
+            return buf.get() & 0xff;
+        }
+
+        @Override
+        public short readShort() {
+            return buf.getShort();
+        }
+
+        @Override
+        public int readUnsignedShort() {
+            return buf.getShort() & 0xffff;
+        }
+
+        @Override
+        public char readChar() {
+            return buf.getChar();
+        }
+
+        @Override
+        public int readInt() {
+            return buf.getInt();
+        }
+
+        @Override
+        public long readLong() {
+            return buf.getLong();
+        }
+
+        @Override
+        public float readFloat() {
+            return buf.getFloat();
+        }
+
+        @Override
+        public double readDouble() {
+            return buf.getDouble();
+        }
+
+        @Override
+        public String readUTF() throws IOException {
+            return DataInputStream.readUTF(this);
+        }
+
+        @Override
+        public String readLine() {
+            throw new UnsupportedOperationException("readLine");
         }
     }
 }

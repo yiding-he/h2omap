@@ -5,6 +5,7 @@ package com.hyd.h2omap.storage;
 
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 import org.h2.value.CompareMode;
 import org.h2.value.ExtTypeInfo;
@@ -35,7 +36,11 @@ public final class ColumnSegment {
 
     private final int rowCount;
 
-    private final ColumnVector[] columns;
+    private final int columnCount;
+
+    private volatile ColumnVector[] columns;
+
+    private Supplier<ColumnVector[]> columnLoader;
 
     private final ZoneMap[] zoneMaps;
 
@@ -48,15 +53,23 @@ public final class ColumnSegment {
     private final CompareMode compareMode;
 
     private ColumnSegment(int segmentId, int generation, int rowCount, ColumnVector[] columns,
-            ZoneMap[] zoneMaps, NullBitmap deleted, int deletedCount, CompareMode compareMode) {
+            int columnCount, ZoneMap[] zoneMaps, NullBitmap deleted, int deletedCount,
+            CompareMode compareMode) {
         this.segmentId = segmentId;
         this.generation = generation;
         this.rowCount = rowCount;
         this.columns = columns;
+        this.columnCount = columnCount;
         this.zoneMaps = zoneMaps;
         this.deleted = deleted;
         this.deletedCount = deletedCount;
         this.compareMode = compareMode;
+    }
+
+    private ColumnSegment(int segmentId, int generation, int rowCount, ColumnVector[] columns,
+            ZoneMap[] zoneMaps, NullBitmap deleted, int deletedCount, CompareMode compareMode) {
+        this(segmentId, generation, rowCount, columns, columns.length, zoneMaps, deleted,
+                deletedCount, compareMode);
     }
 
     private ColumnSegment(int segmentId, int rowCount, ColumnVector[] columns, ZoneMap[] zoneMaps,
@@ -70,6 +83,19 @@ public final class ColumnSegment {
             CompareMode compareMode) {
         return new ColumnSegment(segmentId, generation, rowCount, columns, zoneMaps, deleted,
                 deletedCount, compareMode);
+    }
+
+    /**
+     * 构造列向量按需加载的只读快照段：行数、删除位图与每列 zone map 直接取自堆上骨架，
+     * 仅在首次访问列向量（{@link #getColumn}、{@link #get}、{@link #getRow}）时触发 {@code columnLoader}。
+     */
+    public static ColumnSegment lazy(int segmentId, int generation, int rowCount,
+            int columnCount, ZoneMap[] zoneMaps, NullBitmap deleted, int deletedCount,
+            CompareMode compareMode, Supplier<ColumnVector[]> columnLoader) {
+        ColumnSegment seg = new ColumnSegment(segmentId, generation, rowCount, null,
+                columnCount, zoneMaps, deleted, deletedCount, compareMode);
+        seg.columnLoader = columnLoader;
+        return seg;
     }
 
     /**
@@ -161,23 +187,39 @@ public final class ColumnSegment {
     }
 
     public int getColumnCount() {
-        return columns.length;
+        return columnCount;
+    }
+
+    /** 列向量是否已在内存中（已驻留段或已触发加载的懒段）。 */
+    public boolean isLoaded() {
+        return columns != null;
+    }
+
+    private ColumnVector[] ensureColumns() {
+        ColumnVector[] cols = this.columns;
+        if (cols == null) {
+            cols = columnLoader.get();
+            this.columns = cols;
+            this.columnLoader = null;
+        }
+        return cols;
     }
 
     public Value get(int offset, int column) {
-        return columns[column].get(offset);
+        return ensureColumns()[column].get(offset);
     }
 
     public Value[] getRow(int offset) {
-        Value[] values = new Value[columns.length];
-        for (int c = 0; c < columns.length; c++) {
-            values[c] = columns[c].get(offset);
+        ColumnVector[] cols = ensureColumns();
+        Value[] values = new Value[cols.length];
+        for (int c = 0; c < cols.length; c++) {
+            values[c] = cols[c].get(offset);
         }
         return values;
     }
 
     public ColumnVector getColumn(int column) {
-        return columns[column];
+        return ensureColumns()[column];
     }
 
     public ZoneMap getZoneMap(int column) {

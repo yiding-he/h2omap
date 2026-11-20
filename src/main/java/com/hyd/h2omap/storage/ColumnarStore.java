@@ -1423,6 +1423,10 @@ public final class ColumnarStore {
         /** 当前段是否已经定位到起始偏移，倒序时用于区分新段与已走完的段。 */
         private boolean started;
 
+        private ColumnSegment currentLoadedSegment;
+
+        private SegmentRef pendingLoadRef;
+
         SegmentRowIterator(Value[] lower, Value[] upper, boolean reverse) {
             this.lower = lower;
             this.upper = upper;
@@ -1445,66 +1449,58 @@ public final class ColumnarStore {
 
         @Override
         public int nextBatch(ColumnarStore store, Row[] buffer) {
-            // 产行的批量路径需要段内容：先在读锁外把剩余扫描范围内的逐出段读回。
-            ensureRangeResident();
-            lock.readLock().lock();
-            try {
-                return reverse ? nextBatchReverse(buffer) : nextBatchForward(buffer);
-            } finally {
-                lock.readLock().unlock();
-            }
-        }
-
-        /** 剩余扫描范围内的逐出段读回驻留；用骨架 zone map 先剪枝，预算容不下时批量路径退回临时读。 */
-        private void ensureRangeResident() {
-            List<SegmentRef> evicted = null;
-            lock.readLock().lock();
-            try {
-                for (SegmentRef ref : reverse
-                        ? segments.headMap(segmentId, true).values()
-                        : segments.tailMap(segmentId, true).values()) {
-                    if (ref.loaded == null && ref.skeleton != null && intersects(ref)) {
-                        if (evicted == null) {
-                            evicted = new ArrayList<>();
-                        }
-                        evicted.add(ref);
-                    }
-                }
-            } finally {
-                lock.readLock().unlock();
-            }
-            if (evicted != null) {
-                for (SegmentRef ref : evicted) {
-                    ensureResident(ref);
-                }
-            }
-        }
-
-        /** 批量路径的段内容：驻留的取驻留值；预读后又被逐出的读一份仅供本次迭代，不回写驻留状态。 */
-        private ColumnSegment residentForBatch(SegmentRef ref) {
-            if (ref == null) {
-                return null;
-            }
-            ColumnSegment seg = ref.loaded;
-            if (seg != null) {
-                return seg;
-            }
-            return ref.skeleton == null ? null : readSegmentTransient(ref);
-        }
-
-        private int nextBatchForward(Row[] buffer) {
             int filled = 0;
+            while (filled < buffer.length) {
+                pendingLoadRef = null;
+                lock.readLock().lock();
+                try {
+                    filled = reverse
+                            ? nextBatchReverse(buffer, filled)
+                            : nextBatchForward(buffer, filled);
+                } finally {
+                    lock.readLock().unlock();
+                }
+                if (pendingLoadRef == null) {
+                    break;
+                }
+                // 按段按需读回当前相交的逐出段；预算连单段都容不下时复用返回的段实例直至本段扫完。
+                currentLoadedSegment = ensureResident(pendingLoadRef);
+                if (currentLoadedSegment == null) {
+                    currentLoadedSegment = readSegmentTransient(pendingLoadRef);
+                }
+                if (currentLoadedSegment == null) {
+                    throw new IllegalStateException(
+                            "逐出段读回失败: seg_" + pendingLoadRef.segmentId
+                                    + "_" + pendingLoadRef.generation);
+                }
+            }
+            return filled;
+        }
+
+        private int nextBatchForward(Row[] buffer, int filled) {
             while (filled < buffer.length && segmentId <= lastSegmentId) {
                 boolean open = isOpen();
                 SegmentRef ref = open ? null : refOf(segmentId);
-                ColumnSegment segment = open ? null : residentForBatch(ref);
-                if (segment == null && !open) {
+                if (!open && (ref == null || (ref.loaded == null && ref.skeleton == null))) {
                     nextSegmentForward();
                     continue;
                 }
                 if (!open && !intersects(ref)) {
                     nextSegmentForward();
                     continue;
+                }
+                ColumnSegment segment = null;
+                if (!open) {
+                    segment = ref.loaded;
+                    if (segment == null) {
+                        if (currentLoadedSegment != null
+                                && currentLoadedSegment.getSegmentId() == segmentId) {
+                            segment = currentLoadedSegment;
+                        } else {
+                            pendingLoadRef = ref;
+                            return filled;
+                        }
+                    }
                 }
                 int count = countOf(open, ref);
                 if (!open) {
@@ -1551,20 +1547,31 @@ public final class ColumnarStore {
             return filled;
         }
 
-        private int nextBatchReverse(Row[] buffer) {
-            int filled = 0;
+        private int nextBatchReverse(Row[] buffer, int filled) {
             int minSegmentId = firstSegmentId();
             while (filled < buffer.length && segmentId >= minSegmentId) {
                 boolean open = isOpen();
                 SegmentRef ref = open ? null : refOf(segmentId);
-                ColumnSegment segment = open ? null : residentForBatch(ref);
-                if (segment == null && !open) {
+                if (!open && (ref == null || (ref.loaded == null && ref.skeleton == null))) {
                     nextSegmentReverse();
                     continue;
                 }
                 if (!open && !intersects(ref)) {
                     nextSegmentReverse();
                     continue;
+                }
+                ColumnSegment segment = null;
+                if (!open) {
+                    segment = ref.loaded;
+                    if (segment == null) {
+                        if (currentLoadedSegment != null
+                                && currentLoadedSegment.getSegmentId() == segmentId) {
+                            segment = currentLoadedSegment;
+                        } else {
+                            pendingLoadRef = ref;
+                            return filled;
+                        }
+                    }
                 }
                 int count = countOf(open, ref);
                 if (!open) {
@@ -1685,12 +1692,14 @@ public final class ColumnarStore {
         private void nextSegmentForward() {
             segmentId++;
             offset = 0;
+            currentLoadedSegment = null;
         }
 
         private void nextSegmentReverse() {
             segmentId--;
             offset = -1;
             started = false;
+            currentLoadedSegment = null;
         }
 
         /** 当前段号是否仍是未冻结的开放段。 */
@@ -1773,19 +1782,18 @@ public final class ColumnarStore {
      * @return 快照，{@code segments} 只含可能与区间相交的段
      */
     public VectorizedSnapshot takeVectorizedSnapshot(Value[] lower, Value[] upper, int[] columns) {
-        if (columns == null) {
-            reloadEvictedForSnapshot(lower, upper);
-        }
         lock.readLock().lock();
         try {
             List<ColumnSegment> loadedSegments = new ArrayList<>(segments.size());
             for (SegmentRef ref : segments.values()) {
                 ColumnSegment seg = ref.loaded;
                 if (seg == null && ref.skeleton != null && refNeeded(ref, lower, upper)) {
-                    // 预读后又被预算逐出：读一份仅供本次快照，不回写驻留状态。
-                    seg = columns != null
-                            ? readSliceTransient(ref, columns)
-                            : readSegmentTransient(ref);
+                    // 逐出段在拍快照时不读盘：用堆上骨架构造懒加载段，执行期首次读列时才触发磁盘读取。
+                    SegmentRef target = ref;
+                    SegmentSkeleton sk = ref.skeleton;
+                    seg = ColumnSegment.lazy(ref.segmentId, ref.generation, sk.rowCount,
+                            valueTypes.length, sk.zoneMaps, sk.deleted, sk.deletedCount, compareMode,
+                            () -> loadSnapshotVectors(target, columns));
                 }
                 if (seg != null) {
                     loadedSegments.add(seg);
@@ -1866,10 +1874,10 @@ public final class ColumnarStore {
                 versions.put(seg.getSegmentId(), delta.segmentVersion(seg.getSegmentId()));
             }
             // 剪枝后实际参与扫描的段记一次访问，供 LRU 逐出排序。
-            // 部分列读不进驻留模型：只触碰本来驻留的段，逐出段保持逐出。
+            // 懒加载快照读不进驻留模型：只触碰本来驻留的段，逐出段保持逐出。
             for (ColumnSegment seg : segs) {
                 SegmentRef ref = segments.get(seg.getSegmentId());
-                if (ref != null && (columns == null || ref.loaded != null)) {
+                if (ref != null && ref.loaded != null) {
                     touchRef(ref);
                 }
             }
@@ -1888,6 +1896,24 @@ public final class ColumnarStore {
         }
         return delta.hasSegmentUpdates(ref.segmentId)
                 || skeletonIntersects(ref.skeleton, lower, upper);
+    }
+
+    /** 懒加载快照段首次访问列向量时触发：按列目录切片读或整段临时读，不进入驻留模型。 */
+    private ColumnVector[] loadSnapshotVectors(SegmentRef ref, int[] columns) {
+        ColumnSegment seg = columns != null
+                ? readSliceTransient(ref, columns)
+                : readSegmentTransient(ref);
+        if (seg == null) {
+            ColumnVector[] empty = new ColumnVector[valueTypes.length];
+            Arrays.fill(empty, AbsentColumnVector.INSTANCE);
+            return empty;
+        }
+        int colCount = valueTypes.length;
+        ColumnVector[] vectors = new ColumnVector[colCount];
+        for (int c = 0; c < colCount; c++) {
+            vectors[c] = seg.getColumn(c);
+        }
+        return vectors;
     }
 
     /** 裸 MIN/MAX 定界求值的结果；supported=false 表示形态不支持，交回常规向量化路径。 */
@@ -2063,38 +2089,6 @@ public final class ColumnarStore {
             best = pickExtreme(vec.get(r), min, best, session);
         }
         return best;
-    }
-
-    /**
-     * 逐出段进入向量化快照前先读回：向量化路径需要段内容，骨架只服务行号级读路径。
-     * 剪枝判定用骨架里的 zone map，与驻留段同一条规则。
-     */
-    private void reloadEvictedForSnapshot(Value[] lower, Value[] upper) {
-        List<SegmentRef> evicted = null;
-        lock.readLock().lock();
-        try {
-            for (SegmentRef ref : segments.values()) {
-                if (ref.loaded != null || ref.skeleton == null) {
-                    continue;
-                }
-                boolean needed = (lower == null && upper == null)
-                        || delta.hasSegmentUpdates(ref.segmentId)
-                        || skeletonIntersects(ref.skeleton, lower, upper);
-                if (needed) {
-                    if (evicted == null) {
-                        evicted = new ArrayList<>();
-                    }
-                    evicted.add(ref);
-                }
-            }
-        } finally {
-            lock.readLock().unlock();
-        }
-        if (evicted != null) {
-            for (SegmentRef ref : evicted) {
-                ensureResident(ref);
-            }
-        }
     }
 
     /** 骨架的 zone map 是否可能与给定区间相交。 */

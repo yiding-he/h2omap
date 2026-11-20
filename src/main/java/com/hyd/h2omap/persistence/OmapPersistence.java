@@ -12,9 +12,7 @@ import java.io.DataInput;
 import java.io.DataOutputStream;
 import java.io.DataOutput;
 import java.io.EOFException;
-import java.io.FilterInputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
@@ -634,6 +632,13 @@ public final class OmapPersistence {
         return ZoneMap.restore(min, max, compareMode);
     }
 
+    /** 内存缓冲上的尾部目录项读法。 */
+    private ZoneMap readZoneEntry(ByteBuffer buf) throws IOException {
+        Value min = buf.get() != 0 ? ckptCodec.readValue(new ValueCodec.BufferInput(buf)) : null;
+        Value max = buf.get() != 0 ? ckptCodec.readValue(new ValueCodec.BufferInput(buf)) : null;
+        return ZoneMap.restore(min, max, compareMode);
+    }
+
     private static void patchLong(byte[] bytes, int offset, long value) {
         for (int i = 0; i < 8; i++) {
             bytes[offset + i] = (byte) (value >>> (8 * (7 - i)));
@@ -670,22 +675,50 @@ public final class OmapPersistence {
             long[] offsets = new long[cols];
             int[] lengths = new int[cols];
             ZoneMap[] footerZones = new ZoneMap[cols];
+            // 尾部目录一次块读，在内存上解析。
+            int footerSize = (int) (ch.size() - footerOffset);
+            ByteBuffer footer = ByteBuffer.allocate(footerSize);
             ch.position(footerOffset);
-            in = new DataInputStream(Channels.newInputStream(ch));
-            for (int c = 0; c < cols; c++) {
-                offsets[c] = in.readLong();
-                lengths[c] = in.readInt();
-                footerZones[c] = readZoneEntry(in);
+            while (footer.hasRemaining()) {
+                if (ch.read(footer) < 0) {
+                    throw new EOFException("Unexpected end of " + p);
+                }
             }
+            footer.flip();
+            for (int c = 0; c < cols; c++) {
+                offsets[c] = footer.getLong();
+                lengths[c] = footer.getInt();
+                footerZones[c] = readZoneEntry(footer);
+            }
+            // 请求列在文件上首尾相接时合并成单次大块连续读。
             ColumnVector[] vectors = new ColumnVector[columnIds.length];
             ZoneMap[] zones = new ZoneMap[columnIds.length];
-            for (int i = 0; i < columnIds.length; i++) {
-                int c = columnIds[i];
-                ch.position(offsets[c]);
-                in = new DataInputStream(new BufferedInputStream(
-                        new BoundedInputStream(ch, lengths[c]), 64 * 1024));
-                vectors[i] = ckptCodec.readVector(in);
-                zones[i] = footerZones[c];
+            int i = 0;
+            while (i < columnIds.length) {
+                int i0 = i;
+                int first = columnIds[i];
+                int last = first;
+                while (i + 1 < columnIds.length
+                        && offsets[columnIds[i + 1]] == offsets[last] + lengths[last]) {
+                    last = columnIds[++i];
+                }
+                long runStart = offsets[first];
+                int runLen = (int) (offsets[last] + lengths[last] - runStart);
+                ByteBuffer run = ByteBuffer.allocate(runLen);
+                ch.position(runStart);
+                while (run.hasRemaining()) {
+                    if (ch.read(run) < 0) {
+                        throw new EOFException("Unexpected end of " + p);
+                    }
+                }
+                run.flip();
+                for (int j = i0; j <= i; j++) {
+                    int c = columnIds[j];
+                    run.position((int) (offsets[c] - runStart));
+                    vectors[j] = ckptCodec.readVector(run, lengths[c]);
+                    zones[j] = footerZones[c];
+                }
+                i++;
             }
             return new ColumnSlice(segmentId, generation, rowCount, deletedCount, deleted,
                     columnIds, vectors, zones);
@@ -699,35 +732,67 @@ public final class OmapPersistence {
 
     private ColumnSegment readSegment(int expectedId, int expectedGen) throws IOException {
         Path p = dir.resolve("seg_" + expectedId + "_" + expectedGen + ".omap");
-        try (InputStream fileIn = new BufferedInputStream(Files.newInputStream(p), 512 * 1024);
-                CountingInputStream counting = new CountingInputStream(fileIn);
-                DataInputStream in = new DataInputStream(counting)) {
-            requireSegment(in, p, expectedId, expectedGen);
-            int rowCount = in.readInt();
-            int deletedCount = in.readInt();
-            long footerOffset = in.readLong();
-            NullBitmap deleted = ckptCodec.readNullBitmap(in);
-            int cols = in.readInt();
-            ColumnVector[] vectors = new ColumnVector[cols];
-            for (int c = 0; c < cols; c++) {
-                vectors[c] = ckptCodec.readVector(in);
+        long fileSize;
+        byte[] fileBytes;
+        try (FileChannel ch = FileChannel.open(p, StandardOpenOption.READ)) {
+            fileSize = ch.size();
+            if (fileSize > Integer.MAX_VALUE - 8) {
+                throw new IOException("Segment file too large: " + p);
             }
-            if (counting.getPos() != footerOffset) {
-                throw new IOException("Column blocks end at " + counting.getPos()
-                        + " but footer offset is " + footerOffset + " in " + p);
+            fileBytes = new byte[(int) fileSize];
+            ByteBuffer wrap = ByteBuffer.wrap(fileBytes);
+            while (wrap.hasRemaining()) {
+                if (ch.read(wrap) < 0) {
+                    throw new EOFException("Unexpected end of " + p);
+                }
             }
-            ZoneMap[] zones = new ZoneMap[cols];
-            for (int c = 0; c < cols; c++) {
-                in.readLong(); // 列块偏移：全量读已顺序消费过，仅跳过
-                in.readInt(); // 列块长度
-                zones[c] = readZoneEntry(in);
-            }
-            return ColumnSegment.restore(expectedId, expectedGen, rowCount, vectors, zones,
-                    deleted, deletedCount, compareMode);
         }
+        // 整段一次大块读入后，列块与尾部目录都在内存缓冲上批量解码。
+        ByteBuffer buf = ByteBuffer.wrap(fileBytes);
+        requireSegment(new ValueCodec.BufferInput(buf), p, expectedId, expectedGen);
+        int rowCount = buf.getInt();
+        int deletedCount = buf.getInt();
+        long footerOffset = buf.getLong();
+        if (footerOffset <= 0 || footerOffset >= fileSize) {
+            throw new IOException("Invalid footer offset " + footerOffset + " in " + p);
+        }
+        NullBitmap deleted = ckptCodec.readNullBitmap(buf);
+        int cols = buf.getInt();
+        int headerEnd = buf.position();
+        long[] offsets = new long[cols];
+        int[] lengths = new int[cols];
+        ZoneMap[] zones = new ZoneMap[cols];
+        buf.position((int) footerOffset);
+        for (int c = 0; c < cols; c++) {
+            offsets[c] = buf.getLong();
+            lengths[c] = buf.getInt();
+            zones[c] = readZoneEntry(buf);
+        }
+        // 街接校验：首列块紧接头，列块首尾相接，末列块止于尾部目录。
+        for (int c = 0; c < cols; c++) {
+            long expectedStart = c == 0 ? headerEnd : offsets[c - 1] + lengths[c - 1];
+            if (offsets[c] != expectedStart) {
+                throw new IOException("Column block " + c + " starts at " + offsets[c]
+                        + " but expected " + expectedStart + " in " + p);
+            }
+        }
+        if (cols > 0 && offsets[cols - 1] + lengths[cols - 1] != footerOffset) {
+            throw new IOException("Column blocks end at " + (offsets[cols - 1] + lengths[cols - 1])
+                    + " but footer offset is " + footerOffset + " in " + p);
+        }
+        ColumnVector[] vectors = new ColumnVector[cols];
+        for (int c = 0; c < cols; c++) {
+            buf.position((int) offsets[c]);
+            vectors[c] = ckptCodec.readVector(buf, lengths[c]);
+            if (buf.position() != offsets[c] + lengths[c]) {
+                throw new IOException("Column " + c + " block length mismatch in " + p);
+            }
+        }
+        return ColumnSegment.restore(expectedId, expectedGen, rowCount, vectors, zones,
+                deleted, deletedCount, compareMode);
     }
 
-    private void requireSegment(DataInputStream in, Path p, int expectedId, int expectedGen)
+    private void requireSegment(DataInput in, Path p, int expectedId, int expectedGen)
             throws IOException {
         int magic = in.readInt();
         if (magic != SEGMENT_MAGIC) {
@@ -737,77 +802,6 @@ public final class OmapPersistence {
         int gen = in.readInt();
         if (segId != expectedId || gen != expectedGen) {
             throw new IOException("Segment id/generation mismatch in " + p);
-        }
-    }
-
-    /** 只计已消费字节数，供全量读校验列块与尾部目录的衔接。 */
-    private static final class CountingInputStream extends FilterInputStream {
-        private long pos;
-
-        CountingInputStream(InputStream in) {
-            super(in);
-        }
-
-        @Override
-        public int read() throws IOException {
-            int r = super.read();
-            if (r >= 0) {
-                pos++;
-            }
-            return r;
-        }
-
-        @Override
-        public int read(byte[] b, int off, int len) throws IOException {
-            int r = super.read(b, off, len);
-            if (r > 0) {
-                pos += r;
-            }
-            return r;
-        }
-
-        long getPos() {
-            return pos;
-        }
-    }
-
-    /** 从通道当前位置起限长读取，读到列块末尾即止，不串进下一列。 */
-    private static final class BoundedInputStream extends InputStream {
-        private final FileChannel ch;
-        private long remaining;
-
-        BoundedInputStream(FileChannel ch, int length) {
-            this.ch = ch;
-            this.remaining = length;
-        }
-
-        @Override
-        public int read() throws IOException {
-            if (remaining <= 0) {
-                return -1;
-            }
-            ByteBuffer b = ByteBuffer.allocate(1);
-            int r = ch.read(b);
-            if (r <= 0) {
-                return -1;
-            }
-            remaining--;
-            return b.get(0) & 0xFF;
-        }
-
-        @Override
-        public int read(byte[] b, int off, int len) throws IOException {
-            if (remaining <= 0 || len <= 0) {
-                return remaining <= 0 ? -1 : 0;
-            }
-            len = (int) Math.min(len, remaining);
-            ByteBuffer bb = ByteBuffer.wrap(b, off, len);
-            int r = ch.read(bb);
-            if (r <= 0) {
-                return -1;
-            }
-            remaining -= r;
-            return r;
         }
     }
 

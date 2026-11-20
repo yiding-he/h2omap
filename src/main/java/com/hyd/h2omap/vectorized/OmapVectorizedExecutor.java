@@ -176,8 +176,54 @@ public final class OmapVectorizedExecutor {
                     compareMode);
         }
 
-        int[] sel = null;
+        // 无 ORDER BY 时返回行序无保证：先扫已驻留段与开放段/新像，LIMIT 不够才按需读回逐出段。
+        List<ColumnSegment> residentSegs = new ArrayList<>();
+        List<ColumnSegment> lazySegs = new ArrayList<>();
         for (ColumnSegment seg : snap.segments) {
+            (seg.isLoaded() ? residentSegs : lazySegs).add(seg);
+        }
+        emitted += scanFlatSegments(residentSegs, snap, filter, session, compareMode, outLen,
+                projConsts, projToUnique, uniqueProjCols, uniqueCount, maxRows, emitted, result);
+        if (maxRows > 0 && emitted >= maxRows) {
+            return true;
+        }
+
+        for (Value[] srcRow : snap.extraRows) {
+            if (filter == null || filter.evalRow(srcRow, session, compareMode)) {
+                Value[] row = new Value[outLen];
+                for (int c = 0; c < outLen; c++) {
+                    int col = projCols[c];
+                    row[c] = col >= 0 ? srcRow[col] : projConsts[c];
+                }
+                result.addRow(row);
+                emitted++;
+                if (maxRows > 0 && emitted >= maxRows) {
+                    return true;
+                }
+            }
+        }
+        if (maxRows > 0 && emitted >= maxRows) {
+            return true;
+        }
+        scanFlatSegments(lazySegs, snap, filter, session, compareMode, outLen,
+                projConsts, projToUnique, uniqueProjCols, uniqueCount, maxRows, emitted, result);
+        return true;
+    }
+
+    /**
+     * 扫描一组段并把命中行写进结果集，写满允许额度即停；返回本次写出的行数。
+     * 首次访问懒段的列向量时才触发按需读盘。
+     */
+    private static long scanFlatSegments(List<ColumnSegment> segs,
+            ColumnarStore.VectorizedSnapshot snap, VectorizedFilter filter, SessionLocal session,
+            CompareMode compareMode, int outLen, Value[] projConsts,
+            int[] projToUnique, int[] uniqueProjCols, int uniqueCount, long maxRows, long emitted,
+            LocalResult result) {
+        long allowed = maxRows > 0 ? maxRows : Long.MAX_VALUE;
+        long written = 0;
+        int[] sel = null;
+        ColumnVector[] colVecs = new ColumnVector[uniqueCount];
+        for (ColumnSegment seg : segs) {
             int rowCount = seg.getRowCount();
             if (rowCount == 0) {
                 continue;
@@ -201,9 +247,9 @@ public final class OmapVectorizedExecutor {
                         row[c] = u >= 0 ? colVecs[u].get(i) : projConsts[c];
                     }
                     result.addRow(row);
-                    emitted++;
-                    if (maxRows > 0 && emitted >= maxRows) {
-                        return true;
+                    written++;
+                    if (emitted + written >= allowed) {
+                        return written;
                     }
                 }
                 continue;
@@ -227,28 +273,13 @@ public final class OmapVectorizedExecutor {
                     row[c] = u >= 0 ? colVecs[u].get(idx) : projConsts[c];
                 }
                 result.addRow(row);
-                emitted++;
-                if (maxRows > 0 && emitted >= maxRows) {
-                    return true;
+                written++;
+                if (emitted + written >= allowed) {
+                    return written;
                 }
             }
         }
-
-        for (Value[] srcRow : snap.extraRows) {
-            if (filter == null || filter.evalRow(srcRow, session, compareMode)) {
-                Value[] row = new Value[outLen];
-                for (int c = 0; c < outLen; c++) {
-                    int col = projCols[c];
-                    row[c] = col >= 0 ? srcRow[col] : projConsts[c];
-                }
-                result.addRow(row);
-                emitted++;
-                if (maxRows > 0 && emitted >= maxRows) {
-                    return true;
-                }
-            }
-        }
-        return true;
+        return written;
     }
 
     /** 有序模式下允许的最大 LIMIT（含 OFFSET）；超出时交回 H2，不为巨大 LIMIT 建堆。 */
