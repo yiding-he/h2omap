@@ -14,6 +14,7 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.util.List;
+import java.util.stream.Stream;
 
 import org.h2.engine.Database;
 import org.h2.engine.SessionLocal;
@@ -195,8 +196,8 @@ class SegmentFileFormatTest {
         ColumnarStore source = newStore(4);
         OmapPersistence p = newPersistence(storeDir);
         source.setPersistence(p);
-        long[] ids = new long[6];
-        for (int i = 0; i < 6; i++) {
+        long[] ids = new long[9];
+        for (int i = 0; i < 9; i++) {
             ids[i] = source.append(row(i, "v" + i));
         }
         source.remove(ids[2]);
@@ -208,10 +209,46 @@ class SegmentFileFormatTest {
         try {
             ColumnarStore target = newStore(4);
             r.recover(target);
-            assertEquals(5, target.getRowCount());
+            assertEquals(8, target.getRowCount());
             assertEquals("v0", target.materialize(ids[0]).getValueList()[1].getString());
-            assertEquals("v5", target.materialize(ids[5]).getValueList()[1].getString());
+            assertEquals("v8", target.materialize(ids[8]).getValueList()[1].getString());
             assertNull(target.materialize(ids[2]));
+        } finally {
+            r.close();
+        }
+    }
+
+    /**
+     * 并行恢复中任一段文件损坏：恢复整体失败并抛出异常，
+     * 不允许静默丢段后以缺数据的库打开。
+     */
+    @Test
+    void recoverFailsWhenSegmentFileCorrupted() throws IOException {
+        Path storeDir = dir.resolve("t5");
+        ColumnarStore source = newStore(4);
+        OmapPersistence p = newPersistence(storeDir);
+        source.setPersistence(p);
+        for (int i = 0; i < 9; i++) {
+            source.append(row(i, "v" + i));
+        }
+        source.checkpoint();
+        p.close();
+
+        // 损坏最后一段（段号最大的文件）的魔数
+        List<Path> segFiles;
+        try (Stream<Path> list = Files.list(storeDir)) {
+            segFiles = list.filter(f -> f.getFileName().toString().startsWith("seg_")).sorted().toList();
+        }
+        assertTrue(segFiles.size() >= 2, "应有至少两个冻结段");
+        Path victim = segFiles.get(segFiles.size() - 1);
+        byte[] head = Files.readAllBytes(victim);
+        head[0] = 'X';
+        Files.write(victim, head);
+
+        OmapPersistence r = newPersistence(storeDir);
+        try {
+            ColumnarStore target = newStore(4);
+            assertThrows(DbException.class, () -> r.recover(target));
         } finally {
             r.close();
         }

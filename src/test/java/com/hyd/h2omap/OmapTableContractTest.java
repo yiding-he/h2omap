@@ -314,10 +314,11 @@ class OmapTableContractTest {
                     Statement s = second.createStatement()) {
                 org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
                         ((org.h2.jdbc.JdbcConnection) second).getSession();
-                com.hyd.h2omap.storage.ColumnarStore store =
-                        ((com.hyd.h2omap.table.OmapTable) session.getDatabase().getMainSchema()
-                                .findTableOrView(session, "T")).getStore();
-                // 预载收尾：恰好一次探针逐出；若预载不停止，会逐个读入并逐出段 5..0，计数到 6。
+                com.hyd.h2omap.table.OmapTable table = (com.hyd.h2omap.table.OmapTable)
+                        session.getDatabase().getMainSchema().findTableOrView(session, "T");
+                com.hyd.h2omap.storage.ColumnarStore store = table.getStore();
+                // 预载收尾：并发 4 路按段号从新到老读入，预算边界处的探针逐出 1..4 次；
+                // 若预载不停止，会读完全部 8 段，探针逐出计数到 6。
                 long deadline = System.currentTimeMillis() + 10_000;
                 long evictedSeen = -1;
                 long stableSince = -1;
@@ -332,12 +333,18 @@ class OmapTableContractTest {
                     }
                     Thread.sleep(20);
                 }
-                assertEquals(1, store.getEvictedSegmentCount(),
-                        "预算处停止的预载只应有探针段一次逐出");
+                long evicted = store.getEvictedSegmentCount();
+                assertTrue(evicted >= 1
+                                && evicted <= com.hyd.h2omap.persistence.OmapPersistence.LOAD_CONCURRENCY,
+                        "预算边界的探针逐出应为 1..4 次，实测 " + evicted);
                 assertTrue(store.isSegmentResident(7), "最新段应预载驻留");
                 assertTrue(store.isSegmentResident(6), "次新段应预载驻留");
-                assertFalse(store.isSegmentResident(5), "预算外的段不应被预载读入");
-                assertFalse(store.isSegmentResident(0), "最老的段不应被预载读入");
+                assertFalse(store.isSegmentResident(5), "探针段被预算逐出，不应驻留");
+                assertFalse(store.isSegmentResident(0), "停止条件之后的段不应被预载读入");
+                // 预载确实经线程池并行执行：8 段至少起 4 个加载任务。
+                assertTrue(table.getPersistence().getPoolTaskRuns()
+                        >= com.hyd.h2omap.persistence.OmapPersistence.LOAD_CONCURRENCY,
+                        "预载应经加载线程池执行");
 
                 // 骨架可见：预载未完成时开库第一次 COUNT 就是全量。
                 assertEquals("400", toString(s, "SELECT COUNT(*) FROM T"));
