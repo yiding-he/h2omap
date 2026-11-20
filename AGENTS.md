@@ -27,7 +27,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | JDK | 构建与运行用 JDK 21.0.11；字节码目标 `maven.compiler.release=17` |
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变）。被替换的 3 个 H2 类按该版本源码合入，升级时必须逐类重新比对 |
 | 依赖 | 运行期只有 `com.h2database:h2`，测试用 `junit-jupiter`，构建期插件 `maven-shade-plugin` |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（77 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（24 个用例）、`src/test/java/com/hyd/h2omap/storage/SegmentFileFormatTest.java`（4 个用例）、`src/test/java/com/hyd/h2omap/persistence/ValueCodecTest.java`（3 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（77 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（24 个用例）、`src/test/java/com/hyd/h2omap/storage/SegmentFileFormatTest.java`（5 个用例）、`src/test/java/com/hyd/h2omap/persistence/ValueCodecTest.java`（3 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/`。该目录可能不存在（已排除在版本控制之外）。Maven Central 的 `h2-2.5.252-sources.jar` 内容等价，但个别文件与该 zip 相差数行，核对行号时以 zip 为准 |
 
 ## H2 侧的依据
@@ -206,9 +206,9 @@ manifest 与段文件都只有 v2 一种格式，旧 v1 回退分支已删除：
 
 由服务端启动参数 `-Dh2.omapLazyLoad=true` 打开，默认关闭；开关关闭时 `recover()` 与改动前完全一致（开库时读完所有段），关闭后的行为不受影响。
 
-开关打开时，`recover()` 只读 `manifest.dat` 登记每段的 id、generation 与骨架元数据，段文件不读，随后 `ColumnarStore.startLazyLoading()` 起一个后台线程按段号**倒序**加载：段号与写入顺序同向，最近写入的数据最先驻留。实测 800 个段 4 万行：开库 328 → 198 ms。
+开关打开时，`recover()` 只读 `manifest.dat` 登记每段的 id、generation 与骨架元数据，段文件不读，随后 `ColumnarStore.startLazyLoading()` 的后台线程在固定并发 4（`OmapPersistence.LOAD_CONCURRENCY`）的加载线程池上按段号**倒序**加载：段号与写入顺序同向，最近写入的数据最先驻留；非惰性恢复同样经该线程池并行读回全部段，任一段读失败按段序号最小者抛出。实测 800 个段 4 万行：开库 328 → 198 ms。
 
-可见性口径：骨架随 manifest 恢复后，**未加载段对全部读路径整体可见且可剪枝**——行数（骨架行数减已删行数）、删除位图与每列 zone map 都在堆上，开库第一次 `COUNT(*)` 就是全量；需要段内容的读路径（点查 `materialize`、批量 `nextBatch`、向量化快照、合并归组）按需读回。无持久化的内存库没有 manifest，未加载段整体不参与，`publishLoaded` 发布时才计入行数与递增 modificationId。预载与驻留预算（`residentBytes`）同时开启时，预载循环在两个条件下停止：载入前驻留量已达预算即停；刚发布的段被预算立即逐出即停（判定本身最多多读一个装不下的段，此后零无效读）。全表聚合会把驻留集滚动到最近触碰的段，目标查询只读回骨架 zone map 相交的段。
+可见性口径：骨架随 manifest 恢复后，**未加载段对全部读路径整体可见且可剪枝**——行数（骨架行数减已删行数）、删除位图与每列 zone map 都在堆上，开库第一次 `COUNT(*)` 就是全量；需要段内容的读路径（点查 `materialize`、批量 `nextBatch`、向量化快照、合并归组）按需读回。无持久化的内存库没有 manifest，未加载段整体不参与，`publishLoaded` 发布时才计入行数与递增 modificationId。预载与驻留预算（`residentBytes`）同时开启时，预载在两个条件下停止：取段前驻留量已达预算即停；本次发布触发了任何预算逐出即停（并发下预算边界最多多读「并发数 - 1」个装不下的段，此后零无效读；终驻留集与顺序预载一致，逐出永远选已加载段中 id 最小者）。全表聚合会把驻留集滚动到最近触碰的段，目标查询只读回骨架 zone map 相交的段。
 
 三处配套规则：
 
@@ -322,7 +322,7 @@ src/test/java/com/hyd/h2omap/
 
 ## 当前状态与后续阶段
 
-M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成，M12（Merge-on-Read 与冷热分层）四个批次全部交付；M13（CLOB 打包存储，方案 B2）已完成；M14（段文件尾部列目录重设计，P2）、M15（裸 MIN/MAX 定界与逐出段部分列读，A+P3）与 M16（快照按段懒加载与大块 I/O）已完成。判定依据为 77 个契约用例、28 个存储层用例、3 个编码用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
+M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成，M12（Merge-on-Read 与冷热分层）四个批次全部交付；M13（CLOB 打包存储，方案 B2）已完成；M14（段文件尾部列目录重设计，P2）、M15（裸 MIN/MAX 定界与逐出段部分列读，A+P3）、M16（快照按段懒加载与大块 I/O）与 M17（并行段加载，P1）已完成。判定依据为 77 个契约用例、29 个存储层用例、3 个编码用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
 
 阶段编号按提出顺序，M7、M8 的实际交付早于 M6。
 
@@ -345,6 +345,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 | M14 段文件尾部列目录 | 段文件重设计：头部记目录偏移，列块顺序存放，尾部目录存每列偏移/长度/zone map；全量读免重算、部分列读返回不进驻留模型的 ColumnSlice；manifest 与段文件单一 v2 格式，旧 v1 回退删除，旧数据靠重新灌入 | 完成 |
 | M15 逐出段读优化 | A：裸 MIN/MAX 按骨架 zone map 迭代定界，候选段按边界排序、命中即停，逐出段只读目标列；P3：向量化快照命中逐出段时按列目录只读所需列集，临时 ColumnSlice 不进驻留模型 | 完成 |
 | M16 快照懒加载与大块 I/O | 向量化快照对逐出段不预读：骨架 + 按需列加载器构造懒段，首次读列才触发磁盘读取；无 ORDER BY 的 LIMIT 先扫驻留段与开放段/新像；行式游标推进到当前段按段读回；段文件读改整段/请求列集一次大块连续读 + 内存批量解码 | 完成 |
+| M17 并行段加载（P1） | 恢复与惰性预载的批量读段走固定并发 4 的共享加载线程池；预载停止信号改为「本次发布触发任何预算逐出」，预算边界多读的装不下的段至多并发数 - 1 个；并行恢复任一段失败按段序号最小者抛出 | 完成 |
 
 已确认的设计决策：
 
@@ -360,7 +361,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - 段级逐出按段级 LRU（未访问段按段号老优先、访问过的按访问序）而不是固定段号序：时间滚动场景下自然退化为逐出最老段，随机访问场景下被逐出的才是真冷段；逐出后段仍可见，行数、删除位图与每列 zone map 留在堆上的骨架里，因此逐出语义不复用惰性加载的「`loaded == null` 即不可见」标记，需要段内容的读路径同步读回。
 - 骨架元数据（行数、已删行数、删除位图、每列 zone map）随 manifest 持久化：惰性加载与驻留预算同时开启时，未加载段必须既可见又可剪枝，预载停止后预算外的段不能静默丢数据；无持久化的内存库没有 manifest，未加载段回退旧惰性语义。
 - 段文件重设计为「尾部列目录」单格式：头部记目录偏移，列块沿用 VEC_* 编码顺序存放，目录每项含列偏移、长度与 zone map；全量读免全列重算，`readSegmentColumns` 支持按列定位的部分读，返回不进驻留模型的 `ColumnSlice`。旧 v1 段文件与 v1 manifest 回退分支随格式重设计删除，旧数据靠重新灌入而非迁移。
-- 预载循环的两个停止条件（载入前驻留量达预算即停、刚发布的段被立即逐出即停）是内容寻址的：不依赖段号顺序，预算内的新段照常预载，预算外一个都不读，老段等查询命中时带访问标记读回。
+- 预载的停止条件（取段前驻留量达预算即停、本次发布触发任何预算逐出即停）是内容寻址的：不依赖段号顺序，预算内的新段照常预载，预算外只在并发窗口内多读「并发数 - 1」个装不下的段，老段等查询命中时带访问标记读回；并发发布下「自己发布的段被逐出」不再可靠，停止信号取发布路径在写锁内观测到的任意逐出。
 - 裸 MIN/MAX 的定界用按 zone 边界升序扫描候选段、命中即停的迭代法，而不是一次取全局最优边界，因为候选段内最优值所在行可能已被删除、一次性全局边界会算错，迭代法在任何删除形态下都精确。
 - 向量化查询命中逐出段时按段文件列目录只读所需列集，返回不进驻留模型的临时 `ColumnSlice`，不再整段读回驻留，预算稳态不被冷查询搅动；行式路径不受此影响，仍读回并驻留。
 - `residentBytes` 的运行时修改用 `ALTER TABLE ... SET RESIDENT_BYTES`（关键字形态，扩展 H2 既有 `ALTER TABLE SET` 语句族，需要替换 `Parser`）并持久化进 H2 目录：`CreateTableData.tableEngineParams` 是 public 字段且与 `TableBase` 私有字段共享同一个 `ArrayList`，改写条目后 `database.updateMeta` 经 `getCreateSQLForMeta` 重新渲染目录行，重开库即按新值生效；建表时没有 WITH 子句的表该列表不可变，由 `OmapTable` 覆写 `getCreateSQL`/`getCreateSQLForMeta` 在末尾追加 WITH 子句。预载只在启动时执行，预算调大不重启预载线程，由后续查询自然填驻留。
@@ -376,7 +377,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - 子查询下推的折叠判定与预计算都发生在 `VectorizedFilter.compile` 编译期，不在每行求值期：不相关子查询一次求值后与常量同待遇；关联形态把内层表的一次 `takeVectorizedSnapshot` 预计算成分组聚合或键集合，外层扫描阶段只做哈希查找。预计算的聚合口径对齐 H2 的 `AggregateDataDefault`/`AggregateDataAvg`：`SUM` 溢出即回退，`AVG` 按结果类型走 double 或 `BigDecimal` 除法（HALF_DOWN），`MIN`/`MAX` 用 `session.compare`；关联键无匹配组时 `COUNT` 取 0、其余聚合取 NULL（与 SQL 空组语义一致）；内外层 NULL 键不匹配。整数列的 `IN` 与半连接用原始 `long` 开放寻址集合，避免百万级 `Value` 装箱哈希。关联聚合的外层扫描对字典键列（`DictValueVector`、`DictVarcharVector`）按字典下标预先解析出每个码的比较目标，行内只剩数组读，不再逐行装箱或哈希查找。
 - 向量化快照对逐出段不预读：拍快照用堆上骨架构造懒加载段（行数、删除位图、zone map 零 I/O），执行期首次读列才触发按列目录的临时切片读；无 `ORDER BY` 的 `LIMIT` 先扫驻留段与开放段/新像，驻留可见行数不足才按需读回逐出段。这条路径的取舍是无 `ORDER BY` 时返回行序不再隐含段号升序（H2 本就不保证无排序查询的行序）。
 - 行式行迭代器推进到当前相交段时按段读回（复用驻留通道，预算装不下单段时退整段临时读并复用到本段扫完），不再在入口对剩余扫描范围全量预读；行式读回段进 LRU 由预算管理，扫描集超预算时先扫的段被后扫的段挤出属预期。
-- 段文件读全部走「一次大块连续读 + 内存批量解码」：全量读整段读入后用 `ByteBuffer` 视图批量拷贝原始数组、打包文本按列块长度精确分配；部分列读尾部目录一次块读、请求列在文件上首尾相接时合并成单次连续读。磁盘约束型的单线程读取下小 I/O 与逐元素解码是主要瓶颈，并行读线程暂缓（见「尚未实现」）。
+- 段文件读全部走「一次大块连续读 + 内存批量解码」：全量读整段读入后用 `ByteBuffer` 视图批量拷贝原始数组、打包文本按列块长度精确分配；部分列读尾部目录一次块读、请求列在文件上首尾相接时合并成单次连续读。磁盘约束型的单线程读取下小 I/O 与逐元素解码是主要瓶颈；批量读段的 I/O 并发由 M17 的加载线程池提供。
 - 默认引擎由替换后的 `Schema.createTable()` 决定，不依赖 `DEFAULT_TABLE_ENGINE`（它会把 H2 元数据表也交给本引擎）。
 - 性能数字记录在 `BENCHMARK_RESULT.md` 与 `problems/查询性能优化方向.md`；回归只要求集成测试与内部计数器断言。
 
@@ -384,7 +385,6 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 
 - 并发写的后台合并线程：合并现在由写路径同步触发。
 - M12 已全部交付（批次 1 删除位图与空段丢弃、批次 2 delta rowset、批次 3 段级部分聚合缓存、批次 4 段级 LRU 逐出）；驻留预算按估算内存而非精确占用，重开库后访问热度清零、按段号老优先。
-- 并行段加载（预载/逐出读回的 I/O 并发）暂缓：当前单线程读速受磁盘约束，多线程对磁盘约束型读取没有倍增效应；若将来实测瓶颈转到 CPU 解码侧再立项。
 - 段级部分聚合缓存不覆盖 `COUNT(DISTINCT)`、多列分组、表达式分组键与投影/JOIN 里的子查询；这些形态照常逐段扫描。
 - 数组列的剪枝与按元素过滤：数组列不参与 zone map 剪枝（算值域要重建每行 `ValueArray`，而数组值域几乎不能用于跳段），`UNNEST` 与按元素过滤也没有下推路径。
 - `collectVisibleRowIds` 的数组按 `rowCount` 估计值起步并在超出时扩容，因此估计值与实际可见行数不一致时不会越界；但行数仍不可能超过 `Integer.MAX_VALUE`（`long[]` 的长度上限）。
