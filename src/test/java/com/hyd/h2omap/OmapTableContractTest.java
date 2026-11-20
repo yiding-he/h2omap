@@ -343,12 +343,12 @@ class OmapTableContractTest {
                 assertEquals("400", toString(s, "SELECT COUNT(*) FROM T"));
                 assertEquals("79800", toString(s, "SELECT SUM(ID) FROM T"));
 
-                // 全表聚合后驻留集滚动到最近触碰的两段，这里不断驻留状态；
-                // 目标查询只命中段 0（骨架 zone map 剪枝）：按需读回且驻留稳定。
+                // 全表聚合与目标查询都走部分列读：命中段不进驻留，驻留集保持预载后的两段。
                 assertEquals("50", toString(s, "SELECT COUNT(*) FROM T WHERE ID < 50"));
-                assertTrue(store.isSegmentResident(0), "查询命中的老段应读回并驻留");
+                assertFalse(store.isSegmentResident(0), "部分列读不进驻留模型");
                 assertEquals("v".repeat(60) + "59", toString(s, "SELECT V FROM T WHERE ID = 59"));
-                assertTrue(store.isSegmentResident(0), "命中段读回后应驻留稳定");
+                assertFalse(store.isSegmentResident(0), "部分列读不进驻留模型");
+                assertTrue(store.isSegmentResident(7), "预载驻留的最新段不受影响");
             }
         } finally {
             if (previous == null) {
@@ -2123,8 +2123,9 @@ class OmapTableContractTest {
     }
 
     /**
-     * ALTER TABLE SET RESIDENT_BYTES：调小立即逐出、查询仍正确（临时读）；调大由后续查询
-     * 自然填驻留（不重启预载）；改动同步进 H2 目录的建表 SQL，重开库后按新值生效。
+     * ALTER TABLE SET RESIDENT_BYTES：调小立即逐出、查询仍正确（定界与部分列读）；
+     * 调大后向量化查询不填驻留，行式路径触达的段按新预算读回驻留（不重启预载）；
+     * 改动同步进 H2 目录的建表 SQL，重开库后按新值生效。
      */
     @Test
     void alterTableSetResidentBytesAppliesAndPersists(@TempDir Path dir) throws Exception {
@@ -2155,13 +2156,16 @@ class OmapTableContractTest {
             assertTrue(sql.contains("residentBytes=1"), "目录 SQL 应含新预算: " + sql);
             assertTrue(sql.contains("segmentSize=50"), "其他 WITH 参数保留: " + sql);
 
-            // 调大到 400k（= 形式）：不重启预载，由后续查询自然填驻留。
+            // 调大到 400k（= 形式）：向量化查询走骨架定界与部分列读，不填驻留；
+            // 行式路径触达的段按新预算读回驻留（不重启预载）。
             // 注意 COUNT(*) 在预算 1 阶段已执行过且数据未变，会命中 H2 结果缓存，
             // 不会触碰存储层；用没执行过的新查询触发重载。
             s.execute("ALTER TABLE T SET RESIDENT_BYTES = '400k'");
             assertEquals("199", toString(s, "SELECT MAX(ID) FROM T"));
-            assertTrue(t.getStore().isSegmentResident(0), "400k 预算下查询后应全部驻留");
-            assertTrue(t.getStore().isSegmentResident(3), "400k 预算下查询后应全部驻留");
+            assertFalse(t.getStore().isSegmentResident(0), "定界求值不进驻留模型");
+            assertEquals(200, countRows(s, "SELECT DISTINCT V FROM T"));
+            assertTrue(t.getStore().isSegmentResident(0), "行式路径触达后按新预算驻留");
+            assertTrue(t.getStore().isSegmentResident(3), "行式路径触达后按新预算驻留");
             assertEquals("200", toString(s, "SELECT COUNT(*) FROM T"));
             sql = createTableSqlFromScript(s, "T");
             assertTrue(sql.contains("residentBytes=409600"), "单位后缀按 1024 换算: " + sql);
@@ -2341,15 +2345,22 @@ class OmapTableContractTest {
             assertEquals("400", toString(s, "SELECT COUNT(*) FROM T"));
             assertEquals("79800", toString(s, "SELECT SUM(ID) FROM T"));
 
-            // 只触碰段 0（ID 0..49）：读回后段 0 驻留，且按访问时间保护，
-            // 未被访问的驻留段让位；这证明逐出按访问时间而非段号新老。
+            // 向量化聚合走部分列读：结果正确，但命中的段 0/5 不进驻留，驻留集不变。
             assertEquals("1225", toString(s, "SELECT SUM(ID) FROM T WHERE ID < 50"));
-            assertTrue(store.isSegmentResident(0), "刚被访问的段应已读回");
-            assertFalse(store.isSegmentResident(7), "未被访问的驻留段应让位");
-
-            // 再访问段 5（ID 250..299）：上一轮刚访问的段 0 比段 5 更久未访问，先让位。
+            assertFalse(store.isSegmentResident(0), "部分列读不进驻留模型");
             assertEquals("13725", toString(s, "SELECT SUM(ID) FROM T WHERE ID >= 250 AND ID < 300"));
-            assertTrue(store.isSegmentResident(5));
+            assertFalse(store.isSegmentResident(5), "部分列读不进驻留模型");
+
+            // 行式路径（DISTINCT 不下推）命中的段读回并驻留。
+            assertEquals(50, countRows(s, "SELECT DISTINCT V FROM T WHERE ID < 50"));
+            assertTrue(store.isSegmentResident(0), "行式路径命中的段应读回驻留");
+            assertEquals(50, countRows(s, "SELECT DISTINCT V FROM T WHERE ID >= 250 AND ID < 300"));
+            assertTrue(store.isSegmentResident(5), "行式路径命中的段应读回驻留");
+
+            // 再触碰段 2（ID 100..149）：上一轮刚访问的段 0 比段 5 更久未访问，先让位；
+            // 这证明逐出按访问时间而非段号新老。
+            assertEquals(50, countRows(s, "SELECT DISTINCT V FROM T WHERE ID >= 100 AND ID < 150"));
+            assertTrue(store.isSegmentResident(2));
             assertFalse(store.isSegmentResident(0), "访问时间更早的段应先被逐出");
 
             // 行式路径（DISTINCT）与逐出段上的点查、更新、删除。
@@ -2372,6 +2383,153 @@ class OmapTableContractTest {
             assertEquals("398", toString(s, "SELECT COUNT(*) FROM T"));
             assertEquals("79599", toString(s, "SELECT SUM(ID) FROM T"));
             assertEquals("-1", toString(s, "SELECT IV FROM T WHERE ID = 125"));
+        }
+    }
+
+    /**
+     * 裸 MIN/MAX 的骨架定界：段按目标方向的 zone 边界排序后依次扫描，命中即停。
+     * 逐出段只读目标列，不进驻留模型、不改变逐出计数；zone 边界含已删行
+     * （delta 删除未回写段）时逐段推进仍精确；delta 新像与开放段的行无条件参与。
+     * ID 与 TS 随插入递增（聚簇同向），IV 逆向分布（定界须跳过值域更大的老段）。
+     */
+    @Test
+    void bareExtremeStopsAtZoneBounds(@TempDir Path dir) throws Exception {
+        String url = "jdbc:h2:" + dir.resolve("extreme");
+        String pad = "v".repeat(60);
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            s.execute(createTable("T", "ID INT, TS TIMESTAMP, V VARCHAR(64), IV INT",
+                    "\"segmentSize=50\", \"compactionMinRows=100000\", \"residentBytes=40000\""));
+            for (int i = 0; i < 400; i++) {
+                s.execute("INSERT INTO T VALUES (" + i
+                        + ", TIMESTAMPADD(MINUTE, " + i + ", TIMESTAMP '2026-01-01 00:00:00')"
+                        + ", '" + pad + i + "', " + (399 - i) + ")");
+            }
+            org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                    ((org.h2.jdbc.JdbcConnection) c).getSession();
+            com.hyd.h2omap.storage.ColumnarStore store =
+                    ((com.hyd.h2omap.table.OmapTable) session.getDatabase().getMainSchema()
+                            .findTableOrView(session, "T")).getStore();
+            assertFalse(store.isSegmentResident(0), "最老的段应已逐出");
+            assertFalse(store.isSegmentResident(5), "中段应已逐出");
+            long evictedBefore = store.getEvictedSegmentCount();
+
+            // 聚簇同向：MIN 只扫首段；逆向列：MIN/MAX 分别只扫值域最小的段。
+            long scans = store.getExtremeScannedSegments();
+            assertEquals("0", toString(s, "SELECT MIN(ID) FROM T"));
+            assertEquals(1, store.getExtremeScannedSegments() - scans, "MIN(ID) 只扫一个候选段");
+            scans = store.getExtremeScannedSegments();
+            assertEquals("399", toString(s, "SELECT MAX(ID) FROM T"));
+            assertEquals(1, store.getExtremeScannedSegments() - scans, "MAX(ID) 只扫一个候选段");
+            scans = store.getExtremeScannedSegments();
+            assertEquals("0", toString(s, "SELECT MIN(IV) FROM T"));
+            assertEquals(1, store.getExtremeScannedSegments() - scans, "逆向列 MIN 只扫值域最小的段");
+            scans = store.getExtremeScannedSegments();
+            assertEquals("399", toString(s, "SELECT MAX(IV) FROM T"));
+            assertEquals(1, store.getExtremeScannedSegments() - scans, "逆向列 MAX 只扫值域最大的段");
+            try (java.sql.ResultSet rs = s.executeQuery("SELECT MIN(TS) FROM T")) {
+                assertTrue(rs.next());
+                assertEquals(java.sql.Timestamp.valueOf("2026-01-01 00:00:00").getTime(),
+                        rs.getTimestamp(1).getTime());
+            }
+            assertFalse(store.isSegmentResident(0), "定界求值不进驻留模型");
+            assertFalse(store.isSegmentResident(5), "定界求值不进驻留模型");
+            assertEquals(evictedBefore, store.getEvictedSegmentCount(), "定界求值不触发逐出");
+
+            // zone 边界含已删行：删掉段 0 的最小行后 MIN 仍来自段 0（delta 删除参与定界）。
+            s.execute("DELETE FROM T WHERE ID = 0");
+            scans = store.getExtremeScannedSegments();
+            assertEquals("1", toString(s, "SELECT MIN(ID) FROM T"));
+            assertEquals(1, store.getExtremeScannedSegments() - scans, "删掉最小行后仍只扫段 0");
+            // 整段删空触发整段摘除：MIN 落到段 1，候选只剩一段。
+            s.execute("DELETE FROM T WHERE ID < 50");
+            scans = store.getExtremeScannedSegments();
+            assertEquals("50", toString(s, "SELECT MIN(ID) FROM T"));
+            assertEquals(1, store.getExtremeScannedSegments() - scans, "整段摘除后只扫段 1");
+
+            // delta 新像与开放段的行参与定界；被更新行的旧像不参与。
+            s.execute("UPDATE T SET ID = 1000 WHERE ID = 50");
+            assertEquals("51", toString(s, "SELECT MIN(ID) FROM T"));
+            s.execute("UPDATE T SET ID = -5 WHERE ID = 52");
+            assertEquals("-5", toString(s, "SELECT MIN(ID) FROM T"));
+            s.execute("INSERT INTO T VALUES (-100, TIMESTAMP '2025-12-31 23:00:00', 'x', 400)");
+            assertEquals("-100", toString(s, "SELECT MIN(ID) FROM T"));
+            try (java.sql.ResultSet rs = s.executeQuery("SELECT MIN(TS) FROM T")) {
+                assertTrue(rs.next());
+                assertEquals(java.sql.Timestamp.valueOf("2025-12-31 23:00:00").getTime(),
+                        rs.getTimestamp(1).getTime());
+            }
+            assertEquals("351", toString(s, "SELECT COUNT(*) FROM T"));
+        }
+    }
+
+    /**
+     * 向量化查询对逐出段走部分列读：命中段不进驻留模型、不触发 LRU 逐出；
+     * 全表聚合、过滤聚合、点查投影与裸 MAX 的结果与全驻留一致（含 delta 删除与更新）；
+     * 行式路径（DISTINCT）仍读回并驻留；重开后同样的查询仍正确。
+     */
+    @Test
+    void evictedVectorizedQueriesUsePartialColumnReads(@TempDir Path dir) throws Exception {
+        String url = "jdbc:h2:" + dir.resolve("partial");
+        String pad = "v".repeat(60);
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            s.execute(createTable("T", "ID INT, V VARCHAR(64), IV INT, CAT VARCHAR(8), TS TIMESTAMP",
+                    "\"segmentSize=50\", \"compactionMinRows=100000\", \"residentBytes=40000\""));
+            for (int i = 0; i < 400; i++) {
+                s.execute("INSERT INTO T VALUES (" + i + ", '" + pad + i + "', " + i
+                        + ", 'c" + (i % 4) + "', TIMESTAMPADD(MINUTE, " + i
+                        + ", TIMESTAMP '2026-01-01 00:00:00'))");
+            }
+            org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                    ((org.h2.jdbc.JdbcConnection) c).getSession();
+            com.hyd.h2omap.storage.ColumnarStore store =
+                    ((com.hyd.h2omap.table.OmapTable) session.getDatabase().getMainSchema()
+                            .findTableOrView(session, "T")).getStore();
+            assertFalse(store.isSegmentResident(0), "最老的段应已逐出");
+            assertFalse(store.isSegmentResident(5), "中段应已逐出");
+            long evictedBefore = store.getEvictedSegmentCount();
+
+            // 全表与过滤聚合、点查投影、裸 MAX：命中段走部分列读。
+            assertEquals("400", toString(s, "SELECT COUNT(*) FROM T"));
+            assertEquals("79800", toString(s, "SELECT SUM(ID) FROM T"));
+            assertEquals("100", toString(s, "SELECT COUNT(*) FROM T WHERE ID < 100"));
+            assertEquals("4950", toString(s, "SELECT SUM(ID) FROM T WHERE ID < 100"));
+            assertEquals("100", toString(s, "SELECT COUNT(*) FROM T WHERE CAT = 'c1'"));
+            assertEquals("19900", toString(s, "SELECT SUM(ID) FROM T WHERE CAT = 'c1'"));
+            assertEquals("399", toString(s, "SELECT MAX(ID) FROM T"));
+            assertEquals("55", toString(s, "SELECT ID FROM T WHERE ID = 55"));
+            assertEquals(pad + "55", toString(s, "SELECT V FROM T WHERE ID = 55"));
+            assertEquals(10, countRows(s, "SELECT V FROM T WHERE ID >= 50 AND ID < 60"));
+            assertFalse(store.isSegmentResident(0), "部分列读不进驻留模型");
+            assertFalse(store.isSegmentResident(5), "部分列读不进驻留模型");
+            assertEquals(evictedBefore, store.getEvictedSegmentCount(), "部分列读不触发逐出");
+            assertTrue(store.getTransientSliceReads() > 0, "向量化命中逐出段应走部分列读");
+            assertEquals(0, store.getTransientFullReads(), "向量化路径不应误走整段临时读");
+
+            // delta 删除与更新在部分列读上仍精确；行式扫描（DELETE/UPDATE）按
+            // 预算可临时整段读，这里只约束向量化查询仍走切片读。
+            long sliceBefore = store.getTransientSliceReads();
+            s.execute("DELETE FROM T WHERE ID IN (0, 1)");
+            assertEquals("398", toString(s, "SELECT COUNT(*) FROM T"));
+            assertEquals("79799", toString(s, "SELECT SUM(ID) FROM T"));
+            s.execute("UPDATE T SET IV = -1 WHERE ID = 100");
+            assertEquals("6124", toString(s, "SELECT SUM(IV) FROM T WHERE ID >= 100 AND ID < 150"));
+            assertTrue(store.getTransientSliceReads() > sliceBefore,
+                    "delta 改动后的向量化查询仍走部分列读");
+
+            // 行式路径（DISTINCT 不下推）命中的段读回并驻留，与部分列读形成对照。
+            // ID 0 与 1 已删：段 0 剩 48 行。
+            assertEquals(48, countRows(s, "SELECT DISTINCT V FROM T WHERE ID < 50"));
+            assertTrue(store.isSegmentResident(0), "行式路径仍读回并驻留");
+        }
+        // 重开：骨架可见性不变，同样的查询仍正确。
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            assertEquals("398", toString(s, "SELECT COUNT(*) FROM T"));
+            assertEquals("79799", toString(s, "SELECT SUM(ID) FROM T"));
+            assertEquals("6124", toString(s, "SELECT SUM(IV) FROM T WHERE ID >= 100 AND ID < 150"));
+            assertEquals("399", toString(s, "SELECT MAX(ID) FROM T"));
         }
     }
 
