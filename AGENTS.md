@@ -27,7 +27,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | JDK | 构建与运行用 JDK 21.0.11；字节码目标 `maven.compiler.release=17` |
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变）。被替换的 3 个 H2 类按该版本源码合入，升级时必须逐类重新比对 |
 | 依赖 | 运行期只有 `com.h2database:h2`，测试用 `junit-jupiter`，构建期插件 `maven-shade-plugin` |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（76 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（24 个用例）、`src/test/java/com/hyd/h2omap/storage/SegmentFileFormatTest.java`（4 个用例）、`src/test/java/com/hyd/h2omap/persistence/ValueCodecTest.java`（3 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（77 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（24 个用例）、`src/test/java/com/hyd/h2omap/storage/SegmentFileFormatTest.java`（4 个用例）、`src/test/java/com/hyd/h2omap/persistence/ValueCodecTest.java`（3 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/`。该目录可能不存在（已排除在版本控制之外）。Maven Central 的 `h2-2.5.252-sources.jar` 内容等价，但个别文件与该 zip 相差数行，核对行号时以 zip 为准 |
 
 ## H2 侧的依据
@@ -143,7 +143,7 @@ delta rowset（Merge-on-Read 批次 2）：更新新像不再按行存放（`Map
 
 段级部分聚合缓存（Merge-on-Read 批次 3）：`SegmentAggCache` 按「查询签名 × 段」缓存部分聚合结果，无分组时是 `AggState[]`、单列分组时是 `Map<Value, AggState[]>`。签名 = 过滤树语义签名（各谓词节点的列、比较、常量、集合内容）+ 分组键列 + 每个聚合的类型/列/算术口径/结果类型；`COUNT(DISTINCT)`、多列分组与含子查询预计算的谓词不参与。失效坐标是「段的 generation + 该段的 delta 屏蔽位版本」：合并会换 generation，未回写删除与更新新像的每次变化都递增 `DeltaStore` 的段版本；跨段写因此只使被改动的段失效，其余段在下一轮同签名聚合中直接合并缓存的部分结果（40 万行实测 26 ms → 1-2 ms）。合并部分结果时绝不与缓存对象按引用共享：`groups` 里的状态随后还会被 delta/开放段行累加，共享会污染缓存。分组部分结果基数超过 4096 不缓存；签名数量上限 64（访问序淘汰）。
 
-段级逐出（Merge-on-Read 批次 4）：表级 WITH 参数 `residentBytes` 给出冻结段驻留堆的估算字节数预算（纯数字按字节，可跟后缀 k/m/g，不区分大小写，按 1024 换算，如 8g；非法后缀建表即报错），默认 0 不逐出；仅文件模式库生效（内存库无段文件可读回，不逐出）。预算可随时用 `ALTER TABLE [IF EXISTS] t SET RESIDENT_BYTES '40k'` 修改（`=` 可选，值解析与建表参数共用同一 `parseByteSize`；非 OMAP 表、非法后缀、NULL 值报 SQL 错误）：调小立即在写锁内逐出到新预算，调大不重启预载、由后续查询自然填驻留（预算变化不改变数据，H2 结果缓存对重复查询仍直接命中）。修改同步进 H2 目录的建表 SQL，重开库按新值生效：`CreateTableData.tableEngineParams` 是 public 字段、与 `TableBase` 私有字段同一个 `ArrayList` 实例，改写该条目后调 `database.updateMeta` 重写目录行（`MetaRecord` 经 `getCreateSQLForMeta` 重新渲染）；建表时没有 WITH 子句的表该列表不可变，由 `OmapTable` 覆写 `getCreateSQL`/`getCreateSQLForMeta` 在末尾追加 WITH 子句。逐出后段仍可见、只是慢：行数、已删行数、删除位图与每列 zone map 留在堆上的骨架里，行号级读路径（行迭代器、`collectVisibleRowIds`、可见性判定、全删段丢弃）全部走骨架；需要段内容的读路径先把段同步读回——点查在 `materialize` 前、批量行读在 `nextBatch` 前（用骨架 zone map 先剪枝再读回）、向量化快照在取快照前、合并第一阶段在归组前。逐出顺序按段级 LRU：从未被查询访问的段按段号老优先，访问过的按访问序，与数据写入顺序无关，时间滚动场景自然退化为逐出最老段。预算小于查询工作集时读回后可能被后续读回逐出，此时批量与向量化路径退回「读一份仅供本次使用」的临时读，不回写驻留状态；预算连单个段都容不下时（如 residentBytes=1）所有段保持逐出，点查、批量与向量化路径全部退回临时读，行仍完整可见。逐出检查在段冻结的 checkpoint 之后、合并收尾与恢复收尾触发，读回后的段拥有最新访问序号，不会被紧接着的预算逐出先选中。重开库时恢复收尾把驻留裁回预算；骨架元数据随 manifest（v2）持久化，惰性加载与逐出同时开启时，重开后全部段立即可见可剪枝，预载只填预算内的内容（见「惰性加载」一节）。回归防线是「随机散布写压力用例」：随机 UPDATE/DELETE/INSERT 散布全部段，每轮与 MVStore 逐查询比对，并断言无写的第二遍命中段级部分聚合缓存，防止后续机制窄化到「只改最老几段」的滚动场景。
+段级逐出（Merge-on-Read 批次 4）：表级 WITH 参数 `residentBytes` 给出冻结段驻留堆的估算字节数预算（纯数字按字节，可跟后缀 k/m/g，不区分大小写，按 1024 换算，如 8g；非法后缀建表即报错），默认 0 不逐出；仅文件模式库生效（内存库无段文件可读回，不逐出）。预算可随时用 `ALTER TABLE [IF EXISTS] t SET RESIDENT_BYTES '40k'` 修改（`=` 可选，值解析与建表参数共用同一 `parseByteSize`；非 OMAP 表、非法后缀、NULL 值报 SQL 错误）：调小立即在写锁内逐出到新预算，调大不重启预载、由后续查询自然填驻留（预算变化不改变数据，H2 结果缓存对重复查询仍直接命中）。修改同步进 H2 目录的建表 SQL，重开库按新值生效：`CreateTableData.tableEngineParams` 是 public 字段、与 `TableBase` 私有字段同一个 `ArrayList` 实例，改写该条目后调 `database.updateMeta` 重写目录行（`MetaRecord` 经 `getCreateSQLForMeta` 重新渲染）；建表时没有 WITH 子句的表该列表不可变，由 `OmapTable` 覆写 `getCreateSQL`/`getCreateSQLForMeta` 在末尾追加 WITH 子句。逐出后段仍可见、只是慢：行数、已删行数、删除位图与每列 zone map 留在堆上的骨架里，行号级读路径（行迭代器、`collectVisibleRowIds`、可见性判定、全删段丢弃）全部走骨架；需要段内容的读路径先把段同步读回——点查在 `materialize` 前、合并第一阶段在归组前；批量行读与向量化快照不预读，改为推进到当前段/首次读列时按需读回（行式批量读复用驻留通道，向量化走临时切片读，见「逐出段的部分列读」）。逐出顺序按段级 LRU：从未被查询访问的段按段号老优先，访问过的按访问序，与数据写入顺序无关，时间滚动场景自然退化为逐出最老段。预算小于查询工作集时批量行读的读回可能被后续读回逐出，退回「读一份仅供本次使用」的临时读、不回写驻留状态；预算连单个段都容不下时（如 residentBytes=1）所有段保持逐出，点查与批量路径退回临时读，向量化路径的逐出段恒走临时切片读、不进驻留模型，行仍完整可见。逐出检查在段冻结的 checkpoint 之后、合并收尾与恢复收尾触发，读回后的段拥有最新访问序号，不会被紧接着的预算逐出先选中。重开库时恢复收尾把驻留裁回预算；骨架元数据随 manifest（v2）持久化，惰性加载与逐出同时开启时，重开后全部段立即可见可剪枝，预载只填预算内的内容（见「惰性加载」一节）。回归防线是「随机散布写压力用例」：随机 UPDATE/DELETE/INSERT 散布全部段，每轮与 MVStore 逐查询比对，并断言无写的第二遍命中段级部分聚合缓存，防止后续机制窄化到「只改最老几段」的滚动场景。
 
 ## 向量化执行
 
@@ -162,7 +162,7 @@ delta rowset（Merge-on-Read 批次 2）：更新新像不再按行存放（`Map
 
 裸 MIN/MAX 定界：`tryExecuteGroup` 对无 `WHERE`、无 `GROUP BY`、单聚合且聚合参数为列引用的 `MIN`/`MAX` 走 `ColumnarStore.extremeColumn()`：候选段按目标方向的骨架 zone 边界排序后依次扫描，下一个段的边界已不优于当前最优值即停——时间递增数据通常扫一段即停，逐出段只读目标列，不进驻留模型。zone 边界含已删行，因此不能一次只扫全局边界最优的段（其最优行可能已删，迭代推进在任何删除形态下精确）；delta 新像与开放段的行无条件参与，扫描段内 delta 已删与已更新的旧像不参与。数组列与不可比较类型不定界，交回常规路径。
 
-逐出段的部分列读：向量化快照把「谓词列 + 聚合参数列 + 分组键 + 排序键」的列集传给 `takeVectorizedSnapshot`，逐出段按段文件尾部列目录只读这些列（`readSegmentColumns` → 临时 `ColumnSlice`），不进驻留模型、不触发逐出，预算稳态不被冷查询搅动；行式路径的读回仍整段读并驻留，与切片读形成对照。
+逐出段的部分列读：向量化快照把「谓词列 + 聚合参数列 + 分组键 + 排序键」的列集传给 `takeVectorizedSnapshot`，拍快照不读盘——逐出段用堆上骨架构造懒加载段，行数、删除位图与 zone map 零 I/O，执行期首次读列才按段文件尾部列目录触发磁盘读取（`readSegmentColumns` → 临时 `ColumnSlice`），不进驻留模型、不触发逐出，预算稳态不被冷查询搅动，被 `canSkipSegment` 跳过或聚合缓存命中的段零读盘。无 `ORDER BY` 的 `LIMIT` 先扫驻留段与开放段/新像，驻留可见行数不足才按需读回逐出段，返回行序不再隐含段号升序（无 `ORDER BY` 时 H2 本就不保证行序）；行式路径（如 DISTINCT）经驻留通道推进到当前段时逐段读回，读回段进 LRU 由预算管理，与切片读形成对照。
 
 有序模式：`ORDER BY` 单列加常量 `LIMIT` 时，段按排序列在 zone map 上的边界排序后依次扫描，用容量为 `limit + offset` 的堆留下前 N 行；堆已满且某段内最好的一行也不优于第 N 名时整段跳过。物理聚簇与排序键同向时只需扫一两段；同向不成立时结果仍正确，只是跳过不了段。多列 `ORDER BY`、排序键为表达式、`LIMIT` 缺失或超过 10000 时交回 H2。
 
@@ -194,7 +194,7 @@ tail_<walSeq>.omap            检查点时刻的开放段行、openDeletes 与 d
 wal_<seq>.log                 检查点之后的增量：insert/update/delete/truncate
 ```
 
-manifest 与段文件都只有 v2 一种格式，旧 v1 回退分支已删除：旧格式文件报非法魔数，不迁移。全量读经尾部目录恢复 zone map 与已删行数，不再全列重算；`OmapPersistence.readSegmentColumns` 按目录只读请求列的列块，返回 `ColumnSlice`（列向量 + zone map + 行数 + 删除位图），切片不注册段引用、不计入驻留预算、不触发 LRU 触碰，只服务按需读路径（接入预留，未接消费者）。
+manifest 与段文件都只有 v2 一种格式，旧 v1 回退分支已删除：旧格式文件报非法魔数，不迁移。全量读经尾部目录恢复 zone map 与已删行数，不再全列重算；整段一次大块读入后列块与目录都在内存缓冲上解码——原始数组用 `ByteBuffer` 视图一次批量拷贝（消掉 `DataInputStream` 逐元素的同步单字节拼接），打包文本按列块长度恒等式「剩余字节 - rows*4」一次精确分配零扩容，目录偏移与列块长度做位置校验；`OmapPersistence.readSegmentColumns` 尾部目录一次块读，请求列在文件上首尾相接时合并成单次大块连续读，返回 `ColumnSlice`（列向量 + zone map + 行数 + 删除位图），切片不注册段引用、不计入驻留预算、不触发 LRU 触碰，只服务向量化快照与临时读路径。
 
 `append`、`remove`、`update`、`truncate` 在存储写锁外追加一条 WAL 记录，`syncExecutor` 按 `syncIntervalMs` 对通道执行 `force`。开放段写满冻结后立即 `checkpoint()`；`compact()` 的改动数达到 `max(1024, compactionMinRows)` 时也 `checkpoint()`。`checkpoint()` 在写锁内取段清单、开放段行、`openDeletes` 与 `delta` 的快照并 `rotateWal()`，锁外写段文件与 `tail`，最后写 `manifest.dat` 并清理过期文件。
 
@@ -322,7 +322,7 @@ src/test/java/com/hyd/h2omap/
 
 ## 当前状态与后续阶段
 
-M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成，M12（Merge-on-Read 与冷热分层）四个批次全部交付；M13（CLOB 打包存储，方案 B2）已完成；M14（段文件尾部列目录重设计，P2）与 M15（裸 MIN/MAX 定界与逐出段部分列读，A+P3）已完成。判定依据为 76 个契约用例、28 个存储层用例、3 个编码用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
+M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成，M12（Merge-on-Read 与冷热分层）四个批次全部交付；M13（CLOB 打包存储，方案 B2）已完成；M14（段文件尾部列目录重设计，P2）、M15（裸 MIN/MAX 定界与逐出段部分列读，A+P3）与 M16（快照按段懒加载与大块 I/O）已完成。判定依据为 77 个契约用例、28 个存储层用例、3 个编码用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
 
 阶段编号按提出顺序，M7、M8 的实际交付早于 M6。
 
@@ -344,6 +344,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 | M13 CLOB 打包存储 | 方案 B2：段内 CLOB 列复用「字节池 + 偏移」机制（ClobVector），装箱时才切出 ValueClob，消掉逐值对象开销；内容仍驻堆、不读盘，谓词语义不变；段文件新增 VEC_CLOB，旧段 VEC_VALUE 读路径不变 | 完成 |
 | M14 段文件尾部列目录 | 段文件重设计：头部记目录偏移，列块顺序存放，尾部目录存每列偏移/长度/zone map；全量读免重算、部分列读返回不进驻留模型的 ColumnSlice；manifest 与段文件单一 v2 格式，旧 v1 回退删除，旧数据靠重新灌入 | 完成 |
 | M15 逐出段读优化 | A：裸 MIN/MAX 按骨架 zone map 迭代定界，候选段按边界排序、命中即停，逐出段只读目标列；P3：向量化快照命中逐出段时按列目录只读所需列集，临时 ColumnSlice 不进驻留模型 | 完成 |
+| M16 快照懒加载与大块 I/O | 向量化快照对逐出段不预读：骨架 + 按需列加载器构造懒段，首次读列才触发磁盘读取；无 ORDER BY 的 LIMIT 先扫驻留段与开放段/新像；行式游标推进到当前段按段读回；段文件读改整段/请求列集一次大块连续读 + 内存批量解码 | 完成 |
 
 已确认的设计决策：
 
@@ -373,6 +374,9 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - 两个索引的 `getCreateSQL()` 都保持返回 `null`：区间分支虽然按索引列有序返回，但顺序保证由 H2 的 `Select.getIndexSorts` 判断，交给扫描加排序更稳妥。
 - 向量化下推只在替换后的 `Select` 上触发，拒绝条件命中时退回 H2 原路径；下推只改变执行方式，不改变结果集内容。无 `ORDER BY` 时把 `LIMIT`、`OFFSET` 折成行数上限；`ORDER BY` 单列加常量 `LIMIT` 时由有序模式产出已排序结果，其余 `ORDER BY` 仍交回 H2。
 - 子查询下推的折叠判定与预计算都发生在 `VectorizedFilter.compile` 编译期，不在每行求值期：不相关子查询一次求值后与常量同待遇；关联形态把内层表的一次 `takeVectorizedSnapshot` 预计算成分组聚合或键集合，外层扫描阶段只做哈希查找。预计算的聚合口径对齐 H2 的 `AggregateDataDefault`/`AggregateDataAvg`：`SUM` 溢出即回退，`AVG` 按结果类型走 double 或 `BigDecimal` 除法（HALF_DOWN），`MIN`/`MAX` 用 `session.compare`；关联键无匹配组时 `COUNT` 取 0、其余聚合取 NULL（与 SQL 空组语义一致）；内外层 NULL 键不匹配。整数列的 `IN` 与半连接用原始 `long` 开放寻址集合，避免百万级 `Value` 装箱哈希。关联聚合的外层扫描对字典键列（`DictValueVector`、`DictVarcharVector`）按字典下标预先解析出每个码的比较目标，行内只剩数组读，不再逐行装箱或哈希查找。
+- 向量化快照对逐出段不预读：拍快照用堆上骨架构造懒加载段（行数、删除位图、zone map 零 I/O），执行期首次读列才触发按列目录的临时切片读；无 `ORDER BY` 的 `LIMIT` 先扫驻留段与开放段/新像，驻留可见行数不足才按需读回逐出段。这条路径的取舍是无 `ORDER BY` 时返回行序不再隐含段号升序（H2 本就不保证无排序查询的行序）。
+- 行式行迭代器推进到当前相交段时按段读回（复用驻留通道，预算装不下单段时退整段临时读并复用到本段扫完），不再在入口对剩余扫描范围全量预读；行式读回段进 LRU 由预算管理，扫描集超预算时先扫的段被后扫的段挤出属预期。
+- 段文件读全部走「一次大块连续读 + 内存批量解码」：全量读整段读入后用 `ByteBuffer` 视图批量拷贝原始数组、打包文本按列块长度精确分配；部分列读尾部目录一次块读、请求列在文件上首尾相接时合并成单次连续读。磁盘约束型的单线程读取下小 I/O 与逐元素解码是主要瓶颈，并行读线程暂缓（见「尚未实现」）。
 - 默认引擎由替换后的 `Schema.createTable()` 决定，不依赖 `DEFAULT_TABLE_ENGINE`（它会把 H2 元数据表也交给本引擎）。
 - 性能数字记录在 `BENCHMARK_RESULT.md` 与 `problems/查询性能优化方向.md`；回归只要求集成测试与内部计数器断言。
 
