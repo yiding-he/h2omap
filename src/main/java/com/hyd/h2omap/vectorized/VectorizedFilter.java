@@ -24,6 +24,7 @@ import org.h2.expression.Operation1;
 import org.h2.expression.OperationN;
 import org.h2.expression.Subquery;
 import org.h2.expression.ValueExpression;
+import org.h2.expression.condition.BetweenPredicate;
 import org.h2.expression.condition.CompareLike;
 import org.h2.expression.condition.Comparison;
 import org.h2.expression.condition.ConditionAndOr;
@@ -233,6 +234,9 @@ public final class VectorizedFilter {
             }
             return null;
         }
+        if (expr instanceof BetweenPredicate) {
+            return compileBetween((BetweenPredicate) expr, filter, session);
+        }
         if (expr instanceof Comparison) {
             return compileComparison((Comparison) expr, filter, session);
         }
@@ -402,6 +406,58 @@ public final class VectorizedFilter {
         }
         out.add(n);
         return true;
+    }
+
+    /**
+     * 编译 BETWEEN 谓词：普通形态折叠成两个区间比较的 AND，
+     * NOT BETWEEN 折成两个取反比较的 OR（列空值两侧都不命中，三值语义一致）。
+     * SYMMETRIC、边界为空值或非常量的形态交回 H2。
+     */
+    private static Node compileBetween(BetweenPredicate between, TableFilter filter,
+            SessionLocal session) {
+        if (between.isWhenConditionOperand()) {
+            return null;
+        }
+        Expression left = between.getSubexpression(0);
+        Expression a = between.getSubexpression(1);
+        Expression b = between.getSubexpression(2);
+        if (!isFoldableConstant(a, filter) || !isFoldableConstant(b, filter)) {
+            return null;
+        }
+        // NOT 与 SYMMETRIC 从渲染 SQL 识别，与 LIKE 的操作符识别同一方式。
+        String leftSql = left.getUnenclosedSQL(new StringBuilder(), 0).toString();
+        String fullSql = between.getUnenclosedSQL(new StringBuilder(), 0).toString();
+        String opPart = fullSql.length() > leftSql.length()
+                ? fullSql.substring(leftSql.length()) : "";
+        boolean not;
+        if (opPart.startsWith(" NOT BETWEEN ")) {
+            not = true;
+        } else if (opPart.startsWith(" BETWEEN ")) {
+            not = false;
+        } else {
+            return null;
+        }
+        if (opPart.substring(not ? 13 : 9).startsWith("SYMMETRIC ")) {
+            return null;
+        }
+        Value va = a.getValue(session);
+        Value vb = b.getValue(session);
+        if (va == null || va == ValueNull.INSTANCE || vb == null || vb == ValueNull.INSTANCE) {
+            return null;
+        }
+        Node lo;
+        Node hi;
+        if (not) {
+            lo = compileLeftWithConst(left, Comparison.SMALLER, va, filter, session);
+            hi = compileLeftWithConst(left, Comparison.BIGGER, vb, filter, session);
+        } else {
+            lo = compileLeftWithConst(left, Comparison.BIGGER_EQUAL, va, filter, session);
+            hi = compileLeftWithConst(left, Comparison.SMALLER_EQUAL, vb, filter, session);
+        }
+        if (lo == null || hi == null) {
+            return null;
+        }
+        return not ? new OrNode(lo, hi) : new AndNode(new Node[] { lo, hi });
     }
 
     private static Node compileComparison(Comparison cmp, TableFilter filter, SessionLocal session) {
