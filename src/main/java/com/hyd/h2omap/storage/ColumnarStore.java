@@ -56,7 +56,7 @@ public final class ColumnarStore {
     /** 每列的完整类型，建段时用它识别数组列的元素类型。 */
     private final TypeInfo[] columnTypes;
 
-    private final OmapOptions options;
+    final OmapOptions options;
 
     final CompareMode compareMode;
 
@@ -86,7 +86,7 @@ public final class ColumnarStore {
 
     final Set<Long> openDeletes = new HashSet<>();
 
-    private long rowCount;
+    long rowCount;
 
     final AtomicLong prunedSegments = new AtomicLong();
 
@@ -109,13 +109,8 @@ public final class ColumnarStore {
     /** 只读 manifest 而不读段文件；由服务端系统属性 {@code h2.omapLazyLoad} 决定。 */
     private volatile boolean lazyLoad;
 
-    /** 后台段加载线程，仅惰性模式下存在。 */
-    private volatile Thread lazyLoader;
-
-    private volatile boolean lazyLoaderStopped;
-
-    /** 后台加载中读段失败时保留的最后一个异常，供测试与诊断读取。 */
-    private volatile Throwable lastLazyLoadError;
+    /** 后台段加载与发布，仅惰性模式下工作。 */
+    final SegmentLoader loader = new SegmentLoader(this);
 
     /** 驻留段访问序号，值域从 2^40 起，保证大于任何未访问初始键（段号）。 */
     private static final long TOUCH_BASE = 1L << 40;
@@ -124,13 +119,13 @@ public final class ColumnarStore {
     private final AtomicLong touchCounter = new AtomicLong();
 
     /** 全部驻留段的估算字节数，写锁内维护。 */
-    private long residentTotal;
+    long residentTotal;
 
     /** 累计逐出段数，供测试断言。 */
     private final AtomicLong evictedSegments = new AtomicLong();
 
     /** 段加载完成后的通知，用来让 H2 的查询结果缓存失效。 */
-    private volatile Runnable visibilityListener;
+    volatile Runnable visibilityListener;
 
     /** 段的持久化元数据：checkpoint 与 manifest 只需要这两个值。 */
     public record SegmentMeta(int segmentId, int generation) {
@@ -258,29 +253,15 @@ public final class ColumnarStore {
      * 所以最近写入的数据最先对查询可见。
      */
     public void startLazyLoading() {
-        if (!lazyLoad || lazyLoader != null) {
+        if (!lazyLoad || loader.isRunning()) {
             return;
         }
-        Thread thread = new Thread(this::loadAllSegments, "omap-lazy-loader");
-        thread.setDaemon(true);
-        lazyLoaderStopped = false;
-        lazyLoader = thread;
-        thread.start();
+        loader.start();
     }
 
     /** 停止后台加载并等待其退出。 */
     public void stopLazyLoading() {
-        Thread thread = lazyLoader;
-        lazyLoaderStopped = true;
-        if (thread != null) {
-            thread.interrupt();
-            try {
-                thread.join(2000);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-            lazyLoader = null;
-        }
+        loader.stop();
     }
 
     // ------------------------------------------------------------------
@@ -708,7 +689,7 @@ public final class ColumnarStore {
             // 有骨架的段按骨架计入，保证可见性与剪枝从开库就完整。
             ColumnSegment seg = ref.loaded;
             if (seg != null) {
-                count += visibleRowsOf(seg);
+                count += SegmentLoader.visibleRowsOf(seg);
             } else if (ref.skeleton != null) {
                 count += ref.skeleton.rowCount - ref.skeleton.deletedCount;
             }
@@ -969,152 +950,6 @@ public final class ColumnarStore {
         }
     }
 
-    // ------------------------------------------------------------------
-    // 后台段加载
-    // ------------------------------------------------------------------
-
-    private void loadAllSegments() {
-        OmapPersistence p = persistence;
-        if (p == null) {
-            return;
-        }
-        SegmentRef[] refs;
-        Map<Integer, List<Integer>> deletedOffsetsBySegment = new HashMap<>();
-        lock.readLock().lock();
-        try {
-            refs = segments.values().toArray(new SegmentRef[0]);
-            for (Map.Entry<Integer, DeltaStore.SegmentDeleteBitmap> entry : delta.segmentDeleteEntries()) {
-                List<Integer> offsets = new ArrayList<>();
-                for (int off = entry.getValue().bits.nextSetBit(0); off >= 0;
-                        off = entry.getValue().bits.nextSetBit(off + 1)) {
-                    offsets.add(off);
-                }
-                deletedOffsetsBySegment.put(entry.getKey(), offsets);
-            }
-        } finally {
-            lock.readLock().unlock();
-        }
-        if (refs.length == 0) {
-            return;
-        }
-        // 固定并发的工人群在加载线程池上按段号从新到老取段；
-        // 预算停止条件由发布路径统一判定（见 publishLoaded 的逐出状态）。
-        AtomicInteger cursor = new AtomicInteger(refs.length - 1);
-        AtomicBoolean budgetBoundary = new AtomicBoolean();
-        int workers = Math.min(OmapPersistence.LOAD_CONCURRENCY, refs.length);
-        CountDownLatch done = new CountDownLatch(workers);
-        for (int w = 0; w < workers; w++) {
-            p.executeLoadTask(() -> {
-                try {
-                    runLazyLoadWorker(p, refs, cursor, budgetBoundary, deletedOffsetsBySegment);
-                } finally {
-                    done.countDown();
-                }
-            });
-        }
-        try {
-            done.await();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-    }
-
-    private void runLazyLoadWorker(OmapPersistence p, SegmentRef[] refs, AtomicInteger cursor,
-            AtomicBoolean budgetBoundary, Map<Integer, List<Integer>> deletedOffsetsBySegment) {
-        while (!lazyLoaderStopped && !budgetBoundary.get()) {
-            long budget = options.getResidentBytes();
-            if (budget > 0 && getResidentBytes() >= budget) {
-                // 驻留预算已装满：继续预载只会载入即逐出，老段等查询按需读回。
-                return;
-            }
-            int i = cursor.getAndDecrement();
-            if (i < 0) {
-                return;
-            }
-            SegmentRef ref = refs[i];
-            if (ref.loaded != null) {
-                continue;
-            }
-            ColumnSegment segment;
-            try {
-                segment = p.loadSegment(ref.segmentId, ref.generation);
-            } catch (Exception e) {
-                // 段文件读不出来时跳过这一段，其余段继续加载；读路径继续把该段当作不可见。
-                lastLazyLoadError = e;
-                continue;
-            }
-            if (publishLoaded(ref, segment, deletedOffsetsBySegment.get(ref.segmentId))
-                    == PUBLISH_EVICTED) {
-                // 本次发布触发了预算逐出（含发布段自身被逐出）：预算装不下更多段，
-                // 再预载都是无效读；并发下边界处最多多读 (并发数 - 1) 个装不下的段。
-                // 全删段被丢弃时 ref.loaded 仍非空，不会误判。
-                budgetBoundary.set(true);
-                return;
-            }
-        }
-    }
-
-    /** publishLoaded 的返回状态：段已被并发读回加载（预载放弃该段）。 */
-    private static final int PUBLISH_ALREADY = 0;
-    /** publishLoaded 的返回状态：已发布且本次发布未触发预算逐出。 */
-    private static final int PUBLISH_OK = 1;
-    /** publishLoaded 的返回状态：已发布且本次发布触发了预算逐出（预算边界）。 */
-    private static final int PUBLISH_EVICTED = 2;
-
-    private int publishLoaded(SegmentRef ref, ColumnSegment segment, List<Integer> deletedOffsets) {
-        int status;
-        lock.writeLock().lock();
-        try {
-            if (ref.loaded != null) {
-                status = PUBLISH_ALREADY;
-            } else if (ref.skeleton != null) {
-                // 骨架已在恢复时计入行数并保证可见性：这里只挂内容，不动可见性与结果缓存。
-                ref.loaded = segment;
-                ref.residentBytes = segment.getEstimatedMemory();
-                residentTotal += ref.residentBytes;
-                status = evictLocked() > 0 ? PUBLISH_EVICTED : PUBLISH_OK;
-            } else {
-                ref.loaded = segment;
-                ref.residentBytes = segment.getEstimatedMemory();
-                residentTotal += ref.residentBytes;
-                long added = visibleRowsOf(segment);
-                if (deletedOffsets != null) {
-                    int rowCountOfSegment = segment.getRowCount();
-                    for (int offset : deletedOffsets) {
-                        if (offset < rowCountOfSegment && !segment.isDeleted(offset)) {
-                            added--;
-                        }
-                    }
-                }
-                rowCount += Math.max(0, added);
-                // 加载后该段可能整段已删：与写路径同一条丢弃判定。
-                dropSegmentIfEmpty(ref.segmentId);
-                bump();
-                status = evictLocked() > 0 ? PUBLISH_EVICTED : PUBLISH_OK;
-            }
-        } finally {
-            lock.writeLock().unlock();
-        }
-        Runnable listener = visibilityListener;
-        if (listener != null) {
-            listener.run();
-        }
-        return status;
-    }
-
-    private static long visibleRowsOf(ColumnSegment segment) {
-        int rowCount = segment.getRowCount();
-        if (!segment.getDeleted().hasNull()) {
-            return rowCount;
-        }
-        long visible = 0;
-        for (int i = 0; i < rowCount; i++) {
-            if (!segment.isDeleted(i)) {
-                visible++;
-            }
-        }
-        return visible;
-    }
 
     // ------------------------------------------------------------------
     // 段级逐出（MOR 批次 4）
@@ -1127,7 +962,7 @@ public final class ColumnarStore {
      * 其次选访问时间最早的段，与数据的写入顺序无关。
      * 调用方必须已持有写锁。
      */
-    private int evictLocked() {
+    int evictLocked() {
         long budget = options.getResidentBytes();
         if (budget <= 0 || persistence == null || residentTotal <= budget) {
             return 0;
@@ -1413,7 +1248,7 @@ public final class ColumnarStore {
      * 把整段从段列表摘除，段文件在下次 checkpoint 随 manifest 一起清理。
      * 调用方必须已持有写锁。rowId 空洞保留，不计入任何行数调整。
      */
-    private void dropSegmentIfEmpty(int segmentId) {
+    void dropSegmentIfEmpty(int segmentId) {
         SegmentRef ref = segments.get(segmentId);
         if (ref == null || (ref.loaded == null && ref.skeleton == null)) {
             return;
@@ -1445,7 +1280,7 @@ public final class ColumnarStore {
         }
     }
 
-    private void bump() {
+    void bump() {
         dataModificationId.incrementAndGet();
     }
 
