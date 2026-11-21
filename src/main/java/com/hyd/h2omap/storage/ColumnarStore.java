@@ -69,7 +69,7 @@ public final class ColumnarStore {
     final DeltaStore delta;
 
     /** 段级部分聚合缓存（MOR 批次 3）：签名 × 段的部分聚合结果。 */
-    private final com.hyd.h2omap.vectorized.SegmentAggCache aggCache =
+    final com.hyd.h2omap.vectorized.SegmentAggCache aggCache =
             new com.hyd.h2omap.vectorized.SegmentAggCache();
 
     final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
@@ -111,6 +111,9 @@ public final class ColumnarStore {
 
     /** 后台段加载与发布，仅惰性模式下工作。 */
     final SegmentLoader loader = new SegmentLoader(this);
+
+    /** 检查点与开库恢复。 */
+    final StorePersistence persistenceOps = new StorePersistence(this);
 
     /** 驻留段访问序号，值域从 2^40 起，保证大于任何未访问初始键（段号）。 */
     private static final long TOUCH_BASE = 1L << 40;
@@ -538,34 +541,7 @@ public final class ColumnarStore {
      * 执行一次增量段快照 Checkpoint（将未写盘的新/改段及当前开放段/delta 写盘，并截断旧 WAL）。
      */
     public void checkpoint() {
-        OmapPersistence p = persistence;
-        if (p == null) {
-            return;
-        }
-        List<SegmentMeta> segsSnap;
-        int nextSegIdSnap;
-        long newWalSeq;
-        List<Value[]> openRowsSnap;
-        Set<Long> openDeletesSnap;
-        Map<Long, Value[]> deltaUpdatedSnap;
-        Set<Long> deltaDeletesSnap;
-        lock.writeLock().lock();
-        try {
-            segsSnap = new ArrayList<>(segments.size());
-            for (SegmentRef ref : segments.values()) {
-                segsSnap.add(new SegmentMeta(ref.segmentId, ref.generation));
-            }
-            nextSegIdSnap = nextSegmentId;
-            openRowsSnap = new ArrayList<>(openSegment.rawRows());
-            openDeletesSnap = new HashSet<>(openDeletes);
-            deltaUpdatedSnap = delta.snapshotUpdated();
-            deltaDeletesSnap = new HashSet<>(delta.deletedRowIds());
-            newWalSeq = p.rotateWal();
-        } finally {
-            lock.writeLock().unlock();
-        }
-        p.writeCheckpoint(this, segsSnap, nextSegIdSnap, newWalSeq,
-                openRowsSnap, openDeletesSnap, deltaUpdatedSnap, deltaDeletesSnap);
+        persistenceOps.checkpoint();
     }
 
     // ------------------------------------------------------------------
@@ -576,141 +552,25 @@ public final class ColumnarStore {
             ColumnSegment[] preloaded, SkeletonData[] skeletons, int restoredNextSegId,
             List<Value[]> openRows, Set<Long> restoredOpenDeletes,
             Map<Long, Value[]> restoredDeltaUpdated, Set<Long> restoredDeltaDeletes) {
-        lock.writeLock().lock();
-        try {
-            segments.clear();
-            for (int i = 0; i < segmentIds.length; i++) {
-                SegmentRef ref = new SegmentRef(segmentIds[i], generations[i], preloaded[i]);
-                if (preloaded[i] != null) {
-                    ref.residentBytes = preloaded[i].getEstimatedMemory();
-                    residentTotal += ref.residentBytes;
-                } else if (skeletons != null && skeletons[i] != null) {
-                    // 骨架在恢复时登记：未加载内容的段对全部读路径可见且可剪枝。
-                    ref.skeleton = new SegmentSkeleton(skeletons[i]);
-                }
-                segments.put(segmentIds[i], ref);
-            }
-            nextSegmentId = restoredNextSegId;
-            openSegment.clear();
-            for (Value[] row : openRows) {
-                openSegment.append(row);
-            }
-            openDeletes.clear();
-            openDeletes.addAll(restoredOpenDeletes);
-            delta.clear();
-            for (Map.Entry<Long, Value[]> e : restoredDeltaUpdated.entrySet()) {
-                delta.markUpdated(e.getKey(), e.getValue());
-            }
-            for (long rowId : restoredDeltaDeletes) {
-                delta.markDeleted(rowId);
-            }
-            recomputeRowCount();
-            bump();
-            // 恢复后同样遵守驻留预算：非惰性模式读入了全部段，这里裁到预算内。
-            evictLocked();
-        } finally {
-            lock.writeLock().unlock();
-        }
+        persistenceOps.restoreFromPersistence(segmentIds, generations, preloaded, skeletons,
+                restoredNextSegId, openRows, restoredOpenDeletes, restoredDeltaUpdated,
+                restoredDeltaDeletes);
     }
 
     public void replayInsert(long rowId, Value[] values) {
-        lock.writeLock().lock();
-        try {
-            int segId = RowId.segmentId(rowId);
-            while (nextSegmentId < segId) {
-                nextSegmentId = segId;
-            }
-            openSegment.append(withRowId(rowId, values));
-            rowCount++;
-            bump();
-            if (openSegment.rowCount() >= options.getSegmentSize()) {
-                freeze();
-            }
-        } finally {
-            lock.writeLock().unlock();
-        }
+        persistenceOps.replayInsert(rowId, values);
     }
 
     public void replayUpdate(long rowId, Value[] values) {
-        lock.writeLock().lock();
-        try {
-            if (isFrozen(rowId)) {
-                delta.markUpdated(rowId, values);
-            } else {
-                openSegment.setRow(RowId.offset(rowId), withRowId(rowId, values));
-            }
-            bump();
-        } finally {
-            lock.writeLock().unlock();
-        }
+        persistenceOps.replayUpdate(rowId, values);
     }
 
     public void replayDelete(long rowId) {
-        lock.writeLock().lock();
-        try {
-            if (isVisible(rowId)) {
-                int segId = RowId.segmentId(rowId);
-                if (isFrozen(rowId)) {
-                    delta.markDeleted(rowId);
-                } else {
-                    openDeletes.add(rowId);
-                }
-                if (countedInRowCount(rowId)) {
-                    rowCount--;
-                }
-                dropSegmentIfEmpty(segId);
-                bump();
-            }
-        } finally {
-            lock.writeLock().unlock();
-        }
+        persistenceOps.replayDelete(rowId);
     }
 
     public void replayTruncate(int restoredNextSegId) {
-        lock.writeLock().lock();
-        try {
-            segments.clear();
-            delta.clear();
-            aggCache.clear();
-            openSegment.clear();
-            openDeletes.clear();
-            nextSegmentId = restoredNextSegId;
-            rowCount = 0;
-            bump();
-        } finally {
-            lock.writeLock().unlock();
-        }
-    }
-
-    private void recomputeRowCount() {
-        long count = 0;
-        for (SegmentRef ref : segments.values()) {
-            // 未加载且无骨架的段（旧格式 manifest）不计入，与读路径的可见性判定保持一致；
-            // 有骨架的段按骨架计入，保证可见性与剪枝从开库就完整。
-            ColumnSegment seg = ref.loaded;
-            if (seg != null) {
-                count += SegmentLoader.visibleRowsOf(seg);
-            } else if (ref.skeleton != null) {
-                count += ref.skeleton.rowCount - ref.skeleton.deletedCount;
-            }
-        }
-        for (Map.Entry<Integer, DeltaStore.SegmentDeleteBitmap> entry : delta.segmentDeleteEntries()) {
-            SegmentRef ref = segments.get(entry.getKey());
-            ColumnSegment seg = ref != null ? ref.loaded : null;
-            NullBitmap deleted = seg != null ? seg.getDeleted()
-                    : ref != null && ref.skeleton != null ? ref.skeleton.deleted : null;
-            if (deleted == null) {
-                continue;
-            }
-            for (int off = entry.getValue().bits.nextSetBit(0); off >= 0;
-                    off = entry.getValue().bits.nextSetBit(off + 1)) {
-                if (!deleted.isNull(off)) {
-                    count--;
-                }
-            }
-        }
-        count += openSegment.rowCount() - openDeletes.size();
-        this.rowCount = Math.max(0, count);
+        persistenceOps.replayTruncate(restoredNextSegId);
     }
 
     // ------------------------------------------------------------------
@@ -1069,7 +929,7 @@ public final class ColumnarStore {
     // ------------------------------------------------------------------
 
     /** 把值数组前面加一个 rowId 元素，作为 builder 里的一行。 */
-    private static Value[] withRowId(long rowId, Value[] values) {
+    static Value[] withRowId(long rowId, Value[] values) {
         Value[] row = new Value[values.length + 1];
         row[0] = ValueBigint.get(rowId);
         System.arraycopy(values, 0, row, 1, values.length);
@@ -1081,7 +941,7 @@ public final class ColumnarStore {
     }
 
     /** 当前开放段的段号，也就是它冻结后拿到的段号。 */
-    private void freeze() {
+    void freeze() {
         if (openSegment.rowCount() == 0) {
             return;
         }
@@ -1099,7 +959,7 @@ public final class ColumnarStore {
         nextSegmentId++;
     }
 
-    private boolean isVisible(long rowId) {
+    boolean isVisible(long rowId) {
         if (!isFrozen(rowId)) {
             return !openDeletes.contains(rowId);
         }
@@ -1120,12 +980,12 @@ public final class ColumnarStore {
         return ref.skeleton == null || !ref.skeleton.deleted.isNull(RowId.offset(rowId));
     }
 
-    private boolean isFrozen(long rowId) {
+    boolean isFrozen(long rowId) {
         return RowId.segmentId(rowId) < nextSegmentId;
     }
 
     /** 该行是否已计入 {@code rowCount}：未加载段（含逐出段）的行在加载完成时才计入。 */
-    private boolean countedInRowCount(long rowId) {
+    boolean countedInRowCount(long rowId) {
         if (!isFrozen(rowId)) {
             return true;
         }
