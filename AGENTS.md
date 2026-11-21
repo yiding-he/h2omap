@@ -286,7 +286,7 @@ src/main/java/com/hyd/h2omap/
 ├── storage/       列段、开放段缓冲、delta、rowId 编码、延迟行、部分列读的列切片与占位列向量
 ├── persistence/   WAL 增量日志、增量列段快照与重启恢复
 ├── vector/        列向量（含字典向量、数组列与 CLOB 打包）、ValueVector 回退、null 位图
-├── vectorized/    单表过滤与聚合下推、谓词编译（VectorizedFilter）、子查询折叠（SubqueryFold 入口 + SubqueryInner 内层解析 + CorrelatedAggFold/CorrelatedInFold/CorrelatedExistsFold 各形态）、段级部分聚合缓存（SegmentAggCache）
+├── vectorized/    单表过滤与聚合下推：谓词编译（VectorizedFilter）与子查询折叠（SubqueryFold 入口 + SubqueryInner + CorrelatedAggFold/CorrelatedInFold/CorrelatedExistsFold）；执行入口 OmapVectorizedExecutor（facade，含共用快照管线）+ FlatExecutor/OrderedExecutor/GroupExecutor；聚合口径 AggSpec、累加器 AggState、HAVING 编译 HavingPredicates；段级部分聚合缓存（SegmentAggCache）
 └── stats/         zone map
 
 src/main/java/org/h2/                     被替换的 H2 类与访问桥
