@@ -20,6 +20,8 @@ import org.h2.value.ValueNull;
 
 import com.hyd.h2omap.storage.ColumnSegment;
 import com.hyd.h2omap.storage.ColumnarStore;
+import com.hyd.h2omap.storage.ExtremeValue;
+import com.hyd.h2omap.storage.VectorizedSnapshot;
 import com.hyd.h2omap.table.OmapTable;
 import com.hyd.h2omap.vector.ColumnVector;
 import com.hyd.h2omap.vector.DictValueVector;
@@ -129,7 +131,7 @@ final class GroupExecutor {
             AggSpec spec = aggSpecs[0];
             if (!spec.distinct && spec.arithOp == null
                     && (spec.type == AggregateType.MIN || spec.type == AggregateType.MAX)) {
-                ColumnarStore.ExtremeValue extreme = table.getStore()
+                ExtremeValue extreme = table.getStore()
                         .extremeColumn(spec.col, spec.type == AggregateType.MIN, session);
                 if (extreme.supported) {
                     Value[] out = new Value[resultColumnCount];
@@ -151,7 +153,7 @@ final class GroupExecutor {
         }
         int[] snapshotColumns = OmapVectorizedExecutor.unionColumns(groupKeyCols, aggColumns,
                 filter != null ? filter.referencedColumns() : null);
-        ColumnarStore.VectorizedSnapshot snap = OmapVectorizedExecutor.takeSnapshot(table, filter, tableFilter, snapshotColumns);
+        VectorizedSnapshot snap = OmapVectorizedExecutor.takeSnapshot(table, filter, tableFilter, snapshotColumns);
 
         if (groupCount == 0) {
             executeGlobal(snap, filter, havingPred, aggSpecs, aggCount, resultColumnCount,
@@ -173,7 +175,7 @@ final class GroupExecutor {
     }
 
     private static void executeGlobal(
-            ColumnarStore.VectorizedSnapshot snap,
+            VectorizedSnapshot snap,
             VectorizedFilter filter,
             HavingPredicate havingPred,
             AggSpec[] specs,
@@ -268,7 +270,7 @@ final class GroupExecutor {
     }
 
     private static void executeSingleGroup(
-            ColumnarStore.VectorizedSnapshot snap,
+            VectorizedSnapshot snap,
             VectorizedFilter filter,
             HavingPredicate havingPred,
             int groupKeyCol,
@@ -465,7 +467,7 @@ final class GroupExecutor {
     }
 
     private static void executeMultiGroup(
-            ColumnarStore.VectorizedSnapshot snap,
+            VectorizedSnapshot snap,
             VectorizedFilter filter,
             HavingPredicate havingPred,
             int[] groupKeyCols,

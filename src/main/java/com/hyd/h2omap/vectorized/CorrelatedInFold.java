@@ -19,7 +19,7 @@ import org.h2.value.Value;
 import org.h2.value.ValueNull;
 
 import com.hyd.h2omap.storage.ColumnSegment;
-import com.hyd.h2omap.storage.ColumnarStore.VectorizedSnapshot;
+import com.hyd.h2omap.storage.VectorizedSnapshot;
 import com.hyd.h2omap.table.OmapTable;
 import com.hyd.h2omap.vector.ColumnVector;
 import com.hyd.h2omap.vector.DictValueVector;

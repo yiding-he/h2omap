@@ -18,6 +18,7 @@ import org.h2.value.ValueNull;
 import com.hyd.h2omap.stats.ZoneMap;
 import com.hyd.h2omap.storage.ColumnSegment;
 import com.hyd.h2omap.storage.ColumnarStore;
+import com.hyd.h2omap.storage.VectorizedSnapshot;
 import com.hyd.h2omap.storage.RowId;
 import com.hyd.h2omap.vector.ColumnVector;
 
@@ -54,7 +55,7 @@ final class OrderedExecutor {
         }
     }
 
-    static boolean executeOrdered(SessionLocal session, ColumnarStore.VectorizedSnapshot snap,
+    static boolean executeOrdered(SessionLocal session, VectorizedSnapshot snap,
             VectorizedFilter filter, SortOrder sortOrder, TableFilter tableFilter, int[] projCols,
             Value[] projConsts, int[] projToUnique, int[] uniqueProjCols, int uniqueCount, int outLen,
             long maxRows, ColumnarStore store, LocalResult result, CompareMode compareMode) {

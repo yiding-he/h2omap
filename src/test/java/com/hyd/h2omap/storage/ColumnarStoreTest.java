@@ -649,17 +649,17 @@ class ColumnarStoreTest {
 
         // 下界 50：段 0（旧值 0..9）与段 1（旧值 10..19）都被剪，
         // 新像值域 100..109 与区间相交 → extraRows 有 10 行。
-        ColumnarStore.VectorizedSnapshot snap = store.takeVectorizedSnapshot(
+        VectorizedSnapshot snap = store.takeVectorizedSnapshot(
                 new Value[] { ValueInteger.get(50), null }, null);
         assertEquals(10, snap.extraRows.size());
 
         // 下界 200：新像值域也不相交 → extraRows 为空。
-        ColumnarStore.VectorizedSnapshot none = store.takeVectorizedSnapshot(
+        VectorizedSnapshot none = store.takeVectorizedSnapshot(
                 new Value[] { ValueInteger.get(200), null }, null);
         assertEquals(0, none.extraRows.size());
 
         // 无区间：全部活像参与。
-        ColumnarStore.VectorizedSnapshot all = store.takeVectorizedSnapshot(null, null);
+        VectorizedSnapshot all = store.takeVectorizedSnapshot(null, null);
         assertEquals(10, all.extraRows.size());
     }
 

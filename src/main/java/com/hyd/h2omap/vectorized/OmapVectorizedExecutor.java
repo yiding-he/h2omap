@@ -14,6 +14,7 @@ import org.h2.table.TableFilter;
 import org.h2.value.Value;
 
 import com.hyd.h2omap.storage.ColumnarStore;
+import com.hyd.h2omap.storage.VectorizedSnapshot;
 import com.hyd.h2omap.table.OmapTable;
 
 /**
@@ -73,7 +74,7 @@ public final class OmapVectorizedExecutor {
      * <p>区间只由顶层 {@code AND} 的合取项给出，与合取项的排列顺序无关，
      * 所以不可能命中的段在任何谓词开始求值之前就被跳过。
      */
-    static ColumnarStore.VectorizedSnapshot takeSnapshot(OmapTable table, VectorizedFilter filter,
+    static VectorizedSnapshot takeSnapshot(OmapTable table, VectorizedFilter filter,
             TableFilter tableFilter, int[] columns) {
         ColumnarStore store = table.getStore();
         if (filter == null) {

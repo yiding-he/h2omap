@@ -19,6 +19,7 @@ import org.h2.value.ValueNull;
 import com.hyd.h2omap.index.OmapScanIndex;
 import com.hyd.h2omap.storage.ColumnSegment;
 import com.hyd.h2omap.storage.ColumnarStore;
+import com.hyd.h2omap.storage.VectorizedSnapshot;
 import com.hyd.h2omap.table.OmapTable;
 import com.hyd.h2omap.vector.ColumnVector;
 
@@ -133,7 +134,7 @@ final class FlatExecutor {
                 Arrays.copyOf(uniqueProjCols, uniqueCount),
                 new int[] { preSortCol },
                 filter != null ? filter.referencedColumns() : null);
-        ColumnarStore.VectorizedSnapshot snap = OmapVectorizedExecutor.takeSnapshot(table, filter, tableFilter, snapshotColumns);
+        VectorizedSnapshot snap = OmapVectorizedExecutor.takeSnapshot(table, filter, tableFilter, snapshotColumns);
 
         if (sortOrder != null) {
             return OrderedExecutor.executeOrdered(session, snap, filter, sortOrder, tableFilter, projCols, projConsts,
@@ -180,7 +181,7 @@ final class FlatExecutor {
      * 首次访问懒段的列向量时才触发按需读盘。
      */
     private static long scanFlatSegments(List<ColumnSegment> segs,
-            ColumnarStore.VectorizedSnapshot snap, VectorizedFilter filter, SessionLocal session,
+            VectorizedSnapshot snap, VectorizedFilter filter, SessionLocal session,
             CompareMode compareMode, int outLen, Value[] projConsts,
             int[] projToUnique, int[] uniqueProjCols, int uniqueCount, long maxRows, long emitted,
             LocalResult result) {
