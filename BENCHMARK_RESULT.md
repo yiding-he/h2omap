@@ -20,6 +20,40 @@
 
 本表为 M4 批的环境；i5-14500 复测批的环境与可比性见「实测结果」末尾的说明。
 
+## 表结构
+
+压测表 `T` 由 `src/test/java/com/hyd/h2omap/bench/DataGenerator.java` 生成，固定随机种子 `20260923`，同一行数重复执行产出相同数据。建表语句：
+
+```sql
+CREATE TABLE T(
+  ID BIGINT PRIMARY KEY,
+  LOW_CARD VARCHAR,
+  HIGH_CARD VARCHAR,
+  INT_COL INT,
+  DOUBLE_COL DOUBLE,
+  TS_COL TIMESTAMP,
+  NULLABLE_COL INT,
+  ARRAY_COL INT ARRAY,
+  STR_ARRAY_COL VARCHAR ARRAY,
+  SORT_TS TIMESTAMP
+)
+```
+
+| 列 | 类型 | 生成规则 |
+| --- | --- | --- |
+| `ID` | `BIGINT` | 主键，`1..rows` 连续递增 |
+| `LOW_CARD` | `VARCHAR` | `C0`–`C9` 均匀随机，10 个取值 |
+| `HIGH_CARD` | `VARCHAR` | `user-{i}`，逐行唯一 |
+| `INT_COL` | `INT` | 1/3 概率取行号（连续），否则 `0..999999` 随机 |
+| `DOUBLE_COL` | `DOUBLE` | `0..1000` 均匀随机 |
+| `TS_COL` | `TIMESTAMP` | `2026-01-01` 起 365 天内随机秒 |
+| `NULLABLE_COL` | `INT` | 1/20 为 `NULL`，否则 `0..999999` 随机 |
+| `ARRAY_COL` | `INT ARRAY` | 长度 `0..9`，元素 `0..99` |
+| `STR_ARRAY_COL` | `VARCHAR ARRAY` | 长度 `0..4`，元素 `s0`–`s49` |
+| `SORT_TS` | `TIMESTAMP` | `2026-01-01` 起按行号逐秒递增，与插入顺序同向 |
+
+对比表 `T_MV` 结构与数据完全相同，引擎为 MVStore，仅用于结果正确性对照（不记录耗时）。
+
 ## 复现命令
 
 三档均一键执行（自动完成构建、启动 `-Xmx8g` 独立 TCP 服务端、定位 H2 Jar、执行 50 轮压测、重启校验并自动清理服务端与数据目录）。脚本一次调用跑一种写负载：
