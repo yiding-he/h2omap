@@ -285,6 +285,57 @@ class OmapTableContractTest {
      * 不带主键：避免 addIndex 回填在重开时逐段读回（那是索引正确性的必要读，
      * 与预载停止是两回事）。
      */
+    /**
+     * 查询期段文件 IO 统计随第二个结果集返回客户端。
+     * segmentSize=4 产生 4 个冻结段；residentBytes=1 容不下任何段，全部逐出。
+     * SUM(V) 命中逐出段时按需读回列切片，统计里应出现每次读取的字节数。
+     */
+    @Test
+    void queryIoStatsReportsEvictedSegmentReads(@TempDir Path dir) throws Exception {
+        boolean previous = com.hyd.h2omap.stats.QueryIoStats.isEnabled();
+        com.hyd.h2omap.stats.QueryIoStats.setEnabled(true);
+        try {
+            String url = "jdbc:h2:" + dir.resolve("ioStats");
+            try (Connection c = DriverManager.getConnection(url, "sa", "");
+                    Statement s = c.createStatement()) {
+                s.execute(createTable("T", "ID INT, V INT",
+                        "\"segmentSize=4\", \"residentBytes=1\""));
+                try (PreparedStatement ps = c.prepareStatement("INSERT INTO T VALUES (?, ?)")) {
+                    for (int i = 0; i < 16; i++) {
+                        ps.setInt(1, i);
+                        ps.setInt(2, i);
+                        ps.executeUpdate();
+                    }
+                }
+                try (ResultSet rs = s.executeQuery("SELECT SUM(V) FROM T")) {
+                    assertTrue(rs.next());
+                    assertEquals(120L, rs.getLong(1));
+                }
+                assertTrue(s.getMoreResults(), "逐出段读回应产生 IO 统计");
+                int rows = 0;
+                long bytes = 0;
+                long ioReads = 0;
+                try (ResultSet stats = s.getResultSet()) {
+                    while (stats.next()) {
+                        rows++;
+                        assertTrue(stats.getLong(4) > 0);
+                        // 每段三次读：头部、尾部目录、列块，不存在大量碎片读。
+                        int io = stats.getInt(6);
+                        assertTrue(io >= 3, "每段读回应至少 3 次，实际 " + io);
+                        bytes += stats.getLong(4);
+                        ioReads += io;
+                    }
+                }
+                assertTrue(rows >= 1);
+                assertTrue(bytes > 0);
+                assertTrue(ioReads >= 3L * rows);
+                assertFalse(s.getMoreResults());
+            }
+        } finally {
+            com.hyd.h2omap.stats.QueryIoStats.setEnabled(previous);
+        }
+    }
+
     @Test
     void lazyLoadStopsAtResidentBudget(@TempDir Path dir) throws Exception {
         String key = "h2.omapLazyLoad";

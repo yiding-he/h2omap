@@ -72,6 +72,9 @@ public final class ColumnarStore {
     final com.hyd.h2omap.vectorized.SegmentAggCache aggCache =
             new com.hyd.h2omap.vectorized.SegmentAggCache();
 
+    /** 逐出段的列切片缓存：只复用冻结段内容，不计入驻留预算，默认关闭。 */
+    final SliceCache sliceCache = new SliceCache();
+
     final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
     private final Object compactMonitor = new Object();
@@ -402,6 +405,7 @@ public final class ColumnarStore {
             residentTotal = 0;
             delta.clear();
             aggCache.clear();
+            sliceCache.clear();
             openSegment.clear();
             openDeletes.clear();
             rowCount = 0;
@@ -511,9 +515,11 @@ public final class ColumnarStore {
                         // 回写后整段全删：直接丢弃，不再挂回段列表。
                         segments.remove(segId);
                         residentTotal -= ref.residentBytes;
+                        sliceCache.invalidateSegment(segId);
                     } else {
                         ref.loaded = newSeg;
                         ref.generation = newSeg.getGeneration();
+                        sliceCache.invalidateSegment(segId);
                         residentTotal += newSeg.getEstimatedMemory() - ref.residentBytes;
                         ref.residentBytes = newSeg.getEstimatedMemory();
                     }
@@ -1040,11 +1046,18 @@ public final class ColumnarStore {
         if (p == null || ref.skeleton == null) {
             return null;
         }
-        ColumnSlice slice;
-        try {
-            slice = p.readSegmentColumns(ref.segmentId, ref.generation, columns);
-        } catch (IOException e) {
-            return readSegmentTransient(ref);
+        long mask = sliceCache.isEnabled() ? SliceCache.maskOf(columns) : SliceCache.NO_CACHE;
+        ColumnSlice slice = mask == SliceCache.NO_CACHE
+                ? null : sliceCache.get(ref.segmentId, ref.generation, mask);
+        if (slice == null) {
+            try {
+                slice = p.readSegmentColumns(ref.segmentId, ref.generation, columns);
+            } catch (IOException e) {
+                return readSegmentTransient(ref);
+            }
+            if (mask != SliceCache.NO_CACHE) {
+                sliceCache.put(ref.segmentId, ref.generation, mask, slice);
+            }
         }
         int colCount = valueTypes.length;
         ColumnVector[] vectors = new ColumnVector[colCount];
@@ -1125,6 +1138,7 @@ public final class ColumnarStore {
         residentTotal -= ref.residentBytes;
         delta.clearSegmentDeletes(segmentId);
         aggCache.invalidateSegment(segmentId);
+        sliceCache.invalidateSegment(segmentId);
         bump();
     }
 

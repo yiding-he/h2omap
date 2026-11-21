@@ -52,6 +52,15 @@ public final class ColumnSlice {
         return deletedCount;
     }
 
+    /** 切片驻留堆的估算字节数，供列切片缓存做预算管理。 */
+    public long getEstimatedMemory() {
+        long bytes = 64L;
+        for (int i = 0; i < vectors.length; i++) {
+            bytes += vectors[i].getEstimatedMemory() + zoneMaps[i].getEstimatedMemory();
+        }
+        return bytes + deleted.getEstimatedMemory();
+    }
+
     public NullBitmap getDeletedBitmap() {
         return deleted;
     }

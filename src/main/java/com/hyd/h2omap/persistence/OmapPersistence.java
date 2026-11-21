@@ -27,6 +27,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -46,6 +49,7 @@ import org.h2.value.Value;
 
 import com.hyd.h2omap.storage.ColumnSegment;
 import com.hyd.h2omap.storage.ColumnSlice;
+import com.hyd.h2omap.stats.QueryIoStats;
 import com.hyd.h2omap.stats.ZoneMap;
 import com.hyd.h2omap.storage.ColumnarStore;
 import com.hyd.h2omap.vector.NullBitmap;
@@ -737,8 +741,78 @@ public final class OmapPersistence {
     }
 
     /** 读取单个段文件，供惰性加载按需调用。 */
+    /**
+     * 段读取的在途合并键。列集用位掩码表示，列 id ≥ 64 时用 {@link Long#MIN_VALUE} 表示不参与合并。
+     */
+    private record SegmentReadKey(int segmentId, int generation, long columnMask) {
+    }
+
+    private final ConcurrentHashMap<SegmentReadKey, CompletableFuture<ColumnSegment>> segmentReads =
+            new ConcurrentHashMap<>();
+
+    private final ConcurrentHashMap<SegmentReadKey, CompletableFuture<ColumnSlice>> sliceReads =
+            new ConcurrentHashMap<>();
+
+    private static long maskOf(int[] columnIds) {
+        long mask = 0;
+        for (int c : columnIds) {
+            if (c < 0 || c >= Long.SIZE) {
+                return Long.MIN_VALUE;
+            }
+            mask |= 1L << c;
+        }
+        return mask;
+    }
+
+    private static ColumnSegment awaitSegment(CompletableFuture<ColumnSegment> future) throws IOException {
+        try {
+            return future.join();
+        } catch (CompletionException e) {
+            throw unwrap(e);
+        }
+    }
+
+    private static ColumnSlice awaitSlice(CompletableFuture<ColumnSlice> future) throws IOException {
+        try {
+            return future.join();
+        } catch (CompletionException e) {
+            throw unwrap(e);
+        }
+    }
+
+    private static IOException unwrap(CompletionException e) {
+        Throwable cause = e.getCause();
+        if (cause instanceof IOException io) {
+            return io;
+        }
+        if (cause instanceof RuntimeException re) {
+            throw re;
+        }
+        return new IOException(cause);
+    }
+
+    /**
+     * 读取单个段文件，供惰性加载按需调用。
+     *
+     * <p>并发调用同一段时合并：只让一个线程真正读盘，其余等待同一个结果，避免并发查询重复读。
+     */
     public ColumnSegment loadSegment(int segmentId, int generation) throws IOException {
-        return readSegment(segmentId, generation);
+        SegmentReadKey key = new SegmentReadKey(segmentId, generation, -1L);
+        CompletableFuture<ColumnSegment> future = new CompletableFuture<>();
+        CompletableFuture<ColumnSegment> prev = segmentReads.putIfAbsent(key, future);
+        if (prev != null) {
+            return awaitSegment(prev);
+        }
+        try {
+            ColumnSegment segment = readSegment(segmentId, generation);
+            future.complete(segment);
+            return segment;
+        } catch (Throwable e) {
+            future.completeExceptionally(e);
+            throw e;
+        } finally {
+            segmentReads.remove(key, future);
+        }
     }
 
     /**
@@ -746,12 +820,38 @@ public final class OmapPersistence {
      */
     public ColumnSlice readSegmentColumns(int segmentId, int generation, int[] columnIds)
             throws IOException {
+        long mask = maskOf(columnIds);
+        if (mask == Long.MIN_VALUE) {
+            return readSegmentColumnsNow(segmentId, generation, columnIds);
+        }
+        SegmentReadKey key = new SegmentReadKey(segmentId, generation, mask);
+        CompletableFuture<ColumnSlice> future = new CompletableFuture<>();
+        CompletableFuture<ColumnSlice> prev = sliceReads.putIfAbsent(key, future);
+        if (prev != null) {
+            return awaitSlice(prev);
+        }
+        try {
+            ColumnSlice slice = readSegmentColumnsNow(segmentId, generation, columnIds);
+            future.complete(slice);
+            return slice;
+        } catch (Throwable e) {
+            future.completeExceptionally(e);
+            throw e;
+        } finally {
+            sliceReads.remove(key, future);
+        }
+    }
+
+    private ColumnSlice readSegmentColumnsNow(int segmentId, int generation, int[] columnIds)
+            throws IOException {
         Path p = dir.resolve("seg_" + segmentId + "_" + generation + ".omap");
+        int ioReads = 0;
         try (FileChannel ch = FileChannel.open(p, StandardOpenOption.READ)) {
             ch.position(0);
             // 内层流不关闭：Channels.newInputStream 的 close 会连带关闭通道，由外层通道兑底。
+            CountingInputStream counting = new CountingInputStream(Channels.newInputStream(ch));
             DataInputStream in = new DataInputStream(
-                    new BufferedInputStream(Channels.newInputStream(ch), 64 * 1024));
+                    new BufferedInputStream(counting, 64 * 1024));
             requireSegment(in, p, segmentId, generation);
             int rowCount = in.readInt();
             int deletedCount = in.readInt();
@@ -774,6 +874,7 @@ public final class OmapPersistence {
                 if (ch.read(footer) < 0) {
                     throw new EOFException("Unexpected end of " + p);
                 }
+                ioReads++;
             }
             footer.flip();
             for (int c = 0; c < cols; c++) {
@@ -784,6 +885,7 @@ public final class OmapPersistence {
             // 请求列在文件上首尾相接时合并成单次大块连续读。
             ColumnVector[] vectors = new ColumnVector[columnIds.length];
             ZoneMap[] zones = new ZoneMap[columnIds.length];
+            long dataBytes = 0;
             int i = 0;
             while (i < columnIds.length) {
                 int i0 = i;
@@ -795,12 +897,14 @@ public final class OmapPersistence {
                 }
                 long runStart = offsets[first];
                 int runLen = (int) (offsets[last] + lengths[last] - runStart);
+                dataBytes += runLen;
                 ByteBuffer run = ByteBuffer.allocate(runLen);
                 ch.position(runStart);
                 while (run.hasRemaining()) {
                     if (ch.read(run) < 0) {
                         throw new EOFException("Unexpected end of " + p);
                     }
+                    ioReads++;
                 }
                 run.flip();
                 for (int j = i0; j <= i; j++) {
@@ -810,6 +914,17 @@ public final class OmapPersistence {
                     zones[j] = footerZones[c];
                 }
                 i++;
+            }
+            if (QueryIoStats.isEnabled()) {
+                StringBuilder sb = new StringBuilder();
+                for (int c = 0; c < columnIds.length; c++) {
+                    if (c > 0) {
+                        sb.append(',');
+                    }
+                    sb.append(columnIds[c]);
+                }
+                QueryIoStats.record(segmentId, generation, sb.toString(), dataBytes, footerSize,
+                        ioReads + counting.ioReads);
             }
             return new ColumnSlice(segmentId, generation, rowCount, deletedCount, deleted,
                     columnIds, vectors, zones);
@@ -825,6 +940,7 @@ public final class OmapPersistence {
         Path p = dir.resolve("seg_" + expectedId + "_" + expectedGen + ".omap");
         long fileSize;
         byte[] fileBytes;
+        int ioReads = 0;
         try (FileChannel ch = FileChannel.open(p, StandardOpenOption.READ)) {
             fileSize = ch.size();
             if (fileSize > Integer.MAX_VALUE - 8) {
@@ -836,8 +952,10 @@ public final class OmapPersistence {
                 if (ch.read(wrap) < 0) {
                     throw new EOFException("Unexpected end of " + p);
                 }
+                ioReads++;
             }
         }
+        QueryIoStats.record(expectedId, expectedGen, "*", fileSize, 0, ioReads);
         // 整段一次大块读入后，列块与尾部目录都在内存缓冲上批量解码。
         ByteBuffer buf = ByteBuffer.wrap(fileBytes);
         requireSegment(new ValueCodec.BufferInput(buf), p, expectedId, expectedGen);
@@ -881,6 +999,32 @@ public final class OmapPersistence {
         }
         return ColumnSegment.restore(expectedId, expectedGen, rowCount, vectors, zones,
                 deleted, deletedCount, compareMode);
+    }
+
+    /**
+     * 统计提交给文件通道的读请求次数，用于判断读取是否碎片化。
+     */
+    private static final class CountingInputStream extends java.io.InputStream {
+
+        private final java.io.InputStream in;
+
+        int ioReads;
+
+        CountingInputStream(java.io.InputStream in) {
+            this.in = in;
+        }
+
+        @Override
+        public int read() throws IOException {
+            ioReads++;
+            return in.read();
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            ioReads++;
+            return in.read(b, off, len);
+        }
     }
 
     private void requireSegment(DataInput in, Path p, int expectedId, int expectedGen)

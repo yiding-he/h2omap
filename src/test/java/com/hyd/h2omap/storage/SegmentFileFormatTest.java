@@ -4,7 +4,9 @@
 package com.hyd.h2omap.storage;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -32,6 +34,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import com.hyd.h2omap.engine.OmapOptions;
 import com.hyd.h2omap.persistence.OmapPersistence;
+import com.hyd.h2omap.stats.QueryIoStats;
 import com.hyd.h2omap.stats.ZoneMap;
 
 /**
@@ -251,6 +254,221 @@ class SegmentFileFormatTest {
             assertThrows(DbException.class, () -> r.recover(target));
         } finally {
             r.close();
+        }
+    }
+
+    /**
+     * 并发读同一段同一列集时合并成一次读盘：只有一个线程产生 IO 记录，总字节数不超过单份的两倍。
+     */
+    @Test
+    void concurrentSegmentReadsAreCoalesced() throws Exception {
+        Path storeDir = dir.resolve("t-concurrent");
+        ColumnarStore store = newStore(4);
+        OmapPersistence p = newPersistence(storeDir);
+        store.setPersistence(p);
+        for (int i = 0; i < 8; i++) {
+            store.append(row(i, "v" + i));
+        }
+        List<ColumnSegment> segs = store.segments();
+        assertTrue(segs.size() >= 1);
+        int segmentId = segs.get(0).getSegmentId();
+        int generation = segs.get(0).getGeneration();
+
+        boolean previous = QueryIoStats.isEnabled();
+        QueryIoStats.setEnabled(true);
+        try {
+            QueryIoStats.begin();
+            ColumnSlice single = p.readSegmentColumns(segmentId, generation, new int[] { 1 });
+            QueryIoStats.end();
+            QueryIoStats singleStats = QueryIoStats.pollLast();
+            assertTrue(singleStats != null && singleStats.getTotalBytes() > 0, "串行读应产生统计");
+
+            int threads = 16;
+            long sequential = 0;
+            for (int i = 0; i < threads; i++) {
+                QueryIoStats.begin();
+                p.readSegmentColumns(segmentId, generation, new int[] { 1 });
+                QueryIoStats.end();
+                QueryIoStats st = QueryIoStats.pollLast();
+                sequential += st.getTotalBytes();
+            }
+            assertEquals(singleStats.getTotalBytes() * threads, sequential, "串行读每次都应读盘");
+
+            java.util.concurrent.CyclicBarrier barrier = new java.util.concurrent.CyclicBarrier(threads);
+            java.util.concurrent.atomic.AtomicLong totalBytes = new java.util.concurrent.atomic.AtomicLong();
+            java.util.concurrent.atomic.AtomicInteger failures = new java.util.concurrent.atomic.AtomicInteger();
+            java.util.concurrent.atomic.AtomicInteger ioThreads = new java.util.concurrent.atomic.AtomicInteger();
+            java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(threads);
+            for (int t = 0; t < threads; t++) {
+                Thread th = new Thread(() -> {
+                    try {
+                        barrier.await();
+                        QueryIoStats.begin();
+                        ColumnSlice slice = p.readSegmentColumns(segmentId, generation, new int[] { 1 });
+                        QueryIoStats.end();
+                        QueryIoStats st = QueryIoStats.pollLast();
+                        if (!"v0".equals(slice.getVector(1).get(0).getString())) {
+                            failures.incrementAndGet();
+                        }
+                        if (st != null && !st.isEmpty()) {
+                            ioThreads.incrementAndGet();
+                            totalBytes.addAndGet(st.getTotalBytes());
+                        }
+                    } catch (Exception e) {
+                        failures.incrementAndGet();
+                    } finally {
+                        done.countDown();
+                    }
+                });
+                th.start();
+            }
+            done.await();
+            assertEquals(0, failures.get(), "并发读结果应一致");
+            assertTrue(ioThreads.get() < threads,
+                    "并发 " + threads + " 次读盘应合并，实际 " + ioThreads.get() + " 个线程读盘");
+            assertTrue(totalBytes.get() <= sequential / 2,
+                    "并发读总字节应不超过串行 " + threads + " 份的一半，串行 " + sequential
+                            + "，并发 " + totalBytes.get());
+        } finally {
+            QueryIoStats.setEnabled(previous);
+            p.close();
+        }
+    }
+
+    /**
+     * 列切片缓存：逐出段的同一段同一列集重复读命中缓存（IO 归零、返回同一向量实例）。
+     */
+    @Test
+    void sliceCacheServesRepeatReadsOfEvictedSegment() throws IOException {
+        String property = "h2.omapSliceCacheBytes";
+        String previousValue = System.getProperty(property);
+        System.setProperty(property, "100m");
+        boolean previousStats = QueryIoStats.isEnabled();
+        QueryIoStats.setEnabled(true);
+        OmapPersistence p = null;
+        try {
+            p = newPersistence(dir.resolve("t-slice-cache-hit"));
+            ColumnarStore store = newColumnarStore("segmentSize=4", "compactionMinRows=1",
+                    "residentBytes=1");
+            assertTrue(store.sliceCache.isEnabled(), "设置系统属性后缓存应开启");
+            store.setPersistence(p);
+            for (int i = 0; i < 8; i++) {
+                store.append(row(i * 10, "v" + i));
+            }
+            store.checkpoint();
+            ColumnarStore.SegmentRef ref = store.segments.values().iterator().next();
+            assertNull(ref.loaded, "residentBytes=1 应把段全部逐出");
+            int[] columns = { 0, 1 };
+
+            QueryIoStats.begin();
+            ColumnSegment first = store.readSliceTransient(ref, columns);
+            QueryIoStats.end();
+            QueryIoStats firstStats = QueryIoStats.pollLast();
+            assertTrue(firstStats != null && firstStats.getTotalBytes() > 0, "首次读应读盘");
+
+            QueryIoStats.begin();
+            ColumnSegment second = store.readSliceTransient(ref, columns);
+            QueryIoStats.end();
+            QueryIoStats secondStats = QueryIoStats.pollLast();
+            assertTrue(secondStats == null || secondStats.isEmpty(), "第二次读应命中切片缓存");
+            assertSame(first.getColumn(0), second.getColumn(0), "命中缓存应复用同一列向量");
+            assertEquals("v0", second.getColumn(1).get(0).getString());
+            assertEquals(1, store.sliceCache.size());
+            assertTrue(store.sliceCache.getUsedBytes() > 0);
+            p.close();
+            p = null;
+        } finally {
+            QueryIoStats.setEnabled(previousStats);
+            restoreProperty(property, previousValue);
+            if (p != null) {
+                p.close();
+            }
+        }
+    }
+
+    /**
+     * 列切片缓存的失效：合并换 generation 后旧条目立即清除，下一次读重新读盘并读到新代数。
+     */
+    @Test
+    void sliceCacheInvalidatesWhenSegmentIsCompacted() throws IOException {
+        String property = "h2.omapSliceCacheBytes";
+        String previousValue = System.getProperty(property);
+        System.setProperty(property, "100m");
+        boolean previousStats = QueryIoStats.isEnabled();
+        QueryIoStats.setEnabled(true);
+        OmapPersistence p = null;
+        try {
+            p = newPersistence(dir.resolve("t-slice-cache-invalid"));
+            ColumnarStore store = newColumnarStore("segmentSize=4", "compactionMinRows=1");
+            store.setPersistence(p);
+            long[] ids = new long[8];
+            for (int i = 0; i < 8; i++) {
+                ids[i] = store.append(row(i * 10, "v" + i));
+            }
+            store.checkpoint();
+            // 预算只够留一段驻留，另一段被逐出，制造真实的逐出段读路径。
+            long segBytes = store.segments().get(0).getEstimatedMemory();
+            store.setResidentBudget(segBytes);
+            ColumnarStore.SegmentRef ref = null;
+            for (ColumnarStore.SegmentRef r : store.segments.values()) {
+                if (r.loaded == null) {
+                    ref = r;
+                    break;
+                }
+            }
+            assertNotNull(ref, "预算只够一段，另一段应被逐出");
+            int[] columns = { 0, 1 };
+
+            QueryIoStats.begin();
+            store.readSliceTransient(ref, columns);
+            QueryIoStats.end();
+            assertEquals(1, store.sliceCache.size());
+
+            store.update(ids[0], row(999, "z"));
+            store.compact();
+            int newGeneration = ref.generation;
+            assertTrue(newGeneration > 0, "合并应递增 generation");
+            assertEquals(0, store.sliceCache.size(), "合并后该段的旧缓存条目应被清除");
+            assertNull(store.sliceCache.get(ref.segmentId, 0,
+                    SliceCache.maskOf(columns)), "旧代条目应不再命中");
+
+            // 重新逐出后读新代：应读盘并把新代切片放进缓存。
+            // 先 checkpoint 把新代段文件写盘，否则无文件可读回、不会逐出。
+            store.checkpoint();
+            store.setResidentBudget(1);
+            assertNull(ref.loaded, "预算调小后段应再次被逐出");
+            QueryIoStats.begin();
+            store.readSliceTransient(ref, columns);
+            QueryIoStats.end();
+            QueryIoStats stats = QueryIoStats.pollLast();
+            assertTrue(stats != null && !stats.isEmpty(), "旧条目失效后应重新读盘");
+            assertEquals(newGeneration, stats.get(0).generation(), "重新读盘应读合并后的代数");
+            assertEquals(1, store.sliceCache.size(), "新代切片应重新入缓存");
+            p.close();
+            p = null;
+        } finally {
+            QueryIoStats.setEnabled(previousStats);
+            restoreProperty(property, previousValue);
+            if (p != null) {
+                p.close();
+            }
+        }
+    }
+
+    private static ColumnarStore newColumnarStore(String... params) {
+        return new ColumnarStore(
+                new org.h2.table.Column[] {
+                        new org.h2.table.Column("A", TypeInfo.getTypeInfo(Value.INTEGER)),
+                        new org.h2.table.Column("B", TypeInfo.getTypeInfo(Value.VARCHAR)) },
+                OmapOptions.from(List.of(params)),
+                CompareMode.getInstance(null, 0));
+    }
+
+    private static void restoreProperty(String property, String previousValue) {
+        if (previousValue == null) {
+            System.clearProperty(property);
+        } else {
+            System.setProperty(property, previousValue);
         }
     }
 }
