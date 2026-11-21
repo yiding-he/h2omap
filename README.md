@@ -91,6 +91,29 @@ CREATE TABLE EVENTS_MV(TS TIMESTAMP, HOST VARCHAR, COST DOUBLE)
 
 表定义随 H2 元数据（`.mv.db`）持久化；在文件模式库（如 `jdbc:h2:/path/to/db`）下，OMAP 表数据默认同步写入 `<databasePath>.omap/<schema>_<table>/`（WAL + 增量列段快照），重启后自动加载回内存。纯内存模式（`jdbc:h2:mem:...`）默认不写盘；可通过 `WITH "backup=false"` 关闭持久化，或通过 `WITH "backupDir=/path"`、`WITH "syncIntervalMs=200"` 调整存储路径与 WAL 刷盘间隔。
 
+### 存储参数与全局设置
+
+建表 `WITH` 参数（均为双引号标识符、逗号分隔多个）：
+
+| 参数 | 含义 | 默认 |
+| --- | --- | --- |
+| `segmentSize` | 每个列段的目标行数 | 65536 |
+| `compactionMinRows` | delta 攒到多少行触发合并 | 16384 |
+| `residentBytes` | 冻结段驻留堆的估算字节数预算（0 不逐出，仅文件模式库生效） | 0 |
+| `backup` / `backupDir` / `syncIntervalMs` | 持久化开关、目录与 WAL 刷盘间隔 | 自动 / 同目录 / 200 ms |
+
+运行时配置语句：
+
+```sql
+-- 调整单表驻留预算：调小立即逐出，调大由后续查询自然填驻留；改动同步进建表 SQL
+ALTER TABLE T SET RESIDENT_BYTES '40k';   -- 等号可选，后缀 k/m/g 按 1024 换算
+
+-- 调整数据库全局的逐出段列切片缓存预算：调小立即按 LRU 淘汰，调大不预载
+SET OMAP_SLICE_CACHE_BYTES '64m';         -- 等号可选；默认与下限均为 32 MiB（32768k）
+```
+
+两条语句均需管理员权限。`RESIDENT_BYTES` 持久化在表的建表 SQL 里；`OMAP_SLICE_CACHE_BYTES` 是数据库全局变量，持久化在 H2 目录的 `INFORMATION_SCHEMA.SETTINGS`，对库内全部 OMAP 表生效（每个表的切片缓存各自持有该预算）。
+
 ## 已知限制
 
 - **`DEFAULT_TABLE_ENGINE` 不能用**：它会让 `Schema.createTable` 把 H2 自己的元数据表也交给本引擎（`schema/Schema.java:795`），而元数据必须落在 MVStore 里，实测开库直接抛 `Unexpected code path`。它也只能通过 JDBC URL 参数设置，`2.5.252` 没有 `SET DEFAULT_TABLE_ENGINE` 命令。
