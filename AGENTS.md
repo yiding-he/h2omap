@@ -29,6 +29,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | 依赖 | 运行期只有 `com.h2database:h2`，测试用 `junit-jupiter`，构建期插件 `maven-shade-plugin` |
 | 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（78 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（24 个用例）、`src/test/java/com/hyd/h2omap/storage/SegmentFileFormatTest.java`（5 个用例）、`src/test/java/com/hyd/h2omap/persistence/ValueCodecTest.java`（3 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/`。该目录可能不存在（已排除在版本控制之外）。Maven Central 的 `h2-2.5.252-sources.jar` 内容等价，但个别文件与该 zip 相差数行，核对行号时以 zip 为准 |
+| 文件规模 | 新增或重构的生产类控制在单次文件读取窗口内（约 1200 行 / 45 KB，源自我代理工具的读取上限），超出时按职责拆分；拆分提交只做纯搬移（包声明、可见性、import、限定名），不得顺带改逻辑，验收是全部判定用例与用例计数不变。判定依据：超限文件只能分段读取，分段读会丢失锁契约等跨段不变量的上下文，是代理误判的主要来源 |
 
 ## H2 侧的依据
 
@@ -166,7 +167,7 @@ delta rowset（Merge-on-Read 批次 2）：更新新像不再按行存放（`Map
 
 有序模式：`ORDER BY` 单列加常量 `LIMIT` 时，段按排序列在 zone map 上的边界排序后依次扫描，用容量为 `limit + offset` 的堆留下前 N 行；堆已满且某段内最好的一行也不优于第 N 名时整段跳过。物理聚簇与排序键同向时只需扫一两段；同向不成立时结果仍正确，只是跳过不了段。多列 `ORDER BY`、排序键为表达式、`LIMIT` 缺失或超过 10000 时交回 H2。
 
-子查询下推（`SubqueryFold`，由 `VectorizedFilter.compile` 末尾与 `compileComparison` 调用）：
+子查询下推（入口 `SubqueryFold`，由 `VectorizedFilter.compile` 末尾与 `compileComparison` 调用；内层形态解析与共享原语在 `SubqueryInner`，S3/S4/S5 各形态在 `CorrelatedAggFold`/`CorrelatedExistsFold`/`CorrelatedInFold`）：
 
 | 形态 | 执行方式 |
 | --- | --- |
@@ -285,7 +286,7 @@ src/main/java/com/hyd/h2omap/
 ├── storage/       列段、开放段缓冲、delta、rowId 编码、延迟行、部分列读的列切片与占位列向量
 ├── persistence/   WAL 增量日志、增量列段快照与重启恢复
 ├── vector/        列向量（含字典向量、数组列与 CLOB 打包）、ValueVector 回退、null 位图
-├── vectorized/    单表过滤与聚合下推、谓词编译、子查询折叠（SubqueryFold）、段级部分聚合缓存（SegmentAggCache）
+├── vectorized/    单表过滤与聚合下推、谓词编译（VectorizedFilter）、子查询折叠（SubqueryFold 入口 + SubqueryInner 内层解析 + CorrelatedAggFold/CorrelatedInFold/CorrelatedExistsFold 各形态）、段级部分聚合缓存（SegmentAggCache）
 └── stats/         zone map
 
 src/main/java/org/h2/                     被替换的 H2 类与访问桥
