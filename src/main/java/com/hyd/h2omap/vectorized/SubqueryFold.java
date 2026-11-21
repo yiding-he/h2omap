@@ -131,16 +131,16 @@ final class SubqueryFold {
         if (valueType == Value.TINYINT || valueType == Value.SMALLINT
                 || valueType == Value.INTEGER || valueType == Value.BIGINT) {
             try {
-                return new VectorizedFilter.InNode(col, not, toLongSet(values));
+                return new InNode(col, not, toLongSet(values));
             } catch (RuntimeException e) {
                 return null;
             }
         }
-        return new VectorizedFilter.InNode(col, not, values);
+        return new InNode(col, not, values);
     }
 
-    private static VectorizedFilter.LongSet toLongSet(List<Value> values) {
-        VectorizedFilter.LongSet set = new VectorizedFilter.LongSet(values.size());
+    private static LongSet toLongSet(List<Value> values) {
+        LongSet set = new LongSet(values.size());
         for (Value v : values) {
             set.add(v.getLong());
         }

@@ -167,12 +167,12 @@ final class CorrelatedInFold {
     /** 单个关联键的内层值集合；{@code hasNull} 记录内层投影里的 NULL（NOT IN 的三值语义需要它）。 */
     static final class KeyMembership {
         /** 外层值列为整数族时使用，其余为 {@code null}。 */
-        final VectorizedFilter.LongSet longs;
+        final LongSet longs;
         final Set<Value> values;
         boolean hasNull;
 
         KeyMembership(boolean longValues) {
-            this.longs = longValues ? new VectorizedFilter.LongSet(4) : null;
+            this.longs = longValues ? new LongSet(4) : null;
             this.values = longValues ? null : new HashSet<>();
         }
 
