@@ -29,6 +29,15 @@ public final class OmapOptions {
     /** 冻结段驻留堆的估算字节数预算，0 表示不逐出。 */
     public static final long DEFAULT_RESIDENT_BYTES = 0;
 
+    /** 逐出段列切片缓存的数据库全局预算下限（字节），{@code SET OMAP_SLICE_CACHE_BYTES} 不接受更小值。 */
+    public static final long MIN_SLICE_CACHE_BYTES = 32L * 1024 * 1024;
+
+    /** 逐出段列切片缓存的默认预算（字节），未设置过 {@code SET OMAP_SLICE_CACHE_BYTES} 时生效。 */
+    public static final long DEFAULT_SLICE_CACHE_BYTES = MIN_SLICE_CACHE_BYTES;
+
+    /** {@code SET OMAP_SLICE_CACHE_BYTES} 在数据库目录里的设置名。 */
+    public static final String SLICE_CACHE_SETTING_NAME = "OMAP_SLICE_CACHE_BYTES";
+
     private final int segmentSize;
     private final int compactionMinRows;
     private final Boolean backup;

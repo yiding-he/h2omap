@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.h2.command.ddl.CreateTableData;
+import org.h2.engine.Setting;
 import org.h2.engine.SessionLocal;
 import org.h2.index.Index;
 import org.h2.index.IndexType;
@@ -53,6 +54,7 @@ public final class OmapTable extends TableBase {
         super(data);
         this.engineParams = data.tableEngineParams;
         this.store = new ColumnarStore(getColumns(), options, getCompareMode());
+        this.store.setSliceCacheBudget(sliceCacheBudget());
         // 惰性加载由服务端启动参数决定，默认关闭。
         this.store.setLazyLoad(database.getSettings().omapLazyLoad);
         this.store.setVisibilityListener(this::setModified);
@@ -71,6 +73,30 @@ public final class OmapTable extends TableBase {
                 this.persistence.initEmptyWal();
             }
         }
+    }
+
+    /**
+     * 运行时修改列切片缓存预算（全局 {@code SET OMAP_SLICE_CACHE_BYTES} 下推）：调小立即按 LRU
+     * 淘汰；调大不预载。预算存数据库目录，不进建表 SQL。
+     */
+    public void applySliceCacheBudget(long bytes) {
+        store.setSliceCacheBudget(bytes);
+    }
+
+    /** 建表时读目录里的全局设置；未设置过或损坏时用默认值 32 MiB。 */
+    private long sliceCacheBudget() {
+        Setting setting = database.findSetting(OmapOptions.SLICE_CACHE_SETTING_NAME);
+        if (setting != null) {
+            String value = setting.getStringValue();
+            if (value != null && !value.isEmpty()) {
+                try {
+                    return OmapOptions.parseByteSize(OmapOptions.SLICE_CACHE_SETTING_NAME, value);
+                } catch (RuntimeException ignore) {
+                    // 目录里的值异常时退回默认，不让建表失败
+                }
+            }
+        }
+        return OmapOptions.DEFAULT_SLICE_CACHE_BYTES;
     }
 
     /**

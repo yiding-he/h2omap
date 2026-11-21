@@ -2365,6 +2365,55 @@ class OmapTableContractTest {
         execute("ALTER TABLE IF EXISTS T_NOSUCH SET RESIDENT_BYTES '1'");
     }
 
+    /**
+     * SET OMAP_SLICE_CACHE_BYTES：数据库全局变量设置逐出段列切片缓存预算，对库内全部
+     * OMAP 表生效；默认 32 MiB 且不接受更小值（32768k 恰为下限，允许）；带后缀的值写成
+     * 字符串字面量、纯字节数可不加引号、等号可选；值以规范化字节数持久化进 H2 目录，
+     * 重开库重放 SET 后新表构造时读到同一预算。
+     */
+    @Test
+    void setOmapSliceCacheBytesIsGlobalWithLowerBoundAndPersists(@TempDir Path dir) throws Exception {
+        String url = "jdbc:h2:" + dir.resolve("slicecache");
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            s.execute(createTable("T", "ID INT", "\"segmentSize=4\""));
+            org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                    ((org.h2.jdbc.JdbcConnection) c).getSession();
+            com.hyd.h2omap.table.OmapTable t = (com.hyd.h2omap.table.OmapTable)
+                    session.getDatabase().getMainSchema().findTableOrView(session, "T");
+            assertEquals(32L * 1024 * 1024, t.getStore().getSliceCacheBudget(),
+                    "未设置过时应为默认 32 MiB");
+
+            s.execute("SET OMAP_SLICE_CACHE_BYTES '32768k'");
+            assertEquals(32L * 1024 * 1024, t.getStore().getSliceCacheBudget(),
+                    "32768k 恰为下限，应允许");
+            s.execute("SET OMAP_SLICE_CACHE_BYTES = 33554432");
+            s.execute("SET OMAP_SLICE_CACHE_BYTES '64m'");
+            assertEquals(64L * 1024 * 1024, t.getStore().getSliceCacheBudget());
+
+            assertThrows(SQLException.class, () -> s.execute("SET OMAP_SLICE_CACHE_BYTES '10m'"),
+                    "小于 32 MiB 应报错");
+            assertThrows(SQLException.class, () -> s.execute("SET OMAP_SLICE_CACHE_BYTES '40x'"),
+                    "非法后缀应报错");
+            assertThrows(SQLException.class, () -> s.execute("SET OMAP_SLICE_CACHE_BYTES NULL"));
+            assertEquals(64L * 1024 * 1024, t.getStore().getSliceCacheBudget(),
+                    "被拒绝的语句不应改变预算");
+            assertEquals("67108864", toString(s, "SELECT SETTING_VALUE FROM INFORMATION_SCHEMA.SETTINGS"
+                    + " WHERE SETTING_NAME = 'OMAP_SLICE_CACHE_BYTES'"),
+                    "值应以规范化字节数进目录");
+        }
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            s.execute(createTable("T2", "ID INT", "\"segmentSize=4\""));
+            org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                    ((org.h2.jdbc.JdbcConnection) c).getSession();
+            com.hyd.h2omap.table.OmapTable t2 = (com.hyd.h2omap.table.OmapTable)
+                    session.getDatabase().getMainSchema().findTableOrView(session, "T2");
+            assertEquals(64L * 1024 * 1024, t2.getStore().getSliceCacheBudget(),
+                    "重开库后新表应从目录读到 64 MiB");
+        }
+    }
+
     private static void assertQueriesMatch(Statement s, String[] templates) throws SQLException {
         for (String template : templates) {
             String expected = collectRows(s, String.format(template, "T_MV"));

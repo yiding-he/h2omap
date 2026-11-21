@@ -72,8 +72,8 @@ public final class ColumnarStore {
     final com.hyd.h2omap.vectorized.SegmentAggCache aggCache =
             new com.hyd.h2omap.vectorized.SegmentAggCache();
 
-    /** 逐出段的列切片缓存：只复用冻结段内容，不计入驻留预算，默认关闭。 */
-    final SliceCache sliceCache = new SliceCache();
+    /** 逐出段的列切片缓存：只复用冻结段内容，不计入驻留预算，预算由全局 SET 下推。 */
+    final SliceCache sliceCache = new SliceCache(com.hyd.h2omap.engine.OmapOptions.DEFAULT_SLICE_CACHE_BYTES);
 
     final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
@@ -327,6 +327,19 @@ public final class ColumnarStore {
         } finally {
             lock.writeLock().unlock();
         }
+    }
+
+    /**
+     * 运行时修改列切片缓存预算：调小立即按 LRU 淘汰；调大不预载，由后续查询自然填入。
+     * 调用方是全局 SET 命令与建表时读目录里的设置值，阈值校验在命令层。
+     */
+    public void setSliceCacheBudget(long bytes) {
+        sliceCache.setBudget(bytes);
+    }
+
+    /** 当前列切片缓存预算（字节）。 */
+    public long getSliceCacheBudget() {
+        return sliceCache.getBudget();
     }
 
     /** 当前驻留预算，0 表示不逐出。 */

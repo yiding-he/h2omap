@@ -17,9 +17,10 @@ import java.util.Map;
  * <p>与段级驻留（{@code residentBytes}）相互独立：本缓存不计入驻留预算、不参与逐出、
  * 不触发逐出，驻留通道也不复用本缓存。两者叠加时驻留段走内存，逐出段走本缓存。
  *
- * <p>预算由服务端系统属性 {@code -Dh2.omapSliceCacheBytes} 给出，默认 0 即关闭；纯数字按
- * 字节，可跟后缀 k/m/g（不区分大小写，按 1024 换算），与 residentBytes 同一写法。取值无法
- * 解析时按 0 处理，即关闭缓存。超出预算时按 LRU 淘汰最久未访问的条目。
+ * <p>预算是数据库全局变量 {@code SET OMAP_SLICE_CACHE_BYTES} 的值（默认与下限均为 32 MiB），
+ * 由命令层下推到每个 OMAP 表的存储；取值是带单位的数字（后缀 k/m/g，不区分大小写，
+ * 按 1024 换算）。预算调小时立即按 LRU 淘汰到新一档；调大不主动预载，由后续查询自然
+ * 填入缓存。超出预算时按 LRU 淘汰最久未访问的条目。
  *
  * <p>并发：全部方法同步在同一个锁上；取出的切片其向量与删除位图只读，可跨线程共享。
  */
@@ -31,56 +32,37 @@ final class SliceCache {
     private record Key(int segmentId, int generation, long columnMask) {
     }
 
-    private final long budget;
+    private long budget;
     private final LinkedHashMap<Key, ColumnSlice> lru =
             new LinkedHashMap<>(16, 0.75f, true);
     private long usedBytes;
 
-    SliceCache() {
-        this.budget = budgetBytes();
+    SliceCache(long budgetBytes) {
+        this.budget = budgetBytes;
     }
 
-    private static long budgetBytes() {
-        String value = System.getProperty("h2.omapSliceCacheBytes");
-        if (value == null) {
-            return 0L;
-        }
-        String s = value.trim();
-        int split = 0;
-        while (split < s.length() && Character.isDigit(s.charAt(split))) {
-            split++;
-        }
-        String number = s.substring(0, split);
-        if (number.isEmpty()) {
-            return 0L;
-        }
-        long multiplier;
-        switch (s.substring(split).toLowerCase(java.util.Locale.ROOT)) {
-        case "":
-            multiplier = 1L;
-            break;
-        case "k":
-            multiplier = 1024L;
-            break;
-        case "m":
-            multiplier = 1024L * 1024;
-            break;
-        case "g":
-            multiplier = 1024L * 1024 * 1024;
-            break;
-        default:
-            return 0L;
-        }
-        try {
-            long n = Long.parseLong(number);
-            return n < 0 || n > Long.MAX_VALUE / multiplier ? 0L : n * multiplier;
-        } catch (NumberFormatException e) {
-            return 0L;
+    /**
+     * 调整预算：调小立即按 LRU 淘汰到新一档；调大不预载，由后续查询自然填入。
+     */
+    void setBudget(long budgetBytes) {
+        synchronized (lru) {
+            this.budget = budgetBytes;
+            while (usedBytes > budget && !lru.isEmpty()) {
+                Map.Entry<Key, ColumnSlice> eldest = lru.entrySet().iterator().next();
+                lru.remove(eldest.getKey());
+                usedBytes -= eldest.getValue().getEstimatedMemory();
+            }
         }
     }
 
     boolean isEnabled() {
         return budget > 0;
+    }
+
+    long getBudget() {
+        synchronized (lru) {
+            return budget;
+        }
     }
 
     long getUsedBytes() {

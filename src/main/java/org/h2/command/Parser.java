@@ -417,6 +417,7 @@ import org.h2.value.ValueUuid;
 import org.h2.value.ValueVarchar;
 
 import com.hyd.h2omap.command.OmapAlterTableSetResidentBytes;
+import com.hyd.h2omap.command.OmapSetOmapSliceCacheBytes;
 
 /**
  * The parser is used to convert a SQL statement string to an command object.
@@ -7517,6 +7518,10 @@ public final class Parser extends ParserBase {
             readIfEqualOrTo();
             command.setExpression(readExpression());
             return command;
+        } else if (readIf("OMAP_SLICE_CACHE_BYTES")) {
+            // OMAP 扩展：数据库全局的逐出段列切片缓存预算，其余 SET 名保持原语义。
+            readIfEqualOrTo();
+            return new OmapSetOmapSliceCacheBytes(session, readExpression());
         } else if (readIf("AUTOCOMMIT")) {
             readIfEqualOrTo();
             return new TransactionCommand(session, readBooleanSetting() ? CommandInterface.SET_AUTOCOMMIT_TRUE

@@ -340,9 +340,6 @@ class SegmentFileFormatTest {
      */
     @Test
     void sliceCacheServesRepeatReadsOfEvictedSegment() throws IOException {
-        String property = "h2.omapSliceCacheBytes";
-        String previousValue = System.getProperty(property);
-        System.setProperty(property, "100m");
         boolean previousStats = QueryIoStats.isEnabled();
         QueryIoStats.setEnabled(true);
         OmapPersistence p = null;
@@ -350,7 +347,7 @@ class SegmentFileFormatTest {
             p = newPersistence(dir.resolve("t-slice-cache-hit"));
             ColumnarStore store = newColumnarStore("segmentSize=4", "compactionMinRows=1",
                     "residentBytes=1");
-            assertTrue(store.sliceCache.isEnabled(), "设置系统属性后缓存应开启");
+            assertTrue(store.sliceCache.isEnabled(), "默认 32 MiB 预算下缓存应开启");
             store.setPersistence(p);
             for (int i = 0; i < 8; i++) {
                 store.append(row(i * 10, "v" + i));
@@ -379,7 +376,6 @@ class SegmentFileFormatTest {
             p = null;
         } finally {
             QueryIoStats.setEnabled(previousStats);
-            restoreProperty(property, previousValue);
             if (p != null) {
                 p.close();
             }
@@ -391,9 +387,6 @@ class SegmentFileFormatTest {
      */
     @Test
     void sliceCacheInvalidatesWhenSegmentIsCompacted() throws IOException {
-        String property = "h2.omapSliceCacheBytes";
-        String previousValue = System.getProperty(property);
-        System.setProperty(property, "100m");
         boolean previousStats = QueryIoStats.isEnabled();
         QueryIoStats.setEnabled(true);
         OmapPersistence p = null;
@@ -448,7 +441,56 @@ class SegmentFileFormatTest {
             p = null;
         } finally {
             QueryIoStats.setEnabled(previousStats);
-            restoreProperty(property, previousValue);
+            if (p != null) {
+                p.close();
+            }
+        }
+    }
+
+    /**
+     * 预算调小立即按 LRU 淘汰到新一档：缓存里唯一的条目超出新预算时立即被消掉，
+     * 下一次读重新读盘并重新入缓存。
+     */
+    @Test
+    void sliceCacheBudgetShrinkEvictsImmediately() throws IOException {
+        boolean previousStats = QueryIoStats.isEnabled();
+        QueryIoStats.setEnabled(true);
+        OmapPersistence p = null;
+        try {
+            p = newPersistence(dir.resolve("t-slice-cache-budget"));
+            ColumnarStore store = newColumnarStore("segmentSize=4", "compactionMinRows=1",
+                    "residentBytes=1");
+            store.setPersistence(p);
+            for (int i = 0; i < 8; i++) {
+                store.append(row(i * 10, "v" + i));
+            }
+            store.checkpoint();
+            ColumnarStore.SegmentRef ref = store.segments.values().iterator().next();
+            int[] columns = { 0, 1 };
+
+            QueryIoStats.begin();
+            store.readSliceTransient(ref, columns);
+            QueryIoStats.end();
+            assertEquals(1, store.sliceCache.size());
+            long used = store.sliceCache.getUsedBytes();
+            assertTrue(used > 0);
+
+            // 调小到容不下已有条目：立即淘汰，不需要等下一次访问。
+            store.setSliceCacheBudget(used - 1);
+            assertEquals(0, store.sliceCache.size(), "调小预算应立即按 LRU 淘汰");
+
+            // 恢复预算后重读：重新读盘并重新入缓存。
+            store.setSliceCacheBudget(com.hyd.h2omap.engine.OmapOptions.DEFAULT_SLICE_CACHE_BYTES);
+            QueryIoStats.begin();
+            store.readSliceTransient(ref, columns);
+            QueryIoStats.end();
+            QueryIoStats stats = QueryIoStats.pollLast();
+            assertTrue(stats != null && !stats.isEmpty(), "条目被淘汰后应重新读盘");
+            assertEquals(1, store.sliceCache.size());
+            p.close();
+            p = null;
+        } finally {
+            QueryIoStats.setEnabled(previousStats);
             if (p != null) {
                 p.close();
             }
@@ -462,13 +504,5 @@ class SegmentFileFormatTest {
                         new org.h2.table.Column("B", TypeInfo.getTypeInfo(Value.VARCHAR)) },
                 OmapOptions.from(List.of(params)),
                 CompareMode.getInstance(null, 0));
-    }
-
-    private static void restoreProperty(String property, String previousValue) {
-        if (previousValue == null) {
-            System.clearProperty(property);
-        } else {
-            System.setProperty(property, previousValue);
-        }
     }
 }
