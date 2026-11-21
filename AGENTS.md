@@ -319,6 +319,14 @@ src/test/java/com/hyd/h2omap/
 - 外部纯 H2 客户端压测（16 读 + 1 写 + 100 万行，客户端无需引入 `h2omap` Jar）：`java -Xmx1g -cp "$HOME/.m2/repository/com/h2database/h2/2.5.252/h2-2.5.252.jar:target/test-classes" com.hyd.h2omap.bench.ConcurrentQueryBench 16 1000000 5 true omap "jdbc:h2:tcp://localhost:19092/mem:omapconcurrent;DB_CLOSE_DELAY=-1;QUERY_CACHE_SIZE=0"`。
 - 外部纯 H2 客户端压测（16 读 + 1 写 + 500 万行，仅 OMAP，5 条查询 × 50 轮共 4,000 次查询）：`java -Xmx2g -cp "$HOME/.m2/repository/com/h2database/h2/2.5.252/h2-2.5.252.jar:target/test-classes" com.hyd.h2omap.bench.ConcurrentQueryBench 16 5000000 50 true omap "jdbc:h2:tcp://localhost:19092/mem:omap5m;DB_CLOSE_DELAY=-1;QUERY_CACHE_SIZE=0"`。
 
+### residentBytes 驻留预算测试环境（本机）
+
+一键重建：`./scripts/resident-env.sh`。数据目录默认 `/Volumes/Yotta/Temp/h2omap`（本机 SSD APFS 卷），可用 `OMAP_RESIDENT_DATA_DIR`、`OMAP_RESIDENT_ROWS`（默认 900 万）、`OMAP_RESIDENT_BUDGET`（默认 `100m`）、`OMAP_RESIDENT_XMX`（默认 `8g`）覆盖。流程：生成 900 万行 10 列表 `T`（文件库 `benchdb`，磁盘约 1 GB、139 个段）→ `ALTER TABLE T SET RESIDENT_BYTES '100m'` 设 100 MiB 驻留预算 → 校验行数与 H2 目录里的 `WITH "residentBytes=104857600"`。重建耗时约 5 分钟（含 `benchSetup` 的双插与收尾查询）；脚本重置时会删除 `benchdb*` 全部文件（含 `.trace.db`）。
+
+实测口径（Apple M4、900 万行）：开库 7–10 s，瓶颈不是磁盘——1 GB 段文件由 4 线程并行读只占零点几秒，大头是 `ID BIGINT PRIMARY KEY` 的 rowId 索引回填（900 万次 `ConcurrentSkipListMap.put` 串行，约 1 µs/行）；`COUNT(*)` 走骨架零段读（≤5 ms）；冷 `SUM(INT_COL)` 按列目录只读约 36 MB 列切片（13–19 ms）；二次 `SUM` 命中段级聚合缓存（0 ms）；开库后驻留 100,382,915 B ≤ 预算，逐出后 8 项聚合签名与逐出前一致。进程堆约 1.8 GB，其中段内容 100 MB，大头是主键索引（约 1 GB）与 JVM/H2 开销：`residentBytes` 只管冻结段内容，不管索引。
+
+服务端按需启动：`java -Xmx8g -cp target/h2omap-0.1.0-SNAPSHOT.jar org.h2.tools.Server -tcp -tcpPort 19092 -ifNotExists`；客户端 URL `jdbc:h2:tcp://127.0.0.1:19092/Volumes/Yotta/Temp/h2omap/benchdb;QUERY_CACHE_SIZE=0`（客户端只需官方 H2 驱动）。
+
 `src/test/java/com/hyd/h2omap/OmapTableContractTest.java` 是 H2 接入契约的集成测试；`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java` 直接驱动存储层，断言段数与 rowId 稳定性；`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java` 断言回退向量的内存估算随值内容变化。
 
 ## 当前状态与后续阶段
