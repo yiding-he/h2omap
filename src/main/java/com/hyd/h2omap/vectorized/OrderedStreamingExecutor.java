@@ -6,12 +6,16 @@ package com.hyd.h2omap.vectorized;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
+import java.util.HashSet;
 import java.util.List;
 
 import org.h2.command.query.QueryOrderBy;
 import org.h2.engine.SessionLocal;
 import org.h2.expression.Expression;
 import org.h2.expression.ExpressionColumn;
+import org.h2.expression.ExpressionVisitor;
+import org.h2.expression.Subquery;
+import org.h2.result.Row;
 import org.h2.result.SortOrder;
 import org.h2.table.Column;
 import org.h2.table.TableFilter;
@@ -43,6 +47,13 @@ import com.hyd.h2omap.vector.ColumnVector;
  * {@code NULLS FIRST} 时出首行前就得收齐全部段的 NULL 行；可空首列交回 H2。
  * 区间相交（随机写入形态）、多表、表达式排序键等一律交回 H2 行式路径。
  * 形态合法但区间相交时 {@link #tryClaim} 返回 {@code null}，调用方无缝回退。
+ *
+ * <p>表达式投影（M20-2）：排序阶段不受投影影响，投影里的表达式在行真正发出时
+ * 才逐行求值——把该行引用列的值经 {@code TableFilter.set(Row)} 就位后调
+ * {@code Expression.getValue(session)}，只对真正发射的行付费。接受边界：
+ * 确定表达式（{@code ExpressionVisitor.DETERMINISTIC_VISITOR} 判定，{@code RAND()}
+ * 等交回 H2）、引用列全在本表数据列范围内（{@code _ROWID_} 等伪列交回）；
+ * 顶层 {@code Subquery} 交回 H2，嵌套在其他表达式里的子查询照 H2 行式口径逐行求值。
  */
 final class OrderedStreamingExecutor {
 
@@ -91,6 +102,8 @@ final class OrderedStreamingExecutor {
         int outLen = Math.max(resultColumnCount, expressions.size());
         int[] projCols = new int[outLen];
         Value[] projConsts = new Value[outLen];
+        Expression[] projExprs = new Expression[outLen];
+        List<Integer> exprRefCols = new ArrayList<>();
         for (int i = 0; i < outLen; i++) {
             Expression e = i < expressions.size() ? expressions.get(i) : null;
             if (e == null) {
@@ -103,15 +116,37 @@ final class OrderedStreamingExecutor {
                 if (ec.getTableFilter() != tableFilter) {
                     return null;
                 }
-                projCols[i] = ec.getColumn().getColumnId();
+                int id = ec.getColumn().getColumnId();
+                if (id < 0 || id >= columns.length) {
+                    return null;
+                }
+                projCols[i] = id;
             } else if (e.isConstant()) {
                 projCols[i] = -1;
                 projConsts[i] = e.getValue(session);
             } else {
-                return null;
+                // M20-2：表达式投影在行发出时逐行求值；非确定表达式与顶层子查询交回 H2
+                if (e instanceof Subquery
+                        || !e.isEverything(ExpressionVisitor.DETERMINISTIC_VISITOR)) {
+                    return null;
+                }
+                HashSet<Column> refs = new HashSet<>();
+                e.isEverything(ExpressionVisitor.getColumnsVisitor(refs, table));
+                for (Column c : refs) {
+                    if (c.getTable() != table || c.getColumnId() < 0
+                            || c.getColumnId() >= columns.length) {
+                        return null;
+                    }
+                }
+                projCols[i] = -1;
+                projConsts[i] = ValueNull.INSTANCE;
+                projExprs[i] = e;
+                for (Column c : refs) {
+                    exprRefCols.add(c.getColumnId());
+                }
             }
         }
-        int[] uniqueProjCols = new int[outLen];
+        int[] uniqueProjCols = new int[outLen + exprRefCols.size()];
         int uniqueCount = 0;
         int[] projToUnique = new int[outLen];
         for (int i = 0; i < outLen; i++) {
@@ -133,6 +168,20 @@ final class OrderedStreamingExecutor {
             }
             projToUnique[i] = found;
         }
+        // 表达式引用列并入延迟读集：只在段真正发出一行时才读回
+        for (int i = 0; i < exprRefCols.size(); i++) {
+            int col = exprRefCols.get(i);
+            int found = -1;
+            for (int u = 0; u < uniqueCount; u++) {
+                if (uniqueProjCols[u] == col) {
+                    found = u;
+                    break;
+                }
+            }
+            if (found < 0) {
+                uniqueProjCols[uniqueCount++] = col;
+            }
+        }
 
         VectorizedFilter filter = null;
         if (condition != null) {
@@ -153,7 +202,7 @@ final class OrderedStreamingExecutor {
         }
         table.getStore().recordOrderedStreamingClaim();
         return new Cursor(session, table, tableFilter, filter, compareMode(table),
-                projCols, projConsts, projToUnique,
+                projCols, projConsts, projExprs, projToUnique,
                 Arrays.copyOf(uniqueProjCols, uniqueCount), uniqueCount, outLen,
                 sortCols, desc, nullsFirst, snapshotColumns, offset, built);
     }
@@ -360,6 +409,7 @@ final class OrderedStreamingExecutor {
         private final CompareMode compareMode;
         private final int[] projCols;
         private final Value[] projConsts;
+        private final Expression[] projExprs;
         private final int[] projToUnique;
         private final int[] uniqueProjCols;
         private final int uniqueCount;
@@ -369,6 +419,8 @@ final class OrderedStreamingExecutor {
         private final boolean[] nullsFirst;
         private final int[] snapshotColumns;
         private final long offset;
+        private final boolean hasExprs;
+        private final int[] colToVec;
 
         private VectorizedSnapshot snap;
         private ColumnSegment[] orderedSegs;
@@ -382,7 +434,7 @@ final class OrderedStreamingExecutor {
 
         Cursor(SessionLocal session, OmapTable table, TableFilter tableFilter,
                 VectorizedFilter filter, CompareMode compareMode,
-                int[] projCols, Value[] projConsts, int[] projToUnique,
+                int[] projCols, Value[] projConsts, Expression[] projExprs, int[] projToUnique,
                 int[] uniqueProjCols, int uniqueCount, int outLen,
                 int[] sortCols, boolean[] desc, boolean[] nullsFirst,
                 int[] snapshotColumns, long offset, Built built) {
@@ -393,6 +445,7 @@ final class OrderedStreamingExecutor {
             this.compareMode = compareMode;
             this.projCols = projCols;
             this.projConsts = projConsts;
+            this.projExprs = projExprs;
             this.projToUnique = projToUnique;
             this.uniqueProjCols = uniqueProjCols;
             this.uniqueCount = uniqueCount;
@@ -402,6 +455,19 @@ final class OrderedStreamingExecutor {
             this.nullsFirst = nullsFirst;
             this.snapshotColumns = snapshotColumns;
             this.offset = offset;
+            boolean exprs = false;
+            for (Expression e : projExprs) {
+                if (e != null) {
+                    exprs = true;
+                    break;
+                }
+            }
+            this.hasExprs = exprs;
+            this.colToVec = new int[table.getColumns().length];
+            Arrays.fill(colToVec, -1);
+            for (int u = 0; u < uniqueCount; u++) {
+                colToVec[uniqueProjCols[u]] = u;
+            }
             adopt(built);
         }
 
@@ -455,14 +521,14 @@ final class OrderedStreamingExecutor {
                         return null;
                     }
                     extraIdx++;
-                    return emitExtra(extraRow);
+                    return emitExtra(extraRow, extraIds[extraIdx - 1]);
                 }
                 if (!st.initialized) {
                     if (extraRow != null && compareFirstCol(session, compareMode, desc[0],
                             extraRow[sortCols[0]], st.virtualFarBound) < 0) {
                         // 活像首列严格优于段的边界最优值，必在整段之前
                         extraIdx++;
-                        return emitExtra(extraRow);
+                        return emitExtra(extraRow, extraIds[extraIdx - 1]);
                     }
                     initSeg(st);
                     continue;
@@ -474,7 +540,7 @@ final class OrderedStreamingExecutor {
                             extraKeys[extraIdx], extraIds[extraIdx]);
                     if (cmp > 0) {
                         extraIdx++;
-                        return emitExtra(extraRow);
+                        return emitExtra(extraRow, extraIds[extraIdx - 1]);
                     }
                 }
                 return emitSegment(st);
@@ -546,17 +612,90 @@ final class OrderedStreamingExecutor {
                     out[c] = projConsts[c];
                 }
             }
+            if (hasExprs) {
+                // 表达式投影：行发出时才逐行求值，只对该行付费
+                tableFilter.set(new EmitRow(st.projVecs, colToVec, idx,
+                        RowId.ofSegment(st.seg.getSegmentId(), idx)));
+                evaluateExprs(out);
+            }
             st.ptr++;
             return out;
         }
 
-        private Value[] emitExtra(Value[] extraRow) {
+        private Value[] emitExtra(Value[] extraRow, long rowId) {
             Value[] out = new Value[outLen];
             for (int c = 0; c < outLen; c++) {
                 int col = projCols[c];
                 out[c] = col >= 0 ? extraRow[col] : projConsts[c];
             }
+            if (hasExprs) {
+                tableFilter.set(new EmitRow(extraRow, rowId));
+                evaluateExprs(out);
+            }
             return out;
+        }
+
+        private void evaluateExprs(Value[] out) {
+            for (int c = 0; c < outLen; c++) {
+                if (projExprs[c] != null) {
+                    out[c] = projExprs[c].getValue(session);
+                }
+            }
+        }
+    }
+
+    /** 发射期求值用的行视图：列值直接从延迟读回的列向量或活像行读取。 */
+    private static final class EmitRow extends Row {
+
+        private final ColumnVector[] vecs;
+        private final int[] colToVec;
+        private final Value[] row;
+        private final int idx;
+
+        EmitRow(ColumnVector[] vecs, int[] colToVec, int idx, long rowId) {
+            this.vecs = vecs;
+            this.colToVec = colToVec;
+            this.row = null;
+            this.idx = idx;
+            this.key = rowId;
+        }
+
+        EmitRow(Value[] row, long rowId) {
+            this.vecs = null;
+            this.colToVec = null;
+            this.row = row;
+            this.idx = -1;
+            this.key = rowId;
+        }
+
+        @Override
+        public Value getValue(int i) {
+            return vecs != null ? vecs[colToVec[i]].get(idx) : row[i];
+        }
+
+        @Override
+        public void setValue(int i, Value v) {
+            throw new UnsupportedOperationException("流式发射行不可写入");
+        }
+
+        @Override
+        public void copyFrom(org.h2.result.SearchRow source) {
+            throw new UnsupportedOperationException("流式发射行不可写入");
+        }
+
+        @Override
+        public int getColumnCount() {
+            return vecs != null ? colToVec.length : row.length;
+        }
+
+        @Override
+        public Value[] getValueList() {
+            throw new UnsupportedOperationException("流式发射行不支持整行物化");
+        }
+
+        @Override
+        public int getMemory() {
+            return org.h2.engine.Constants.MEMORY_ROW + 24;
         }
     }
 
