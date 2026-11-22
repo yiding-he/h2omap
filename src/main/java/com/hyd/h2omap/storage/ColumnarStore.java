@@ -104,6 +104,12 @@ public final class ColumnarStore {
     /** 整段临时读的累计次数（预算容不下单段的行式回退与合并读回），供测试断言不误走整段读。 */
     private final AtomicLong fullTransientReads = new AtomicLong();
 
+    /** 有序流式执行命中下推的次数累计，供测试断言回退口径（区间相交等场景不命中）。 */
+    private final AtomicLong orderedStreamingClaims = new AtomicLong();
+
+    /** 有序流式延迟投影读回的累计次数（含驻留段内存直读），供测试断言延迟物化生效。 */
+    private final AtomicLong deferredProjectionReads = new AtomicLong();
+
     /** 空位置数组：rowset 被 zone map 跳过时用它替代。 */
     private static final int[] EMPTY_POSITIONS = new int[0];
 
@@ -1087,6 +1093,49 @@ public final class ColumnarStore {
                 vectors, zones, slice.getDeletedBitmap(), slice.getDeletedCount(), compareMode);
     }
 
+    /**
+     * 有序流式执行的延迟投影读回（M20）：排序阶段只读排序键与谓词列，段内首次发出一行前
+     * 才按段号读回投影列，不进驻留模型。
+     *
+     * <p>与懒加载快照同一套读回口径：段已驻留时直接读驻留段，逐出段走切片缓存或按列目录
+     * 切片读，读的都是段的当前代内容——可见性由快照时刻截取的删除/更新掩码决定，
+     * 与 {@code SnapshotQuery.loadSnapshotVectors} 一致。快照后段被整段摘除（全删丢弃）时
+     * 段号查不到，与懒加载同口径地显式报错。
+     *
+     * @param segmentId 快照段的段号
+     * @param columns 投影列号升序
+     * @return 与 {@code columns} 逐位对齐的列向量
+     */
+    public ColumnVector[] readDeferredProjection(int segmentId, int[] columns) {
+        deferredProjectionReads.incrementAndGet();
+        ColumnVector[] out = new ColumnVector[columns.length];
+        lock.readLock().lock();
+        SegmentRef ref;
+        try {
+            ref = segments.get(segmentId);
+        } finally {
+            lock.readLock().unlock();
+        }
+        if (ref != null) {
+            ColumnSegment loaded = ref.loaded;
+            if (loaded != null) {
+                for (int i = 0; i < columns.length; i++) {
+                    out[i] = loaded.getColumn(columns[i]);
+                }
+                return out;
+            }
+            ColumnSegment slice = readSliceTransient(ref, columns);
+            if (slice != null) {
+                for (int i = 0; i < columns.length; i++) {
+                    out[i] = slice.getColumn(columns[i]);
+                }
+                return out;
+            }
+            throw new IllegalStateException("流式投影列读回失败: seg_" + segmentId);
+        }
+        throw new IllegalStateException("流式投影列读回失败: 段已不存在 seg_" + segmentId);
+    }
+
     /** 按段号取已加载的段，供 checkpoint 写盘使用。 */
     /**
      * 检查点要写进 manifest 的骨架元数据；段既无内容也无骨架时返回 null。
@@ -1254,5 +1303,20 @@ public final class ColumnarStore {
     /** 记一次有序扫描的整段跳过。 */
     public void recordOrderedSkip() {
         orderedSkippedSegments.incrementAndGet();
+    }
+
+    /** 有序流式下推命中次数累计（不含回退），供测试断言命中与回退口径。 */
+    public long getOrderedStreamingClaims() {
+        return orderedStreamingClaims.get();
+    }
+
+    /** 记一次有序流式下推命中。 */
+    public void recordOrderedStreamingClaim() {
+        orderedStreamingClaims.incrementAndGet();
+    }
+
+    /** 有序流式延迟投影读回次数累计，供测试断言延迟物化生效。 */
+    public long getDeferredProjectionReads() {
+        return deferredProjectionReads.get();
     }
 }

@@ -123,6 +123,7 @@ final class OrderedExecutor {
             }
         }
 
+        int extraCount = 0;
         for (Value[] srcRow : snap.extraRows) {
             if (filter != null && !filter.evalRow(srcRow, session, compareMode)) {
                 continue;
@@ -132,7 +133,9 @@ final class OrderedExecutor {
                 int col = projCols[c];
                 row[c] = col >= 0 ? srcRow[col] : projConsts[c];
             }
-            push(heap, capacity, order, new OrderedEntry(srcRow[sortCol], srcRow[0].getLong(), row));
+            // extra 行按数据列索引、不含 0 号 rowId，rowId 必须取自快照携带的对齐数组。
+            push(heap, capacity, order,
+                    new OrderedEntry(srcRow[sortCol], snap.extraRowIds[extraCount++], row));
         }
 
         OrderedEntry[] entries = heap.toArray(new OrderedEntry[0]);

@@ -21,15 +21,22 @@ public final class VectorizedSnapshot {
 
     public final List<Value[]> extraRows;
 
+    /**
+     * 与 {@link #extraRows} 逐位对齐的 rowId（M20）：delta 新像与开放段行都不含 0 号 rowId，
+     * 取代旧实现从 {@code srcRow[0].getLong()} 反解的口径——那是数据列的值，不是 rowId。
+     */
+    public final long[] extraRowIds;
+
     /** 每段的 delta 屏蔽位版本，供部分聚合缓存判定条目是否仍有效。 */
     public final Map<Integer, Long> deltaVersions;
 
     VectorizedSnapshot(ColumnSegment[] segments,
             Map<Integer, BitSet> maskedBySegment, List<Value[]> extraRows,
-            Map<Integer, Long> deltaVersions) {
+            long[] extraRowIds, Map<Integer, Long> deltaVersions) {
         this.segments = segments;
         this.maskedBySegment = maskedBySegment;
         this.extraRows = extraRows;
+        this.extraRowIds = extraRowIds;
         this.deltaVersions = deltaVersions;
     }
 }

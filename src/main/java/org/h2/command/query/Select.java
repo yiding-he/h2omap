@@ -822,6 +822,22 @@ public class Select extends Query {
                 target == null && forUpdate == null && !isQuickAggregateQuery &&
                 fetch != 0 && !fetchPercent && !withTies && offset == 0 && isReadOnly();
         int columnCount = expressions.size();
+        // M20：无 LIMIT 的 ORDER BY 有序流式下推——命中时直接返回流式游标，不建 LocalResult、
+        // 不全量物化；客户端逐行取数，停止取数扫描即停。必须在下面建 LocalResult 之前判定，
+        // 否则空 LocalResult 会盖掉流式结果。不命中则交回原路径。
+        if (sort != null && target == null && forUpdate == null
+                && !isQuickAggregateQuery && !isGroupQuery && !isWindowQuery
+                && !distinct && distinctExpressions == null && qualifyIndex < 0
+                && inPredicateSortTypes == null && !withTies && !fetchPercent
+                && fetch == -1 && offset >= 0 && filters.size() == 1) {
+            LazyResultSelect streamed = tryVectorizedOrderedStreaming(columnCount, offset);
+            if (streamed != null) {
+                topTableFilter.startQuery(session);
+                topTableFilter.reset();
+                topTableFilter.lock(session);
+                return streamed;
+            }
+        }
         LocalResult result = null;
         if (!lazy && (target == null ||
                 !getDatabase().getSettings().optimizeInsertFromSelect)) {
@@ -925,6 +941,18 @@ public class Select extends Query {
         }
         return com.hyd.h2omap.vectorized.OmapVectorizedExecutor.tryExecuteFlat(
                 session, topTableFilter, condition, expressions, resultColumnCount, maxRows, sort, result);
+    }
+
+    /**
+     * M20：无 LIMIT 的 ORDER BY 有序流式下推。形态、区间不相交等判据在执行器内部，
+     * 不命中返回 null，交回 H2 原路径。
+     */
+    private LazyResultSelect tryVectorizedOrderedStreaming(int columnCount, long offset) {
+        com.hyd.h2omap.vectorized.OrderedStreamingRowSource cursor =
+                com.hyd.h2omap.vectorized.OmapVectorizedExecutor.tryExecuteOrderedStreaming(
+                        session, topTableFilter, condition, expressions, resultColumnCount,
+                        offset, sort);
+        return cursor != null ? new LazyResultOrderedStreaming(cursor, columnCount) : null;
     }
 
     private boolean tryVectorizedGroup(LocalResult result) {
@@ -1934,6 +1962,38 @@ public class Select extends Query {
                 }
             }
             return false;
+        }
+
+    }
+
+    /**
+     * M20：有序流式结果——逐行从段级流取数，客户端停止取数即停扫；重置时重新截取快照。
+     */
+    private final class LazyResultOrderedStreaming extends LazyResultSelect {
+
+        private final com.hyd.h2omap.vectorized.OrderedStreamingRowSource cursor;
+
+        LazyResultOrderedStreaming(com.hyd.h2omap.vectorized.OrderedStreamingRowSource cursor,
+                int columnCount) {
+            super(expressionArray, columnCount);
+            this.cursor = cursor;
+        }
+
+        @Override
+        protected Value[] fetchNextRow() {
+            Value[] row = cursor.nextRow();
+            if (row == null) {
+                return null;
+            }
+            setCurrentRowNumber(rowNumber + 1);
+            rowNumber++;
+            return row;
+        }
+
+        @Override
+        public void reset() {
+            super.reset();
+            cursor.reset();
         }
 
     }

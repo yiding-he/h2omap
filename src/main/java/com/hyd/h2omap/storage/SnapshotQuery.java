@@ -30,6 +30,20 @@ final class SnapshotQuery {
     /** 空位置数组：rowset 被 zone map 跳过时用它替代。 */
     private static final int[] EMPTY_POSITIONS = new int[0];
 
+    /** 与 extraRows 对齐的 rowId 数组；空集共用一个零长数组。 */
+    private static long[] toIds(List<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return EMPTY_ROW_IDS;
+        }
+        long[] out = new long[ids.size()];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = ids.get(i);
+        }
+        return out;
+    }
+
+    private static final long[] EMPTY_ROW_IDS = new long[0];
+
     private SnapshotQuery() {
     }
 
@@ -80,22 +94,28 @@ final class SnapshotQuery {
                 }
             }
             List<Value[]> openRows = null;
+            List<Long> openRowIds = null;
             int openCount = store.openSegment.rowCount();
             if (openCount > 0) {
                 openRows = new ArrayList<>(openCount);
+                openRowIds = new ArrayList<>(openCount);
                 if (store.openDeletes.isEmpty()) {
                     for (int r = 0; r < openCount; r++) {
                         openRows.add(store.openSegment.rowValues(r));
+                        openRowIds.add(RowId.ofSegment(store.nextSegmentId, r));
                     }
                 } else {
                     for (int r = 0; r < openCount; r++) {
-                        if (!store.openDeletes.contains(RowId.ofSegment(store.nextSegmentId, r))) {
+                        long rowId = RowId.ofSegment(store.nextSegmentId, r);
+                        if (!store.openDeletes.contains(rowId)) {
                             openRows.add(store.openSegment.rowValues(r));
+                            openRowIds.add(rowId);
                         }
                     }
                 }
             }
             List<Value[]> extra = null;
+            List<Long> extraIds = null;
             if (!store.delta.isEmpty()) {
                 if (masked == null) {
                     masked = new HashMap<>();
@@ -120,15 +140,19 @@ final class SnapshotQuery {
                 for (int pos : rowsetPositions) {
                     if (extra == null) {
                         extra = new ArrayList<>();
+                        extraIds = new ArrayList<>();
                     }
                     extra.add(store.delta.updatedValueAt(pos));
+                    extraIds.add(store.delta.updatedRowIdAt(pos));
                 }
             }
             if (openRows != null) {
                 if (extra == null) {
                     extra = openRows;
+                    extraIds = openRowIds;
                 } else {
                     extra.addAll(openRows);
+                    extraIds.addAll(openRowIds);
                 }
             }
             Map<Integer, Long> versions = new HashMap<>(segs.length * 2);
@@ -145,7 +169,7 @@ final class SnapshotQuery {
             }
             return new VectorizedSnapshot(
                     segs, masked != null ? masked : Map.of(), extra != null ? extra : List.of(),
-                    versions);
+                    toIds(extraIds), versions);
         } finally {
             store.lock.readLock().unlock();
         }

@@ -68,6 +68,22 @@ public final class OmapVectorizedExecutor {
     }
 
     /**
+     * 无 {@code LIMIT} 的有序下推（M20）：段间区间不相交时返回流式行源，
+     * 逐行驱动、客户端停止取数即停扫；形态或区间不满足时返回 {@code null} 交回 H2。
+     */
+    public static OrderedStreamingRowSource tryExecuteOrderedStreaming(
+            SessionLocal session,
+            TableFilter tableFilter,
+            Expression condition,
+            List<Expression> expressions,
+            int resultColumnCount,
+            long offset,
+            SortOrder sortOrder) {
+        return OrderedStreamingExecutor.tryClaim(session, tableFilter, condition, expressions,
+                resultColumnCount, offset, sortOrder);
+    }
+
+    /**
      * 取向量化快照，并把过滤条件给出的列值区间交给存储层按段剪枝；
      * 逐出段按请求列集做部分列读，不进驻留模型。
      *
