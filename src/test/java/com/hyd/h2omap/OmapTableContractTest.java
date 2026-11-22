@@ -2820,6 +2820,188 @@ class OmapTableContractTest {
     }
 
     /** SCRIPT 输出里找指定表的建表语句，验证 H2 目录里持久化的 SQL。 */
+    // ------------------------------------------------------------------
+    // M20：无 LIMIT 的 ORDER BY 有序流式执行
+    // ------------------------------------------------------------------
+
+    /** 主数据：3 个冻结段 + 开放段 2 行 + delta 更新新像 + 段内删除，TS 段间区间不相交。 */
+    private void createOrderedStreamingTable() throws SQLException {
+        execute(createTable("T", "ID INT, TS BIGINT NOT NULL, V INT",
+                "\"segmentSize=4\", \"compactionMinRows=100000\""));
+        execute("INSERT INTO T VALUES (1, 10, 1), (2, 5, 2), (3, 8, 1), (4, 2, 3)");
+        execute("INSERT INTO T VALUES (5, 20, 9), (6, 11, 5), (7, 15, 6), (8, 13, 7)");
+        execute("INSERT INTO T VALUES (9, 30, 1), (10, 25, 2), (11, 29, 3), (12, 21, 4)");
+        execute("INSERT INTO T VALUES (13, 22, 6), (14, 35, 5)");
+        execute("UPDATE T SET TS = 17, V = 8 WHERE ID = 6");
+        execute("DELETE FROM T WHERE ID = 11");
+    }
+
+    @Test
+    void orderedStreamingEmitsSortedRowsWithDeltaAndDeletes() throws SQLException {
+        createOrderedStreamingTable();
+        // DESC：开放段两行乱序（rowId 序 ≠ TS 序），22 落在段 [21,30] 内逐行归并；delta 新像 17 取代旧像 13；已删 29 不出现
+        assertEquals(List.of(
+                "14/35/5", "9/30/1", "10/25/2", "13/22/6", "12/21/4",
+                "5/20/9", "6/17/8", "7/15/6", "8/13/7",
+                "1/10/1", "3/8/1", "2/5/2", "4/2/3"),
+                rows("SELECT ID, TS, V FROM T ORDER BY TS DESC"));
+        assertEquals(List.of(
+                "4/2/3", "2/5/2", "3/8/1", "1/10/1",
+                "8/13/7", "7/15/6", "6/17/8", "5/20/9",
+                "12/21/4", "13/22/6", "10/25/2", "9/30/1", "14/35/5"),
+                rows("SELECT ID, TS, V FROM T ORDER BY TS"));
+        com.hyd.h2omap.storage.ColumnarStore store = omapStore("T");
+        assertTrue(store.getOrderedStreamingClaims() >= 2,
+                "两条查询都应命中有序流式下推");
+    }
+
+    @Test
+    void orderedStreamingMultiColumnOrderWithTiesAndNullSecondKey() throws SQLException {
+        execute(createTable("T2", "ID INT, TS BIGINT NOT NULL, V INT",
+                "\"segmentSize=4\", \"compactionMinRows=100000\""));
+        execute("INSERT INTO T2 VALUES (1, 10, 3), (2, 10, 9), (3, 10, 5), (4, 12, 1)");
+        execute("INSERT INTO T2 VALUES (5, 20, NULL), (6, 20, 8), (7, 20, 4), (8, 22, 6)");
+        execute("INSERT INTO T2 VALUES (9, 30, 7)");
+        // 首列区间不相交，段间顺序由 TS 决定；TS 并列时按 V DESC、NULLS LAST 定序
+        assertEquals(List.of("9", "8", "6", "7", "5", "4", "2", "3", "1"),
+                rows("SELECT ID FROM T2 ORDER BY TS DESC, V DESC NULLS LAST"));
+        // ASC 默认 NULL 位次是 NULLS FIRST（H2 把 NULL 视作最小值）
+        assertEquals(List.of("1", "3", "2", "4", "5", "7", "6", "8", "9"),
+                rows("SELECT ID FROM T2 ORDER BY TS, V"));
+        assertTrue(omapStore("T2").getOrderedStreamingClaims() >= 2);
+    }
+
+    @Test
+    void orderedStreamingSelectStarReadsProjectionLazily() throws SQLException {
+        execute(createTable("T3", "ID INT, TS TIMESTAMP NOT NULL, V INT, NAME VARCHAR",
+                "\"segmentSize=2\", \"compactionMinRows=100000\""));
+        execute("INSERT INTO T3 VALUES (1, TIMESTAMP '2026-01-01 00:00:10', 1, 'a')");
+        execute("INSERT INTO T3 VALUES (2, TIMESTAMP '2026-01-01 00:00:05', 2, 'b')");
+        execute("INSERT INTO T3 VALUES (3, TIMESTAMP '2026-01-01 00:00:30', 3, 'c')");
+        execute("INSERT INTO T3 VALUES (4, TIMESTAMP '2026-01-01 00:00:25', 4, 'd')");
+        execute("INSERT INTO T3 VALUES (5, TIMESTAMP '2026-01-01 00:00:35', 5, 'e')");
+        com.hyd.h2omap.storage.ColumnarStore store = omapStore("T3");
+        long deferredBefore = store.getDeferredProjectionReads();
+        List<String> out = new ArrayList<>();
+        try (Statement st = conn.createStatement();
+                ResultSet rs = st.executeQuery("SELECT * FROM T3 ORDER BY TS DESC")) {
+            while (rs.next()) {
+                out.add(rs.getInt(1) + "/" + rs.getTimestamp(2).getTime() / 1000 + "/"
+                        + rs.getInt(3) + "/" + rs.getString(4));
+            }
+        }
+        assertEquals(List.of(
+                "5/1767196835/5/e", "3/1767196830/3/c",
+                "4/1767196825/4/d", "1/1767196810/1/a", "2/1767196805/2/b"), out);
+        assertTrue(store.getOrderedStreamingClaims() >= 1);
+        assertTrue(store.getDeferredProjectionReads() > deferredBefore,
+                "SELECT * 的投影列应在行发出时才读回");
+    }
+
+    @Test
+    void orderedStreamingWithWhereAndOffset() throws SQLException {
+        createOrderedStreamingTable();
+        // V >= 4 的行按 TS DESC：35,22,21,20,17,15,13 → OFFSET 2 跳过 35/22
+        assertEquals(List.of("12", "5", "6", "7", "8"),
+                rows("SELECT ID FROM T WHERE V >= 4 ORDER BY TS DESC OFFSET 2"));
+        assertEquals(List.of("14", "13", "12", "5", "6", "7", "8"),
+                rows("SELECT ID FROM T WHERE V >= 4 ORDER BY TS DESC"));
+    }
+
+    @Test
+    void orderedStreamingAbandonedCursorStopsScanning(@TempDir Path dir) throws Exception {
+        String url = "jdbc:h2:" + dir.resolve("db").toAbsolutePath().toString().replace('\\', '/');
+        try (Connection c = DriverManager.getConnection(url, "sa", "")) {
+            try (Statement s = c.createStatement()) {
+                s.execute(createTable("T", "ID INT, TS BIGINT NOT NULL",
+                        "\"segmentSize=4\", \"residentBytes=1\""));
+                for (int i = 1; i <= 40; i++) {
+                    s.execute("INSERT INTO T VALUES (" + i + ", " + (i * 10) + ")");
+                }
+            }
+            org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                    ((org.h2.jdbc.JdbcConnection) c).getSession();
+            com.hyd.h2omap.table.OmapTable table = (com.hyd.h2omap.table.OmapTable)
+                    session.getDatabase().getMainSchema().findTableOrView(session, "T");
+            com.hyd.h2omap.storage.ColumnarStore store = table.getStore();
+            long sliceBefore = store.getTransientSliceReads();
+            long deferredBefore = store.getDeferredProjectionReads();
+            long claimsBefore = store.getOrderedStreamingClaims();
+            // 只取 3 行即弃游标：最新一段（4 行）足够，其余 9 个逐出段零读取
+            try (Statement st = c.createStatement();
+                    ResultSet rs = st.executeQuery("SELECT ID FROM T ORDER BY TS DESC")) {
+                assertTrue(rs.next());
+                assertEquals("40", rs.getString(1));
+                assertTrue(rs.next());
+                assertTrue(rs.next());
+            }
+            assertEquals(claimsBefore + 1, store.getOrderedStreamingClaims(),
+                    "应命中有序流式下推");
+            assertEquals(sliceBefore + 2, store.getTransientSliceReads(),
+                    "只应读回首个段的排序列切片与投影列切片");
+            assertEquals(deferredBefore + 1, store.getDeferredProjectionReads(),
+                    "只有首个段产生延迟投影读回");
+            // 逐出段上的多列延迟投影必须逐列对位读回（ID 与 TS 各自正确）
+            List<String> full = new ArrayList<>();
+            try (Statement st = c.createStatement();
+                    ResultSet rs = st.executeQuery("SELECT ID, TS FROM T ORDER BY TS DESC")) {
+                while (rs.next()) {
+                    full.add(rs.getInt(1) + "/" + rs.getLong(2));
+                }
+            }
+            List<String> expected = new ArrayList<>();
+            for (int i = 40; i >= 1; i--) {
+                expected.add(i + "/" + (i * 10));
+            }
+            assertEquals(expected, full);
+        }
+    }
+
+    @Test
+    void orderedStreamingOverlappingZonesFallBackToH2() throws SQLException {
+        execute(createTable("T4", "ID INT, TS BIGINT NOT NULL, V INT",
+                "\"segmentSize=4\", \"compactionMinRows=100000\""));
+        execute("INSERT INTO T4 VALUES (1, 10, 1), (2, 5, 2), (3, 8, 3), (4, 2, 4)");
+        execute("INSERT INTO T4 VALUES (5, 9, 5), (6, 7, 6), (7, 10, 7), (8, 3, 8)");
+        long claims = omapStore("T4").getOrderedStreamingClaims();
+        assertEquals(List.of("1/10", "7/10", "5/9", "3/8", "6/7", "2/5", "8/3", "4/2"),
+                rows("SELECT ID, TS FROM T4 ORDER BY TS DESC, ID"));
+        assertEquals(claims, omapStore("T4").getOrderedStreamingClaims(),
+                "段间区间相交应交回 H2 行式路径，不命中流式下推");
+    }
+
+    @Test
+    void orderedStreamingNullableFirstColumnFallsBackToH2() throws SQLException {
+        execute(createTable("T5", "ID INT, TS BIGINT, V INT",
+                "\"segmentSize=4\", \"compactionMinRows=100000\""));
+        execute("INSERT INTO T5 VALUES (1, 10, 1), (2, NULL, 2), (3, 5, 3), (4, 8, 4)");
+        execute("INSERT INTO T5 VALUES (5, 20, 5), (6, NULL, 6), (7, 15, 7), (8, 25, 8)");
+        long claims = omapStore("T5").getOrderedStreamingClaims();
+        // NULL 组跨段必须整体位于末尾（H2 默认 DESC 视 NULL 最小）；若误入流式，两段的 NULL 会被拆散
+        assertEquals(List.of("8/25", "5/20", "7/15", "1/10", "4/8", "3/5", "2/null", "6/null"),
+                rows("SELECT ID, TS FROM T5 ORDER BY TS DESC"));
+        assertEquals(claims, omapStore("T5").getOrderedStreamingClaims(),
+                "首列可空应交回 H2 行式路径");
+    }
+
+    @Test
+    void orderedStreamingNotClaimedWhenLimitPresent() throws SQLException {
+        createOrderedStreamingTable();
+        long claims = omapStore("T").getOrderedStreamingClaims();
+        assertEquals(List.of("14/35", "9/30", "10/25"),
+                rows("SELECT ID, TS FROM T ORDER BY TS DESC LIMIT 3"));
+        assertEquals(claims, omapStore("T").getOrderedStreamingClaims(),
+                "带 LIMIT 的有序查询走 M11 有序模式，不走流式下推");
+    }
+
+    private com.hyd.h2omap.storage.ColumnarStore omapStore(String table) {
+        org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                ((org.h2.jdbc.JdbcConnection) conn).getSession();
+        com.hyd.h2omap.table.OmapTable t = (com.hyd.h2omap.table.OmapTable)
+                session.getDatabase().getMainSchema().findTableOrView(session, table);
+        return t.getStore();
+    }
+
     private static String createTableSqlFromScript(Statement s, String table) throws SQLException {
         try (ResultSet rs = s.executeQuery("SCRIPT")) {
             while (rs.next()) {
