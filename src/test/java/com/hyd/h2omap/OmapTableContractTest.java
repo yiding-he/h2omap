@@ -2984,6 +2984,105 @@ class OmapTableContractTest {
                 "首列可空应交回 H2 行式路径");
     }
 
+    // ------------------------------------------------------------------
+    // M20-2：表达式投影在行发出时逐行求值
+    // ------------------------------------------------------------------
+
+    @Test
+    void orderedStreamingExpressionProjectionEvaluatesPerRow() throws SQLException {
+        createOrderedStreamingTable();
+        assertEquals(List.of(
+                "145/35", "91/30", "102/25", "136/22", "124/21",
+                "59/20", "68/17", "76/15", "87/13",
+                "11/10", "31/8", "22/5", "43/2"),
+                rows("SELECT ID * 10 + V, TS FROM T ORDER BY TS DESC"));
+        assertTrue(omapStore("T").getOrderedStreamingClaims() >= 1,
+                "表达式投影应命中有序流式下推");
+    }
+
+    @Test
+    void orderedStreamingExpressionWithDirectColumnsAndWhere() throws SQLException {
+        createOrderedStreamingTable();
+        // 表达式、直接列引用混排共享同一列；delta 新像（ID 6）与开放段行（13/14）走活像发射路径
+        assertEquals(List.of(
+                "14/28/6", "13/26/7", "12/24/5", "5/10/10", "6/12/9", "7/14/7", "8/16/8"),
+                rows("SELECT ID, ID * 2, V + 1 FROM T WHERE V >= 4 ORDER BY TS DESC"));
+        assertTrue(omapStore("T").getOrderedStreamingClaims() >= 1);
+    }
+
+    @Test
+    void orderedStreamingFunctionProjectionOnVarcharColumn() throws SQLException {
+        execute(createTable("T6", "ID INT, TS TIMESTAMP NOT NULL, V INT, NAME VARCHAR",
+                "\"segmentSize=2\", \"compactionMinRows=100000\""));
+        execute("INSERT INTO T6 VALUES (1, TIMESTAMP '2026-01-01 00:00:10', 1, 'a')");
+        execute("INSERT INTO T6 VALUES (2, TIMESTAMP '2026-01-01 00:00:05', 2, 'b')");
+        execute("INSERT INTO T6 VALUES (3, TIMESTAMP '2026-01-01 00:00:30', 3, 'c')");
+        execute("INSERT INTO T6 VALUES (4, TIMESTAMP '2026-01-01 00:00:25', 4, 'd')");
+        execute("INSERT INTO T6 VALUES (5, TIMESTAMP '2026-01-01 00:00:35', 5, 'e')");
+        assertEquals(List.of("E/5", "C/3", "D/4", "A/1", "B/2"),
+                rows("SELECT UPPER(NAME), ID FROM T6 ORDER BY TS DESC"));
+        assertTrue(omapStore("T6").getOrderedStreamingClaims() >= 1);
+    }
+
+    @Test
+    void orderedStreamingNonDeterministicExpressionFallsBackToH2() throws SQLException {
+        createOrderedStreamingTable();
+        long claims = omapStore("T").getOrderedStreamingClaims();
+        assertEquals("14", rows("SELECT ID, RAND() FROM T ORDER BY TS DESC").get(0).split("/")[0]);
+        assertEquals(claims, omapStore("T").getOrderedStreamingClaims(),
+                "非确定表达式（RAND）应交回 H2 行式路径，不命中流式下推");
+    }
+
+    @Test
+    void orderedStreamingSubqueryProjectionFallsBackToH2() throws SQLException {
+        createOrderedStreamingTable();
+        long claims = omapStore("T").getOrderedStreamingClaims();
+        // MAX(V) = 9（ID 5）；顶层子查询交回 H2，但结果仍正确
+        assertEquals(List.of(
+                "14/9", "9/9", "10/9", "13/9", "12/9", "5/9", "6/9", "7/9", "8/9",
+                "1/9", "3/9", "2/9", "4/9"),
+                rows("SELECT ID, (SELECT MAX(V) FROM T) FROM T ORDER BY TS DESC"));
+        assertEquals(claims, omapStore("T").getOrderedStreamingClaims(),
+                "顶层子查询投影应交回 H2 行式路径");
+    }
+
+    @Test
+    void orderedStreamingExpressionOnEvictedSegmentsReadsColumnsDeferred(@TempDir Path dir)
+            throws Exception {
+        String url = "jdbc:h2:" + dir.resolve("db").toAbsolutePath().toString().replace('\\', '/');
+        try (Connection c = DriverManager.getConnection(url, "sa", "")) {
+            try (Statement s = c.createStatement()) {
+                s.execute(createTable("T", "ID INT, TS BIGINT NOT NULL",
+                        "\"segmentSize=4\", \"residentBytes=1\""));
+                for (int i = 1; i <= 40; i++) {
+                    s.execute("INSERT INTO T VALUES (" + i + ", " + (i * 10) + ")");
+                }
+            }
+            org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                    ((org.h2.jdbc.JdbcConnection) c).getSession();
+            com.hyd.h2omap.table.OmapTable table = (com.hyd.h2omap.table.OmapTable)
+                    session.getDatabase().getMainSchema().findTableOrView(session, "T");
+            com.hyd.h2omap.storage.ColumnarStore store = table.getStore();
+            long deferredBefore = store.getDeferredProjectionReads();
+            long claimsBefore = store.getOrderedStreamingClaims();
+            List<String> expected = new ArrayList<>();
+            for (int i = 40; i >= 1; i--) {
+                expected.add(String.valueOf(i + 1000));
+            }
+            List<String> got = new ArrayList<>();
+            try (Statement st = c.createStatement();
+                    ResultSet rs = st.executeQuery("SELECT ID + 1000 FROM T ORDER BY TS DESC")) {
+                while (rs.next()) {
+                    got.add(rs.getString(1));
+                }
+            }
+            assertEquals(expected, got);
+            assertEquals(claimsBefore + 1, store.getOrderedStreamingClaims());
+            assertTrue(store.getDeferredProjectionReads() > deferredBefore,
+                    "表达式引用列应在段内首行发出时才经切片读回");
+        }
+    }
+
     @Test
     void orderedStreamingNotClaimedWhenLimitPresent() throws SQLException {
         createOrderedStreamingTable();
