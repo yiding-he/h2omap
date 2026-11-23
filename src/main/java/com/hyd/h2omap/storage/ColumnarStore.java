@@ -1053,9 +1053,19 @@ public final class ColumnarStore {
         return seg != null ? seg.isDeleted(offset) : ref.skeleton.deleted.isNull(offset);
     }
 
-    /** 读一份段内容供当次迭代使用，不回写驻留状态；仅批量路径预读后又被并发逐出的窗口使用。 */
+    /**
+     * 读一份段内容供当次迭代使用，不回写驻留状态；仅批量路径预读后又被并发逐出的窗口使用。
+     *
+     * <p>快照后段被并发读回或预载驻留（{@code ensureResident} 会清 skeleton 挂 loaded）时，
+     * 驻留内容即当前代内容，直接返回；否则在骨架守卫下误判为不可读回，
+     * 懒加载快照会回填全占位列向量，首次读列即抛异常。
+     */
     ColumnSegment readSegmentTransient(SegmentRef ref) {
         fullTransientReads.incrementAndGet();
+        ColumnSegment loaded = ref.loaded;
+        if (loaded != null) {
+            return loaded;
+        }
         OmapPersistence p = persistence;
         if (p == null || ref.skeleton == null) {
             return null;
@@ -1072,10 +1082,15 @@ public final class ColumnarStore {
      * 逐出段的部分列读：按尾部列目录只读请求列，拼成只在快照内使用的段对象。
      *
      * <p>未请求的列以抛异常的占位向量与恒相交的 zone map 填充，意外访问会显式暴露；
-     * 读盘失败时回退整段读，保证可用性优先。
+     * 读盘失败时回退整段读，保证可用性优先。快照后段被并发读回或预载驻留时
+     * 驻留内容即当前代内容，直接返回，免一次无谓的磁盘切片读。
      */
     ColumnSegment readSliceTransient(SegmentRef ref, int[] columns) {
         sliceTransientReads.incrementAndGet();
+        ColumnSegment resident = ref.loaded;
+        if (resident != null) {
+            return resident;
+        }
         OmapPersistence p = persistence;
         if (p == null || ref.skeleton == null) {
             return null;
