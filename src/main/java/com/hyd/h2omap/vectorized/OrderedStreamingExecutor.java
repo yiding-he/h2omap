@@ -34,9 +34,11 @@ import com.hyd.h2omap.vector.ColumnVector;
 /**
  * 有序流式执行（M20）：{@code 无 LIMIT 的 ORDER BY} 在段间区间不相交时按段流式输出。
  *
- * <p>排序键取首列判定段间顺序：首列的段间 zone 区间两两严格不相交时，段 k 的任何一行
- * 都严格先于（或后于）段 k+1 的任何一行，与后续列取值无关；段按发射方向的 zone 边界
- * 排序后逐段推进，段内一次排序，delta 新像与开放段行按复合键预先排好序后归并进输出流。
+ * <p>排序键取首列判定段间顺序：首列的段间 zone 区间次邻严格分离（M22 起；相邻段
+ * 允许边界相交——迟到写入形态）。发射单元 U_k = 段 k 的主区间行（首键严格优于
+ * 段 k+1 的近端界）∪ 段 k-1 的迟到带行（首键不严格优于段 k 的近端界），单元内按
+ * 复合键一次归并，单元之间严格有序；次邻区间相接/相交时单元间无法保证有序，整条
+ * 查询交回 H2。delta 新像与开放段行按复合键预先排好序后归并进输出流。
  * 客户端取一行才推进一次：停止取数时，未触碰的段零读取。
  *
  * <p>投影延迟物化：排序阶段每段只读「排序键 ∪ 谓词列」（逐出段按段文件列目录切片读），
@@ -47,7 +49,7 @@ import com.hyd.h2omap.vector.ColumnVector;
  * （段级 hasNull 随段文件 v3 目录与 manifest v3 骨架持久化）；任一段实际含 NULL，
  * 或段无骨架信息（无持久化内存库的未加载段），则整条查询交回 H2。
  * {@code NULLS FIRST} 时出首行前就得收齐全部段的 NULL 行；可空首列交回 H2。
- * 区间相交（随机写入形态）、多表、表达式排序键等一律交回 H2 行式路径。
+ * 次邻区间相交（跨两段以上的极迟写入）、多表、表达式排序键等一律交回 H2 行式路径。
  * 形态合法但区间相交时 {@link #tryClaim} 返回 {@code null}，调用方无缝回退。
  *
  * <p>表达式投影（M20-2）：排序阶段不受投影影响，投影里的表达式在行真正发出时
@@ -209,18 +211,21 @@ final class OrderedStreamingExecutor {
         return table.getCompareMode();
     }
 
-    /** 一次流式执行的不可变状态：快照、发射序段数组与预先排好序的活像/开放段行。 */
+    /** 一次流式执行的不可变状态：快照、发射序段数组、各段近端界与预先排好序的活像/开放段行。 */
     private static final class Built {
         final VectorizedSnapshot snap;
         final ColumnSegment[] orderedSegs;
+        /** 各段发射方向上的近端界：迟到带切分与活像预发射的判据。 */
+        final Value[] nearBounds;
         final Value[][] extras;
         final Value[][] extraKeys;
         final long[] extraIds;
 
-        Built(VectorizedSnapshot snap, ColumnSegment[] orderedSegs,
+        Built(VectorizedSnapshot snap, ColumnSegment[] orderedSegs, Value[] nearBounds,
                 Value[][] extras, Value[][] extraKeys, long[] extraIds) {
             this.snap = snap;
             this.orderedSegs = orderedSegs;
+            this.nearBounds = nearBounds;
             this.extras = extras;
             this.extraKeys = extraKeys;
             this.extraIds = extraIds;
@@ -257,6 +262,11 @@ final class OrderedStreamingExecutor {
         if (ordered == null) {
             return null;
         }
+        Value[] nearBounds = new Value[ordered.length];
+        for (int i = 0; i < ordered.length; i++) {
+            ZoneMap zone = ordered[i].getZoneMap(sortCols[0]);
+            nearBounds[i] = desc[0] ? zone.getMax() : zone.getMin();
+        }
         // 活像与开放段行：过滤后按复合键排序，rowId 作并列定序。
         List<Value[]> keptRows = new ArrayList<>();
         List<Value[]> keptKeys = new ArrayList<>();
@@ -285,7 +295,7 @@ final class OrderedStreamingExecutor {
             extraKeys[i] = keptKeys.get(ord[i]);
             extraIds[i] = keptIds.get(ord[i]);
         }
-        return new Built(snap, ordered, extras, extraKeys, extraIds);
+        return new Built(snap, ordered, nearBounds, extras, extraKeys, extraIds);
     }
 
     private static Value[] extractKeys(Value[] row, int[] sortCols) {
@@ -340,8 +350,10 @@ final class OrderedStreamingExecutor {
     }
 
     /**
-     * 段按首列 zone 边界排成发射序并校验区间两两严格分离。
-     * 边界缺失（全 NULL、不可比较类型）或相邻区间相接/相交返回 {@code null}。
+     * 段按首列 zone 边界排成发射序并校验次邻区间严格分离（M22）。
+     * 相邻段允许边界相交（迟到写入形态）：相交带的行归入下一发射单元一起归并；
+     * 次邻段必须严格分离，否则单元之间无法保证严格有序。
+     * 边界缺失（全 NULL、不可比较类型）返回 {@code null}。
      */
     private static ColumnSegment[] orderByFirstZone(List<ColumnSegment> active, int sortCol,
             boolean descending, SessionLocal session, CompareMode compareMode) {
@@ -370,14 +382,15 @@ final class OrderedStreamingExecutor {
         for (int i = 0; i < n; i++) {
             out[i] = active.get(ord[i]);
         }
-        // 相邻严格分离：DESC 要求 min_i > max_{i+1}，ASC 要求 max_i < min_{i+1}。
-        for (int i = 0; i + 1 < n; i++) {
+        // 次邻严格分离：ASC 要求 max_i < min_{i+2}，DESC 要求 min_i > max_{i+2}。
+        // 相邻对相交交给发射单元的迟到带归并，次邻相接/相交则单元间无法保证有序。
+        for (int i = 0; i + 2 < n; i++) {
             Value a = descending
                     ? out[i].getZoneMap(sortCol).getMin()
                     : out[i].getZoneMap(sortCol).getMax();
             Value b = descending
-                    ? out[i + 1].getZoneMap(sortCol).getMax()
-                    : out[i + 1].getZoneMap(sortCol).getMin();
+                    ? out[i + 2].getZoneMap(sortCol).getMax()
+                    : out[i + 2].getZoneMap(sortCol).getMin();
             if (compareValue(session, compareMode, descending, a, b) >= 0) {
                 return null;
             }
@@ -385,21 +398,46 @@ final class OrderedStreamingExecutor {
         return out;
     }
 
-    /** 流式游标的段内状态。 */
+    /** 一个冻结段的发射准备状态：过滤与段内排序一次完成，行分成主区间前缀与迟到带后缀。 */
     private static final class Seg {
         final ColumnSegment seg;
-        final Value virtualFarBound;
-        boolean initialized;
-        boolean exhausted;
         int[] rows;
         Value[][] keys;
         int n;
-        int ptr;
+        /** 迟到带起点：首键不严格优于下一段近端界的行从该下标起。 */
+        int carryStart;
         ColumnVector[] projVecs;
 
-        Seg(ColumnSegment seg, Value virtualFarBound) {
+        Seg(ColumnSegment seg) {
             this.seg = seg;
-            this.virtualFarBound = virtualFarBound;
+        }
+    }
+
+    /**
+     * 一个发射单元：当前段的主区间行与上一段的迟到带行按复合键归并后的结果。
+     * 单元之间由次邻门控保证严格有序；单元内的行序与 H2 稳定排序一致（rowId 并列定序）。
+     */
+    private static final class Unit {
+        /** 单元序号，即发射序段数组下标。 */
+        final int index;
+        /** 迟到带来源段（构造单元时已初始化），首单元为 null。 */
+        final Seg srcA;
+        /** 主区间来源段，初始化时才过滤排序。 */
+        final ColumnSegment segB;
+        /** {@link Unit#segB} 的发射准备状态，初始化后可用。 */
+        Seg segBSeg;
+        int[] rows;
+        Value[][] keys;
+        boolean[] fromA;
+        int n;
+        boolean initialized;
+        boolean exhausted;
+        int ptr;
+
+        Unit(int index, Seg srcA, ColumnSegment segB) {
+            this.index = index;
+            this.srcA = srcA;
+            this.segB = segB;
         }
     }
 
@@ -427,12 +465,15 @@ final class OrderedStreamingExecutor {
 
         private VectorizedSnapshot snap;
         private ColumnSegment[] orderedSegs;
+        private Value[] nearBounds;
         private Value[][] extras;
         private Value[][] extraKeys;
         private long[] extraIds;
         private int extraIdx;
         private int segPos;
-        private Seg cur;
+        private Unit cur;
+        /** 最近完成发射准备的段，供下一单元取迟到带。 */
+        private Seg prevSeg;
         private long pendingOffset;
 
         Cursor(SessionLocal session, OmapTable table, TableFilter tableFilter,
@@ -477,12 +518,14 @@ final class OrderedStreamingExecutor {
         private void adopt(Built built) {
             this.snap = built.snap;
             this.orderedSegs = built.orderedSegs;
+            this.nearBounds = built.nearBounds;
             this.extras = built.extras;
             this.extraKeys = built.extraKeys;
             this.extraIds = built.extraIds;
             this.extraIdx = 0;
             this.segPos = -1;
             this.cur = null;
+            this.prevSeg = null;
             this.pendingOffset = offset;
         }
 
@@ -503,30 +546,30 @@ final class OrderedStreamingExecutor {
             // 结果复用路径只在没有写入时触发（写入会使 modificationId 失效复用判定），
             // 无写入时段区间形状不变；此分支实际不可达，可达即判据被破坏，显式暴露。
             if (rebuilt == null) {
-                throw new IllegalStateException("有序流式重置时段区间不再严格不相交");
+                throw new IllegalStateException("有序流式重置时段区间不再次邻严格分离");
             }
             adopt(rebuilt);
         }
 
         private Value[] nextEmitted() {
             while (true) {
-                Seg st = cur;
-                if (st == null || st.exhausted || (st.initialized && st.ptr >= st.n)) {
+                Unit u = cur;
+                if (u == null || u.exhausted || (u.initialized && u.ptr >= u.n)) {
+                    // 推进到下一发射单元：单元 k = 段 k 的主区间 + 段 k-1 的迟到带
                     segPos++;
-                    st = segPos < orderedSegs.length
-                            ? new Seg(orderedSegs[segPos], virtualFar(orderedSegs[segPos]))
+                    cur = u = segPos < orderedSegs.length
+                            ? new Unit(segPos, segPos == 0 ? null : prevSeg, orderedSegs[segPos])
                             : null;
-                    cur = st;
                 }
                 Value[] extraRow = extraIdx < extras.length ? extras[extraIdx] : null;
-                if (st == null) {
+                if (u == null) {
                     if (extraRow == null) {
                         return null;
                     }
                     extraIdx++;
                     return emitExtra(extraRow, extraIds[extraIdx - 1]);
                 }
-                if (!st.initialized) {
+                if (!u.initialized) {
                     if (extraRow != null) {
                         Value extraKey = extraRow[sortCols[0]];
                         boolean extraKeyNull = extraKey == null || extraKey == ValueNull.INSTANCE;
@@ -536,46 +579,100 @@ final class OrderedStreamingExecutor {
                                 extraIdx++;
                                 return emitExtra(extraRow, extraIds[extraIdx - 1]);
                             }
-                            // NULLS LAST：段初始化后由 compareKeys 正确把 NULL 活像排到全部段行之后。
+                            // NULLS LAST：单元初始化后由 compareKeys 正确把 NULL 活像
+                            // 排到全部段行之后。
                         } else if (compareFirstCol(session, compareMode, desc[0],
-                                extraKey, st.virtualFarBound) < 0) {
-                            // 活像首列严格优于段的边界最优值，必在整段之前
+                                extraKey, nearBounds[u.index]) < 0) {
+                            // 活像首列严格优于单元的近端界，必在整单元之前
                             extraIdx++;
                             return emitExtra(extraRow, extraIds[extraIdx - 1]);
                         }
                     }
-                    initSeg(st);
+                    initUnit(u);
                     continue;
                 }
-                // 段已初始化且还有行
+                // 单元已初始化且还有行
                 if (extraRow != null) {
                     int cmp = compareKeys(session, compareMode, sortCols, desc, nullsFirst,
-                            st.keys[st.ptr], RowId.ofSegment(st.seg.getSegmentId(), st.rows[st.ptr]),
+                            u.keys[u.ptr], RowId.ofSegment(
+                                    (u.fromA[u.ptr] ? u.srcA.seg : u.segBSeg.seg)
+                                            .getSegmentId(),
+                                    u.rows[u.ptr]),
                             extraKeys[extraIdx], extraIds[extraIdx]);
                     if (cmp > 0) {
                         extraIdx++;
                         return emitExtra(extraRow, extraIds[extraIdx - 1]);
                     }
                 }
-                return emitSegment(st);
+                return emitUnitRow(u);
             }
         }
 
-        private Value virtualFar(ColumnSegment seg) {
-            ZoneMap zone = seg.getZoneMap(sortCols[0]);
-            return desc[0] ? zone.getMax() : zone.getMin();
+        /** 初始化发射单元：过滤排序当前段，切分主区间与迟到带，归并两个来源。 */
+        private void initUnit(Unit u) {
+            u.initialized = true;
+            Seg segB = initSeg(u.segB,
+                    u.index + 1 < orderedSegs.length ? nearBounds[u.index + 1] : null);
+            prevSeg = segB;
+            Seg srcA = u.srcA;
+            int na = srcA == null ? 0 : srcA.n - srcA.carryStart;
+            int nb = segB.carryStart;
+            if (na + nb == 0) {
+                u.n = 0;
+                u.exhausted = true;
+                return;
+            }
+            int[] rows = new int[na + nb];
+            Value[][] keys = new Value[na + nb][];
+            boolean[] fromA = new boolean[na + nb];
+            int ia = srcA == null ? 0 : srcA.carryStart;
+            int ib = 0;
+            for (int t = 0; t < rows.length; t++) {
+                boolean takeA;
+                if (srcA == null || ia >= srcA.n) {
+                    takeA = false;
+                } else if (ib >= nb) {
+                    takeA = true;
+                } else {
+                    int cmp = compareKeys(session, compareMode, sortCols, desc, nullsFirst,
+                            srcA.keys[ia],
+                            RowId.ofSegment(srcA.seg.getSegmentId(), srcA.rows[ia]),
+                            segB.keys[ib],
+                            RowId.ofSegment(segB.seg.getSegmentId(), segB.rows[ib]));
+                    takeA = cmp < 0;
+                }
+                if (takeA) {
+                    rows[t] = srcA.rows[ia];
+                    keys[t] = srcA.keys[ia];
+                    fromA[t] = true;
+                    ia++;
+                } else {
+                    rows[t] = segB.rows[ib];
+                    keys[t] = segB.keys[ib];
+                    fromA[t] = false;
+                    ib++;
+                }
+            }
+            u.segBSeg = segB;
+            u.rows = rows;
+            u.keys = keys;
+            u.fromA = fromA;
+            u.n = rows.length;
         }
 
-        private void initSeg(Seg st) {
-            ColumnSegment s = st.seg;
+        /**
+         * 段的发射准备：过滤可见行、按复合键排序，再按下一段的近端界切分——
+         * 首键严格优于近端界的前缀是主区间（本单元发射），其余归入迟到带（下一单元发射）。
+         */
+        private Seg initSeg(ColumnSegment s, Value nearNext) {
+            Seg st = new Seg(s);
             BitSet masked = snap.maskedBySegment.get(s.getSegmentId());
             int rc = s.getRowCount();
             int[] sel = new int[rc];
             int n = filter == null ? fillAll(sel, rc, masked)
                     : filter.filterSegment(s, sel, masked, session, compareMode);
             if (n == 0) {
-                st.exhausted = true;
-                return;
+                return st;
             }
             ColumnVector[] sortVecs = new ColumnVector[sortCols.length];
             for (int i = 0; i < sortCols.length; i++) {
@@ -604,22 +701,40 @@ final class OrderedStreamingExecutor {
                 st.keys[k] = fkeys[ord[k]];
             }
             st.n = n;
-            st.ptr = 0;
-            st.initialized = true;
+            // 迟到带切分：排序后首键非严格优于近端界的行是连续后缀，二分定位
+            if (nearNext == null) {
+                st.carryStart = n;
+            } else {
+                int lo = 0, hi = n;
+                while (lo < hi) {
+                    int mid = (lo + hi) >>> 1;
+                    if (compareFirstCol(session, compareMode, desc[0],
+                            st.keys[mid][0], nearNext) < 0) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                st.carryStart = lo;
+            }
+            return st;
         }
 
-        private Value[] emitSegment(Seg st) {
-            int idx = st.rows[st.ptr];
+        private Value[] emitUnitRow(Unit u) {
+            // 行来源段决定延迟投影与 rowId：迟到带行读上一段、主区间行读当前段
+            Seg st = u.fromA[u.ptr] ? u.srcA : u.segBSeg;
+            int idx = u.rows[u.ptr];
             Value[] out = new Value[outLen];
             if (uniqueCount > 0) {
                 if (st.projVecs == null) {
-                    // 延迟物化：段内首次发出一行才读回投影列，不进驻留模型。
+                    // 延迟物化：该段首次发出一行才读回投影列，不进驻留模型；
+                    // 迟到带行与主区间行共享同一段的投影缓存。
                     st.projVecs = table.getStore().readDeferredProjection(
                             st.seg.getSegmentId(), uniqueProjCols);
                 }
                 for (int c = 0; c < outLen; c++) {
-                    int u = projToUnique[c];
-                    out[c] = u >= 0 ? st.projVecs[u].get(idx) : projConsts[c];
+                    int uc = projToUnique[c];
+                    out[c] = uc >= 0 ? st.projVecs[uc].get(idx) : projConsts[c];
                 }
             } else {
                 for (int c = 0; c < outLen; c++) {
@@ -632,7 +747,7 @@ final class OrderedStreamingExecutor {
                         RowId.ofSegment(st.seg.getSegmentId(), idx)));
                 evaluateExprs(out);
             }
-            st.ptr++;
+            u.ptr++;
             return out;
         }
 
