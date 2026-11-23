@@ -133,6 +133,12 @@ public final class ColumnarStore {
     /** 全部驻留段的估算字节数，写锁内维护。 */
     long residentTotal;
 
+    /** 数据库内全部 OMAP 表共享的驻留预算（真共享池）。 */
+    private final ResidentBudget resident;
+
+    /** releaseResident 只做一次（close 与 drop 都可能到达）。 */
+    private boolean residentReleased;
+
     /** 累计逐出段数，供测试断言。 */
     private final AtomicLong evictedSegments = new AtomicLong();
 
@@ -239,9 +245,11 @@ public final class ColumnarStore {
         }
     }
 
-    public ColumnarStore(Column[] columns, OmapOptions options, CompareMode compareMode) {
+    public ColumnarStore(Column[] columns, OmapOptions options, CompareMode compareMode,
+            ResidentBudget resident) {
         this.options = options;
         this.compareMode = compareMode;
+        this.resident = resident;
         this.valueTypes = new int[columns.length];
         this.columnTypes = new TypeInfo[columns.length];
         for (int i = 0; i < columns.length; i++) {
@@ -250,6 +258,7 @@ public final class ColumnarStore {
         }
         this.delta = new DeltaStore(columnTypes, compareMode);
         this.openSegment = new SegmentBuilder();
+        resident.register(this);
     }
 
     /** 段级部分聚合缓存，按「签名 × 段」失效，跨段写只使被改动的段失效。 */
@@ -337,13 +346,14 @@ public final class ColumnarStore {
     }
 
     /**
-     * 运行时修改驻留预算：调小立即逐出超预算的段；调大不重启预载，由后续查询自然填驻留。
-     * evictLocked 自带预算判断：预算 0（不逐出）或未超预算时空转。
+     * 运行时修改驻留预算（数据库全局，各表共享同一预算对象）：调小立即逐出超预算的段；
+     * 调大不重启预载，由后续查询自然填驻留。evictLocked 自带预算判断：预算 0（不逐出）
+     * 或未超预算时空转。
      */
     public void setResidentBudget(long bytes) {
         lock.writeLock().lock();
         try {
-            options.setResidentBytes(bytes);
+            resident.setBudget(bytes);
             evictLocked();
         } finally {
             lock.writeLock().unlock();
@@ -363,9 +373,35 @@ public final class ColumnarStore {
         return sliceCache.getBudget();
     }
 
-    /** 当前驻留预算，0 表示不逐出。 */
+    /** 当前驻留预算（数据库全局），0 表示不逐出。 */
     public long getResidentBudget() {
-        return options.getResidentBytes();
+        return resident.getBudget();
+    }
+
+    /** 全库（全部注册表）当前驻留字节之和。 */
+    public long getResidentUsed() {
+        return resident.residentUsed();
+    }
+
+    /** 写锁内同步更新本表与全局共享账本的驻留字节。 */
+    void residentAdd(long delta) {
+        residentTotal += delta;
+        resident.add(delta);
+    }
+
+    /** 表关闭时从共享预算注销并扣回本表占用；返回 true 表示本预算已无注册表。 */
+    public boolean releaseResident() {
+        if (residentReleased) {
+            return false;
+        }
+        residentReleased = true;
+        lock.writeLock().lock();
+        try {
+            residentAdd(-residentTotal);
+        } finally {
+            lock.writeLock().unlock();
+        }
+        return resident.unregister(this);
     }
 
     public void remove(long rowId) {
@@ -436,7 +472,7 @@ public final class ColumnarStore {
         try {
             long old = rowCount;
             segments.clear();
-            residentTotal = 0;
+            residentAdd(-residentTotal);
             delta.clear();
             aggCache.clear();
             sliceCache.clear();
@@ -548,13 +584,13 @@ public final class ColumnarStore {
                     if (newSeg.getDeletedCount() >= newSeg.getRowCount()) {
                         // 回写后整段全删：直接丢弃，不再挂回段列表。
                         segments.remove(segId);
-                        residentTotal -= ref.residentBytes;
+                        residentAdd(-ref.residentBytes);
                         sliceCache.invalidateSegment(segId);
                     } else {
                         ref.loaded = newSeg;
                         ref.generation = newSeg.getGeneration();
                         sliceCache.invalidateSegment(segId);
-                        residentTotal += newSeg.getEstimatedMemory() - ref.residentBytes;
+                        residentAdd(newSeg.getEstimatedMemory() - ref.residentBytes);
                         ref.residentBytes = newSeg.getEstimatedMemory();
                     }
                     delta.clearSegmentDeletes(segId);
@@ -863,12 +899,12 @@ public final class ColumnarStore {
      * 调用方必须已持有写锁。
      */
     int evictLocked() {
-        long budget = options.getResidentBytes();
-        if (budget <= 0 || persistence == null || residentTotal <= budget) {
+        long budget = resident.getBudget();
+        if (budget <= 0 || persistence == null || resident.residentUsed() <= budget) {
             return 0;
         }
         int evicted = 0;
-        while (residentTotal > budget) {
+        while (resident.residentUsed() > budget) {
             SegmentRef victim = null;
             for (SegmentRef ref : segments.values()) {
                 if (ref.loaded == null || !persistence.hasSegmentFile(ref.segmentId, ref.generation)) {
@@ -883,7 +919,7 @@ public final class ColumnarStore {
             }
             victim.skeleton = new SegmentSkeleton(victim.loaded);
             victim.loaded = null;
-            residentTotal -= victim.residentBytes;
+            residentAdd(-victim.residentBytes);
             victim.residentBytes = 0;
             evictedSegments.incrementAndGet();
             evicted++;
@@ -924,7 +960,7 @@ public final class ColumnarStore {
             ref.loaded = loaded;
             ref.skeleton = null;
             ref.residentBytes = loaded.getEstimatedMemory();
-            residentTotal += ref.residentBytes;
+            residentAdd(ref.residentBytes);
             touchRef(ref);
             evictLocked();
         } finally {
@@ -989,7 +1025,7 @@ public final class ColumnarStore {
                 nextSegmentId, openSegment.drain(), columnTypes, compareMode);
         SegmentRef ref = new SegmentRef(nextSegmentId, segment.getGeneration(), segment);
         ref.residentBytes = segment.getEstimatedMemory();
-        residentTotal += ref.residentBytes;
+        residentAdd(ref.residentBytes);
         segments.put(nextSegmentId, ref);
         // 段冻结后，开放段里的删除记录必须移交给 delta，否则那些行会重新可见。
         for (long rowId : openDeletes) {
@@ -1230,7 +1266,7 @@ public final class ColumnarStore {
             return;
         }
         segments.remove(segmentId);
-        residentTotal -= ref.residentBytes;
+        residentAdd(-ref.residentBytes);
         delta.clearSegmentDeletes(segmentId);
         aggCache.invalidateSegment(segmentId);
         sliceCache.invalidateSegment(segmentId);

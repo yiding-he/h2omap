@@ -38,28 +38,27 @@ public final class OmapOptions {
     /** {@code SET OMAP_SLICE_CACHE_BYTES} 在数据库目录里的设置名。 */
     public static final String SLICE_CACHE_SETTING_NAME = "OMAP_SLICE_CACHE_BYTES";
 
+    /** {@code SET OMAP_RESIDENT_BYTES} 在数据库目录里的设置名。 */
+    public static final String RESIDENT_SETTING_NAME = "OMAP_RESIDENT_BYTES";
+
     private final int segmentSize;
     private final int compactionMinRows;
     private final Boolean backup;
     private final String backupDir;
     private final int syncIntervalMs;
 
-    /** 驻留预算可被 ALTER TABLE SET RESIDENT_BYTES 运行时修改，因此非 final。 */
-    private volatile long residentBytes;
-
     private OmapOptions(int segmentSize, int compactionMinRows,
-            Boolean backup, String backupDir, int syncIntervalMs, long residentBytes) {
+            Boolean backup, String backupDir, int syncIntervalMs) {
         this.segmentSize = segmentSize;
         this.compactionMinRows = compactionMinRows;
         this.backup = backup;
         this.backupDir = backupDir;
         this.syncIntervalMs = syncIntervalMs;
-        this.residentBytes = residentBytes;
     }
 
     public static OmapOptions defaults() {
         return new OmapOptions(DEFAULT_SEGMENT_SIZE, DEFAULT_COMPACTION_MIN_ROWS,
-                null, null, DEFAULT_SYNC_INTERVAL_MS, DEFAULT_RESIDENT_BYTES);
+                null, null, DEFAULT_SYNC_INTERVAL_MS);
     }
 
     /**
@@ -77,7 +76,6 @@ public final class OmapOptions {
         Boolean backup = null;
         String backupDir = null;
         int syncIntervalMs = DEFAULT_SYNC_INTERVAL_MS;
-        long residentBytes = DEFAULT_RESIDENT_BYTES;
         for (String param : params) {
             String text = param == null ? "" : param.trim();
             if (text.isEmpty()) {
@@ -112,17 +110,18 @@ public final class OmapOptions {
                 syncIntervalMs = parseInt(key, value);
                 break;
             case "residentBytes":
-                residentBytes = parseByteSize(key, value);
+                // 兼容旧目录重放：驻留预算已改为数据库全局 SET OMAP_RESIDENT_BYTES，
+                // 这里只校验值合法（非法后缀建表仍报错），不再消费该值。
+                parseByteSize(key, value);
                 break;
             default:
                 throw DbException.getInvalidValueException("OMAP parameter name", key);
             }
         }
-        if (segmentSize <= 0 || compactionMinRows <= 0 || syncIntervalMs <= 0 || residentBytes < 0) {
+        if (segmentSize <= 0 || compactionMinRows <= 0 || syncIntervalMs <= 0) {
             throw DbException.getInvalidValueException("OMAP parameter", params.toString());
         }
-        return new OmapOptions(segmentSize, compactionMinRows, backup, backupDir, syncIntervalMs,
-                residentBytes);
+        return new OmapOptions(segmentSize, compactionMinRows, backup, backupDir, syncIntervalMs);
     }
 
     private static int parseInt(String key, String value) {
@@ -194,15 +193,5 @@ public final class OmapOptions {
 
     public int getSyncIntervalMs() {
         return syncIntervalMs;
-    }
-
-    /** 冻结段驻留堆的字节预算，0 表示不逐出。 */
-    public long getResidentBytes() {
-        return residentBytes;
-    }
-
-    /** 运行时修改驻留预算，调用方负责保证值非负。 */
-    public void setResidentBytes(long residentBytes) {
-        this.residentBytes = residentBytes;
     }
 }

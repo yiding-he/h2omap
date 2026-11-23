@@ -416,7 +416,7 @@ import org.h2.value.ValueTimestampTimeZone;
 import org.h2.value.ValueUuid;
 import org.h2.value.ValueVarchar;
 
-import com.hyd.h2omap.command.OmapAlterTableSetResidentBytes;
+import com.hyd.h2omap.command.OmapSetOmapResidentBytes;
 import com.hyd.h2omap.command.OmapSetOmapSliceCacheBytes;
 
 /**
@@ -7518,6 +7518,10 @@ public final class Parser extends ParserBase {
             readIfEqualOrTo();
             command.setExpression(readExpression());
             return command;
+        } else if (readIf("OMAP_RESIDENT_BYTES")) {
+            // OMAP 扩展：数据库全局的共享驻留预算，其余 SET 名保持原语义。
+            readIfEqualOrTo();
+            return new OmapSetOmapResidentBytes(session, readExpression());
         } else if (readIf("OMAP_SLICE_CACHE_BYTES")) {
             // OMAP 扩展：数据库全局的逐出段列切片缓存预算，其余 SET 名保持原语义。
             readIfEqualOrTo();
@@ -8140,10 +8144,6 @@ public final class Parser extends ParserBase {
             }
             return parseAlterTableAddColumn(tableName, schema, ifTableExists);
         } else if (readIf(SET)) {
-            // OMAP 扩展：SET 后跟 RESIDENT_BYTES 时解析驻留预算修改语句，其余保持原语义。
-            if (readIf("RESIDENT_BYTES")) {
-                return parseAlterTableSetResidentBytes(schema, tableName, ifTableExists);
-            }
             return parseAlterTableSet(schema, tableName, ifTableExists);
         } else if (readIf("RENAME")) {
             return parseAlterTableRename(schema, tableName, ifTableExists);
@@ -8470,21 +8470,6 @@ public final class Parser extends ParserBase {
         } else if (readIf("NOCHECK")) {
             command.setCheckExisting(false);
         }
-        return command;
-    }
-
-    /**
-     * OMAP 扩展：{@code ALTER TABLE ... SET RESIDENT_BYTES <字节数>}。
-     * 值接受字符串字面量或数字表达式，单位后缀与建表 WITH 参数的解析一致。
-     */
-    private Prepared parseAlterTableSetResidentBytes(Schema schema, String tableName,
-            boolean ifTableExists) {
-        readIf(EQUAL);
-        Expression value = readExpression();
-        OmapAlterTableSetResidentBytes command = new OmapAlterTableSetResidentBytes(session,
-                schema, value);
-        command.setTableName(tableName);
-        command.setIfTableExists(ifTableExists);
         return command;
     }
 

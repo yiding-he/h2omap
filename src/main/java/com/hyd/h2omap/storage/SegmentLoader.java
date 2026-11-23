@@ -115,9 +115,9 @@ final class SegmentLoader {
     private void runLazyLoadWorker(OmapPersistence p, SegmentRef[] refs, AtomicInteger cursor,
             AtomicBoolean budgetBoundary, Map<Integer, List<Integer>> deletedOffsetsBySegment) {
         while (!lazyLoaderStopped && !budgetBoundary.get()) {
-            long budget = store.options.getResidentBytes();
-            if (budget > 0 && store.getResidentBytes() >= budget) {
-                // 驻留预算已装满：继续预载只会载入即逐出，老段等查询按需读回。
+            long budget = store.getResidentBudget();
+            if (budget > 0 && store.getResidentUsed() >= budget) {
+                // 全库驻留预算已装满：继续预载只会载入即逐出，老段等查询按需读回。
                 return;
             }
             int i = cursor.getAndDecrement();
@@ -164,12 +164,12 @@ final class SegmentLoader {
                 // 骨架已在恢复时计入行数并保证可见性：这里只挂内容，不动可见性与结果缓存。
                 ref.loaded = segment;
                 ref.residentBytes = segment.getEstimatedMemory();
-                store.residentTotal += ref.residentBytes;
+                store.residentAdd(ref.residentBytes);
                 status = store.evictLocked() > 0 ? PUBLISH_EVICTED : PUBLISH_OK;
             } else {
                 ref.loaded = segment;
                 ref.residentBytes = segment.getEstimatedMemory();
-                store.residentTotal += ref.residentBytes;
+                store.residentAdd(ref.residentBytes);
                 long added = visibleRowsOf(segment);
                 if (deletedOffsets != null) {
                     int rowCountOfSegment = segment.getRowCount();

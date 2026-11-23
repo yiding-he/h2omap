@@ -79,7 +79,7 @@ final class StorePersistence {
                 SegmentRef ref = new SegmentRef(segmentIds[i], generations[i], preloaded[i]);
                 if (preloaded[i] != null) {
                     ref.residentBytes = preloaded[i].getEstimatedMemory();
-                    store.residentTotal += ref.residentBytes;
+                    store.residentAdd(ref.residentBytes);
                 } else if (skeletons != null && skeletons[i] != null) {
                     // 骨架在恢复时登记：未加载内容的段对全部读路径可见且可剪枝。
                     ref.skeleton = new SegmentSkeleton(skeletons[i]);

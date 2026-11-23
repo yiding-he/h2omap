@@ -23,10 +23,12 @@ import org.h2.table.TableType;
 import org.h2.value.Value;
 
 import com.hyd.h2omap.engine.OmapOptions;
+import com.hyd.h2omap.engine.OmapResidentBudgets;
 import com.hyd.h2omap.index.OmapRowIdIndex;
 import com.hyd.h2omap.index.OmapScanIndex;
 import com.hyd.h2omap.persistence.OmapPersistence;
 import com.hyd.h2omap.storage.ColumnarStore;
+import com.hyd.h2omap.storage.ResidentBudget;
 
 /**
  * 列式表。H2 的 {@code Table} 接口在这一层收口，下面全部是 OMAP 自己的结构。
@@ -47,13 +49,13 @@ public final class OmapTable extends TableBase {
 
     private final OmapPersistence persistence;
 
-    /** 与 TableBase 共享的 WITH 参数列表（同一个 ArrayList 实例）；建表时没有 WITH 子句则为 null。 */
-    private final ArrayList<String> engineParams;
+    /** 数据库内全部 OMAP 表共享的驻留预算（真共享池）。 */
+    private final ResidentBudget resident;
 
     public OmapTable(CreateTableData data, OmapOptions options) {
         super(data);
-        this.engineParams = data.tableEngineParams;
-        this.store = new ColumnarStore(getColumns(), options, getCompareMode());
+        this.resident = OmapResidentBudgets.of(database);
+        this.store = new ColumnarStore(getColumns(), options, getCompareMode(), resident);
         this.store.setSliceCacheBudget(sliceCacheBudget());
         // 惰性加载由服务端启动参数决定，默认关闭。
         this.store.setLazyLoad(database.getSettings().omapLazyLoad);
@@ -100,41 +102,11 @@ public final class OmapTable extends TableBase {
     }
 
     /**
-     * 运行时修改驻留预算并同步进建表 SQL：调小立即逐出，调大由后续查询自然填满。
-     * 持久化由命令层调 database.updateMeta 完成。
+     * 运行时修改驻留预算（数据库全局，各表共享同一预算对象）：调小立即逐出，调大由后续查询
+     * 自然填满。持久化由命令层写 H2 目录的 Setting 完成，不进建表 SQL。
      */
     public void applyResidentBudget(long bytes) {
         store.setResidentBudget(bytes);
-        if (engineParams != null) {
-            String param = "residentBytes=" + bytes;
-            for (int i = 0; i < engineParams.size(); i++) {
-                String text = engineParams.get(i);
-                if (text != null && text.trim().startsWith("residentBytes=")) {
-                    engineParams.set(i, param);
-                    return;
-                }
-            }
-            engineParams.add(param);
-        }
-    }
-
-    @Override
-    public String getCreateSQL() {
-        return appendRuntimeParams(super.getCreateSQL());
-    }
-
-    @Override
-    public String getCreateSQLForMeta() {
-        return appendRuntimeParams(super.getCreateSQLForMeta());
-    }
-
-    /** 建表时没有 WITH 子句的表，运行期新增的 residentBytes 只能在渲染结果末尾追加。 */
-    private String appendRuntimeParams(String sql) {
-        if (sql == null || engineParams != null) {
-            return sql;
-        }
-        long bytes = store.getResidentBudget();
-        return bytes == 0 ? sql : sql + "\nWITH \"residentBytes=" + bytes + '"';
     }
 
     private OmapPersistence initPersistence(CreateTableData data, OmapOptions options) {
@@ -382,6 +354,9 @@ public final class OmapTable extends TableBase {
     @Override
     public void close(SessionLocal session) {
         store.stopLazyLoading();
+        if (store.releaseResident()) {
+            OmapResidentBudgets.release(database, resident);
+        }
         if (persistence != null) {
             persistence.close();
         }
@@ -399,6 +374,9 @@ public final class OmapTable extends TableBase {
     @Override
     public void removeChildrenAndResources(SessionLocal session) {
         super.removeChildrenAndResources(session);
+        if (store.releaseResident()) {
+            OmapResidentBudgets.release(database, resident);
+        }
         if (persistence != null) {
             persistence.deleteDirectory();
         }
