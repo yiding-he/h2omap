@@ -3163,8 +3163,11 @@ class OmapTableContractTest {
     }
 
     /** 次邻区间相交（跨两段的极迟写入）整条交回 H2。 */
+    /**
+     * 次邻区间相交由归并流式（M24）接管：全体段键流进同一个堆，行序与 H2 排序一致。
+     */
     @Test
-    void orderedStreamingSecondNeighborOverlapFallsBackToH2() throws SQLException {
+    void orderedStreamingSecondNeighborOverlapMergesStreams() throws SQLException {
         execute(createTable("T6", "ID INT, TS BIGINT NOT NULL, V INT",
                 "\"segmentSize=2\", \"compactionMinRows=100000\""));
         execute("INSERT INTO T6 VALUES (1, 12, 1), (2, 2, 2)");
@@ -3172,37 +3175,42 @@ class OmapTableContractTest {
         execute("INSERT INTO T6 VALUES (5, 11, 5), (6, 8, 6)");
         // 发射序 seg0[2,12]、seg1[3,9]、seg2[8,11]：seg0.max=12 >= seg2.min=8，次邻相交
         long claims = omapStore("T6").getOrderedStreamingClaims();
+        long merges = omapStore("T6").getMergeStreamingClaims();
         assertEquals(List.of("2", "4", "6", "3", "5", "1"),
                 rows("SELECT ID FROM T6 ORDER BY TS"));
         assertEquals(claims, omapStore("T6").getOrderedStreamingClaims(),
-                "次邻区间相交应交回 H2 行式路径，不命中流式下推");
+                "次邻区间相交不命中有序流式");
+        assertEquals(merges + 1, omapStore("T6").getMergeStreamingClaims(),
+                "次邻区间相交应由归并流式接管");
     }
 
     /**
-     * 次邻区间相接（边界值相等）同样拒绝：等值键跨单元时无法按 rowId 定序。
-     * ASC 侧 seg2[5,10] 与 seg0[10,15] 次邻相接必须回退；
-     * DESC 侧次邻严格分离（seg0.min=10 > seg2.max=9），命中流式且 10 并列按 rowId 定序。
+     * 次邻区间相接（边界值相等）：等值键跨段在归并堆里按 rowId 定序，ASC 侧命中归并；
+     * DESC 侧次邻严格分离（seg0.min=10 > seg2.max=9），仍命中有序流式。
      */
     @Test
-    void orderedStreamingTouchingSecondNeighborFallsBackToH2() throws SQLException {
+    void orderedStreamingTouchingSecondNeighborMergesOnAsc() throws SQLException {
         execute(createTable("T7", "ID INT, TS BIGINT NOT NULL, V INT",
                 "\"segmentSize=2\", \"compactionMinRows=100000\""));
         execute("INSERT INTO T7 VALUES (1, 10, 1), (2, 15, 2)");
         execute("INSERT INTO T7 VALUES (3, 8, 3), (4, 9, 4)");
         execute("INSERT INTO T7 VALUES (5, 5, 5), (6, 10, 6)");
         long claims = omapStore("T7").getOrderedStreamingClaims();
+        long merges = omapStore("T7").getMergeStreamingClaims();
         assertEquals(List.of("5", "3", "4", "1", "6", "2"),
                 rows("SELECT ID FROM T7 ORDER BY TS"));
         assertEquals(claims, omapStore("T7").getOrderedStreamingClaims(),
-                "次邻区间相接（等值键跨单元）应交回 H2 行式路径");
+                "次邻区间相接不命中有序流式");
+        assertEquals(merges + 1, omapStore("T7").getMergeStreamingClaims(),
+                "ASC 侧相接由归并接管，等值键 10 按 rowId 定序（1 在 6 前）");
         assertEquals(List.of("2", "1", "6", "4", "3", "5"),
                 rows("SELECT ID FROM T7 ORDER BY TS DESC"));
         assertEquals(claims + 1, omapStore("T7").getOrderedStreamingClaims(),
-                "DESC 侧次邻严格分离应命中流式下推");
+                "DESC 侧次邻严格分离应命中有序流式下推");
     }
 
     @Test
-    void orderedStreamingNullWrittenBackByCompactionFallsBack() throws SQLException {
+    void orderedStreamingNullWrittenBackByCompactionMerges() throws SQLException {
         execute(createTable("T8", "ID INT, TS BIGINT, V INT",
                 "\"segmentSize=4\", \"compactionMinRows=1\""));
         execute("INSERT INTO T8 VALUES (1, 10, 1), (2, 5, 2), (3, 8, 3), (4, 2, 4)");
@@ -3211,27 +3219,144 @@ class OmapTableContractTest {
         // 无 NULL 时命中流式
         rows("SELECT ID, TS FROM T8 ORDER BY TS DESC");
         long claims = omapStore("T8").getOrderedStreamingClaims();
+        long merges = omapStore("T8").getMergeStreamingClaims();
         // delta 新像把 TS 改为 NULL 并同步触发合并写回段：段 hasNull 必须随之置真
         execute("UPDATE T8 SET TS = NULL WHERE ID = 6");
         assertEquals(List.of(
                 "10/30", "9/25", "5/20", "7/15", "8/13", "1/10", "3/8", "2/5", "4/2", "6/null"),
                 rows("SELECT ID, TS FROM T8 ORDER BY TS DESC"));
         assertEquals(claims, omapStore("T8").getOrderedStreamingClaims(),
-                "合并把 NULL 写回段后应交回 H2 行式路径");
+                "合并把 NULL 写回段后不命中有序流式");
+        assertEquals(merges + 1, omapStore("T8").getMergeStreamingClaims(),
+                "合并把 NULL 写回段后由归并流式接管，NULL 由复合键比较器统一排序");
     }
 
     @Test
-    void orderedStreamingSegmentsContainingNullFallBackToH2() throws SQLException {
+    void orderedStreamingSegmentsContainingNullMerge() throws SQLException {
         execute(createTable("T5", "ID INT, TS BIGINT, V INT",
                 "\"segmentSize=4\", \"compactionMinRows=100000\""));
         execute("INSERT INTO T5 VALUES (1, 10, 1), (2, NULL, 2), (3, 5, 3), (4, 8, 4)");
         execute("INSERT INTO T5 VALUES (5, 20, 5), (6, NULL, 6), (7, 15, 7), (8, 25, 8)");
         long claims = omapStore("T5").getOrderedStreamingClaims();
-        // NULL 组跨段必须整体位于末尾（H2 默认 DESC 视 NULL 最小）；若误入流式，两段的 NULL 会被拆散
+        long merges = omapStore("T5").getMergeStreamingClaims();
+        // NULL 组由归并堆统一排序：全体段头在同一个堆里，不存在流式单元推进拆散 NULL 组的问题
         assertEquals(List.of("8/25", "5/20", "7/15", "1/10", "4/8", "3/5", "2/null", "6/null"),
                 rows("SELECT ID, TS FROM T5 ORDER BY TS DESC"));
         assertEquals(claims, omapStore("T5").getOrderedStreamingClaims(),
-                "参与段首列实际含 NULL 应交回 H2 行式路径");
+                "参与段首列实际含 NULL 不命中有序流式");
+        assertEquals(merges + 1, omapStore("T5").getMergeStreamingClaims(),
+                "首列含 NULL 由归并流式接管");
+        assertEquals(List.of("2/null", "6/null", "8/25", "5/20", "7/15", "1/10", "4/8", "3/5"),
+                rows("SELECT ID, TS FROM T5 ORDER BY TS DESC NULLS FIRST"));
+        assertEquals(merges + 2, omapStore("T5").getMergeStreamingClaims(),
+                "NULLS FIRST 同样由归并接管");
+    }
+
+    // ------------------------------------------------------------------
+    // M24：归并流式执行（随机键形态，段间次邻相交时全体键流归并）
+    // ------------------------------------------------------------------
+
+    /**
+     * 归并流式把 delta 新像与开放段行作为附加键流参与归并，ASC/DESC 都与 H2 排序一致。
+     */
+    @Test
+    void mergeStreamingExtraRowsJoinTheHeap() throws SQLException {
+        execute(createTable("T9", "ID INT, TS BIGINT, V INT",
+                "\"segmentSize=2\", \"compactionMinRows=100000\""));
+        execute("INSERT INTO T9 VALUES (1, 12, 1), (2, 2, 2)");
+        execute("INSERT INTO T9 VALUES (3, 9, 3), (4, 3, 4)");
+        execute("INSERT INTO T9 VALUES (5, 11, 5), (6, 8, 6)");
+        // 冻结段内行改键成新像（delta 未回写）
+        execute("UPDATE T9 SET TS = 1 WHERE ID = 1");
+        // 开放段行（未冻结）
+        execute("INSERT INTO T9 VALUES (7, 4, 7), (8, 6, 8)");
+        long claims = omapStore("T9").getOrderedStreamingClaims();
+        long merges = omapStore("T9").getMergeStreamingClaims();
+        assertEquals(List.of("1", "2", "4", "7", "8", "6", "3", "5"),
+                rows("SELECT ID FROM T9 ORDER BY TS"));
+        assertEquals(List.of("5", "3", "6", "8", "7", "4", "2", "1"),
+                rows("SELECT ID FROM T9 ORDER BY TS DESC"));
+        assertEquals(claims, omapStore("T9").getOrderedStreamingClaims(),
+                "段间次邻相交不命中有序流式");
+        assertEquals(merges + 2, omapStore("T9").getMergeStreamingClaims(),
+                "新像与开放段行随段键流一起归并");
+    }
+
+    /** 归并流式带 WHERE 与 SELECT *：谓词列进键流排序阶段，投影列行发出时延迟读回。 */
+    @Test
+    void mergeStreamingWhereAndSelectStar() throws SQLException {
+        execute(createTable("T10", "ID INT, TS BIGINT, V INT",
+                "\"segmentSize=2\", \"compactionMinRows=100000\""));
+        // 每段 V 区间都跨 [5,∞)，无段被谓词剪掉；
+        // 幸存段 TS zone seg0[2,12]/seg1[3,9]/seg2[8,11] 次邻相交，归并接管
+        execute("INSERT INTO T10 VALUES (1, 12, 1), (2, 2, 9)");
+        execute("INSERT INTO T10 VALUES (3, 9, 3), (4, 3, 7)");
+        execute("INSERT INTO T10 VALUES (5, 11, 5), (6, 8, 6)");
+        long merges = omapStore("T10").getMergeStreamingClaims();
+        assertEquals(List.of(
+                "5/11/5", "6/8/6", "4/3/7", "2/2/9"),
+                rows("SELECT * FROM T10 WHERE V >= 5 ORDER BY TS DESC"));
+        assertEquals(merges + 1, omapStore("T10").getMergeStreamingClaims(),
+                "WHERE + SELECT * 应命中归并流式");
+    }
+
+    /** 归并流式带 OFFSET：偏移在发射流上跳过。 */
+    @Test
+    void mergeStreamingOffsetSkipsOnStream() throws SQLException {
+        execute(createTable("T11", "ID INT, TS BIGINT NOT NULL, V INT",
+                "\"segmentSize=2\", \"compactionMinRows=100000\""));
+        execute("INSERT INTO T11 VALUES (1, 12, 1), (2, 2, 2)");
+        execute("INSERT INTO T11 VALUES (3, 9, 3), (4, 3, 4)");
+        execute("INSERT INTO T11 VALUES (5, 11, 5), (6, 8, 6)");
+        long merges = omapStore("T11").getMergeStreamingClaims();
+        assertEquals(List.of("6", "3", "5", "1"),
+                rows("SELECT ID FROM T11 ORDER BY TS OFFSET 2"));
+        assertEquals(merges + 1, omapStore("T11").getMergeStreamingClaims(),
+                "OFFSET 应命中归并流式并在发射流上跳过");
+    }
+
+    /**
+     * 键流量超出 {@code omap.mergeStreamMaxBytes} 时整条交回 H2 行式路径；
+     * 上限恢复后重新命中归并。系统属性名与 OrderedMergeExecutor.MAX_BYTES_PROPERTY 一致。
+     */
+    @Test
+    void mergeStreamingCeilingFallsBackToH2() throws SQLException {
+        execute(createTable("T12", "ID INT, TS BIGINT NOT NULL, V INT",
+                "\"segmentSize=2\", \"compactionMinRows=100000\""));
+        execute("INSERT INTO T12 VALUES (1, 12, 1), (2, 2, 2)");
+        execute("INSERT INTO T12 VALUES (3, 9, 3), (4, 3, 4)");
+        execute("INSERT INTO T12 VALUES (5, 11, 5), (6, 8, 6)");
+        long merges = omapStore("T12").getMergeStreamingClaims();
+        System.setProperty("omap.mergeStreamMaxBytes", "1");
+        try {
+            assertEquals(List.of("2", "4", "6", "3", "5", "1"),
+                    rows("SELECT ID FROM T12 ORDER BY TS"));
+            assertEquals(merges, omapStore("T12").getMergeStreamingClaims(),
+                    "键流量超上限应交回 H2 行式路径");
+        } finally {
+            System.clearProperty("omap.mergeStreamMaxBytes");
+        }
+        // 文本不同于上一次，避开 H2 查询结果缓存重放旧结果
+        assertEquals(List.of("2/2", "4/3", "6/8", "3/9", "5/11", "1/12"),
+                rows("SELECT ID, TS FROM T12 ORDER BY TS"));
+        assertEquals(merges + 1, omapStore("T12").getMergeStreamingClaims(),
+                "上限恢复后应重新命中归并流式");
+    }
+
+    /** 归并流式的表达式投影：求值发生在行发出期，行序与列值同时验证。 */
+    @Test
+    void mergeStreamingExpressionProjection() throws SQLException {
+        execute(createTable("T13", "ID INT, TS BIGINT NOT NULL, V INT",
+                "\"segmentSize=2\", \"compactionMinRows=100000\""));
+        execute("INSERT INTO T13 VALUES (1, 12, 1), (2, 2, 2)");
+        execute("INSERT INTO T13 VALUES (3, 9, 3), (4, 3, 4)");
+        execute("INSERT INTO T13 VALUES (5, 11, 5), (6, 8, 6)");
+        long merges = omapStore("T13").getMergeStreamingClaims();
+        assertEquals(List.of(
+                "22/2", "44/3", "66/8", "33/9", "55/11", "11/12"),
+                rows("SELECT ID * 10 + V, TS FROM T13 ORDER BY TS"));
+        assertEquals(merges + 1, omapStore("T13").getMergeStreamingClaims(),
+                "表达式投影应命中归并流式");
     }
 
     @Test
