@@ -497,6 +497,61 @@ class SegmentFileFormatTest {
         }
     }
 
+    /**
+     * 快照与并发驻留的竞态：懒段在快照后已被并发读回/预载驻留（loaded 挂上、
+     * skeleton 被清）时，首次读列应直接复用驻留内容，不得回填全占位向量后抛异常。
+     */
+    @Test
+    void snapshotSegmentRacingWithResidentReadback() throws IOException {
+        boolean previousStats = QueryIoStats.isEnabled();
+        QueryIoStats.setEnabled(true);
+        OmapPersistence p = null;
+        try {
+            p = newPersistence(dir.resolve("t-race-resident"));
+            ColumnarStore store = newColumnarStore("segmentSize=4", "compactionMinRows=1",
+                    "residentBytes=1");
+            store.setPersistence(p);
+            for (int i = 0; i < 8; i++) {
+                store.append(row(i * 10, "v" + i));
+            }
+            store.checkpoint();
+            ColumnarStore.SegmentRef ref = store.segments.values().iterator().next();
+            assertNull(ref.loaded, "residentBytes=1 应把段全部逐出");
+
+            ColumnSegment resident = store.readSegmentTransient(ref);
+            assertEquals("v0", resident.getColumn(1).get(0).getString());
+
+            // 拍快照：逐出段被包装成懒段，首次读列才按部分列读回
+            VectorizedSnapshot snap = SnapshotQuery.take(store, null, null, new int[] { 0, 1 });
+            ColumnSegment lazy = snap.segments[0];
+
+            // 模拟快照后另一线程经 ensureResident 把段驻留：loaded 挂上、skeleton 被清。
+            // 修复前：懒段首次读列判 skeleton==null 不可读回，回填全占位向量，
+            // 触碰请求列抛 UnsupportedOperationException。
+            ref.loaded = resident;
+            ref.skeleton = null;
+
+            assertEquals("v0", lazy.getColumn(1).get(0).getString());
+            assertEquals("v3", lazy.getColumn(1).get(3).getString());
+            assertSame(resident, store.readSegmentTransient(ref),
+                    "已驻留段应直接返回驻留内容，不再走临时读");
+
+            // 驻留后懒段读列不应再触发磁盘读
+            QueryIoStats.begin();
+            assertEquals("v1", lazy.getColumn(1).get(1).getString());
+            QueryIoStats.end();
+            QueryIoStats stats = QueryIoStats.pollLast();
+            assertTrue(stats == null || stats.isEmpty(), "驻留后懒段读列不应再读盘");
+            p.close();
+            p = null;
+        } finally {
+            QueryIoStats.setEnabled(previousStats);
+            if (p != null) {
+                p.close();
+            }
+        }
+    }
+
     private static ColumnarStore newColumnarStore(String... params) {
         return new ColumnarStore(
                 new org.h2.table.Column[] {
