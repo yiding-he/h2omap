@@ -3380,6 +3380,194 @@ class OmapTableContractTest {
                 "带 LIMIT 的有序查询走 M11 有序模式，不走流式下推");
     }
 
+    // ---- M23 平面流式执行（无 LIMIT 无 ORDER BY 的单表平面查询） ----
+
+    /** 40 行恰好冻结成 10 段、开放段为空；compactionMinRows 大到不触发合并。 */
+    private void createFlatStreamingTable() throws SQLException {
+        execute(createTable("T", "ID INT, V INT", "\"segmentSize=4\", \"compactionMinRows=100000\""));
+        for (int i = 1; i <= 40; i++) {
+            execute("INSERT INTO T VALUES (" + i + ", " + (i * 2) + ")");
+        }
+    }
+
+    @Test
+    void flatStreamingEmitsAllRowsWithoutMaterializing() throws SQLException {
+        createFlatStreamingTable();
+        long claims = omapStore("T").getFlatStreamingClaims();
+        List<String> expected = new ArrayList<>();
+        for (int i = 1; i <= 40; i++) {
+            expected.add(i + "/" + (i * 2));
+        }
+        assertEquals(expected, rows("SELECT ID, V FROM T"));
+        assertEquals(claims + 1, omapStore("T").getFlatStreamingClaims(),
+                "应命中平面流式下推");
+        // SELECT * 全列投影同样流式
+        assertEquals(expected, rows("SELECT * FROM T"));
+    }
+
+    @Test
+    void flatStreamingWhereAndOffsetSkipEmittedRows() throws SQLException {
+        createFlatStreamingTable();
+        // V = 2i，V >= 13 即 i >= 7；全驻留无活像，发射序即段号升序；
+        // OFFSET 2 跳过 7/8
+        List<String> expected = new ArrayList<>();
+        for (int i = 9; i <= 40; i++) {
+            expected.add(String.valueOf(i));
+        }
+        assertEquals(expected, rows("SELECT ID FROM T WHERE V >= 13 OFFSET 2"));
+    }
+
+    @Test
+    void flatStreamingEmitsDeltaNewImagesAndSkipsDeletedRows() throws SQLException {
+        execute(createTable("T", "ID INT, V INT", "\"segmentSize=4\", \"compactionMinRows=100000\""));
+        execute("INSERT INTO T VALUES (1, 10), (2, 20), (3, 30), (4, 40)");
+        execute("INSERT INTO T VALUES (5, 50), (6, 60), (7, 70), (8, 80)");
+        execute("INSERT INTO T VALUES (9, 90), (10, 100)");
+        execute("UPDATE T SET V = 25 WHERE ID = 2");
+        execute("DELETE FROM T WHERE ID = 6");
+        // 冻结段可见行按段号升序先行，随后是 delta 新像与开放段行
+        assertEquals(List.of("1/10", "3/30", "4/40", "5/50", "7/70", "8/80",
+                "2/25", "9/90", "10/100"), rows("SELECT ID, V FROM T"));
+    }
+
+    @Test
+    void flatStreamingAbandonedCursorStopsScanning(@TempDir Path dir) throws Exception {
+        String url = "jdbc:h2:" + dir.resolve("db").toAbsolutePath().toString().replace('\\', '/');
+        try (Connection c = DriverManager.getConnection(url, "sa", "")) {
+            try (Statement s = c.createStatement()) {
+                s.execute(createTable("T", "ID INT, V INT",
+                        "\"segmentSize=4\", \"compactionMinRows=100000\""));
+                s.execute("SET OMAP_RESIDENT_BYTES '1'");
+                for (int i = 1; i <= 40; i++) {
+                    s.execute("INSERT INTO T VALUES (" + i + ", " + (i * 2) + ")");
+                }
+            }
+            org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                    ((org.h2.jdbc.JdbcConnection) c).getSession();
+            com.hyd.h2omap.table.OmapTable table = (com.hyd.h2omap.table.OmapTable)
+                    session.getDatabase().getMainSchema().findTableOrView(session, "T");
+            com.hyd.h2omap.storage.ColumnarStore store = table.getStore();
+            long sliceBefore = store.getTransientSliceReads();
+            long claimsBefore = store.getFlatStreamingClaims();
+            // 只取 3 行即弃游标：首个逐出段（4 行）足够，其余 9 个逐出段零读取
+            try (Statement st = c.createStatement();
+                    ResultSet rs = st.executeQuery("SELECT ID, V FROM T")) {
+                assertTrue(rs.next());
+                assertTrue(rs.next());
+                assertTrue(rs.next());
+            }
+            assertEquals(claimsBefore + 1, store.getFlatStreamingClaims(),
+                    "应命中平面流式下推");
+            assertEquals(sliceBefore + 1, store.getTransientSliceReads(),
+                    "只应读回首个段的列切片");
+            List<String> expected = new ArrayList<>();
+            for (int i = 1; i <= 40; i++) {
+                expected.add(i + "/" + (i * 2));
+            }
+            List<String> got = new ArrayList<>();
+            try (Statement st = c.createStatement();
+                    ResultSet rs = st.executeQuery("SELECT ID, V FROM T")) {
+                while (rs.next()) {
+                    got.add(rs.getInt(1) + "/" + rs.getInt(2));
+                }
+            }
+            assertEquals(expected, got);
+        }
+    }
+
+    @Test
+    void flatStreamingEmitsResidentSegmentsFirst(@TempDir Path dir) throws Exception {
+        String url = "jdbc:h2:" + dir.resolve("db").toAbsolutePath().toString().replace('\\', '/');
+        try (Connection c = DriverManager.getConnection(url, "sa", "")) {
+            try (Statement s = c.createStatement()) {
+                s.execute(createTable("T", "ID INT PRIMARY KEY, V INT",
+                        "\"segmentSize=4\", \"compactionMinRows=100000\""));
+                for (int i = 1; i <= 40; i++) {
+                    s.execute("INSERT INTO T VALUES (" + i + ", " + (i * 2) + ")");
+                }
+                // 先把预算压到装不下单个段，全部段逐出；再调大但不预载
+                s.execute("SET OMAP_RESIDENT_BYTES '1'");
+                s.execute("SET OMAP_RESIDENT_BYTES '100000'");
+            }
+            org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                    ((org.h2.jdbc.JdbcConnection) c).getSession();
+            com.hyd.h2omap.table.OmapTable table = (com.hyd.h2omap.table.OmapTable)
+                    session.getDatabase().getMainSchema().findTableOrView(session, "T");
+            com.hyd.h2omap.storage.ColumnarStore store = table.getStore();
+            // 主键点查走 rowId 索引：不命中平面流式，且把含 25 的段同步读回驻留
+            long claimsBeforePoint = store.getFlatStreamingClaims();
+            try (Statement st = c.createStatement();
+                    ResultSet rs = st.executeQuery("SELECT ID FROM T WHERE ID = 25")) {
+                assertTrue(rs.next());
+                assertEquals("25", rs.getString(1));
+                assertFalse(rs.next());
+            }
+            assertEquals(claimsBeforePoint, store.getFlatStreamingClaims(),
+                    "rowId 索引点查不得命中平面流式");
+            long claimsBeforeStream = store.getFlatStreamingClaims();
+            // 投影带上主键外的列，强制 H2 选扫描索引（只选主键列会被主键索引覆盖）
+            List<String> got = new ArrayList<>();
+            try (Statement st = c.createStatement();
+                    ResultSet rs = st.executeQuery("SELECT ID, V FROM T")) {
+                while (rs.next()) {
+                    got.add(rs.getInt(1) + "/" + rs.getInt(2));
+                }
+            }
+            assertEquals(claimsBeforeStream + 1, store.getFlatStreamingClaims(),
+                    "应命中平面流式下推");
+            List<String> expected = new ArrayList<>();
+            expected.addAll(List.of("25/50", "26/52", "27/54", "28/56"));
+            for (int i = 1; i <= 24; i++) {
+                expected.add(i + "/" + (i * 2));
+            }
+            for (int i = 29; i <= 40; i++) {
+                expected.add(i + "/" + (i * 2));
+            }
+            assertEquals(expected, got, "驻留段应先于逐出段发射");
+        }
+    }
+
+    @Test
+    void flatStreamingExpressionProjectionEvaluatesPerRow() throws SQLException {
+        createFlatStreamingTable();
+        long claims = omapStore("T").getFlatStreamingClaims();
+        List<String> expected = new ArrayList<>();
+        for (int i = 1; i <= 40; i++) {
+            expected.add((i * 2 + 1) + "/" + i);
+        }
+        assertEquals(expected, rows("SELECT V + 1, ID FROM T"));
+        assertEquals(claims + 1, omapStore("T").getFlatStreamingClaims(),
+                "确定表达式投影应命中平面流式");
+        // 非确定表达式交回 H2 行式路径
+        long claimsBefore = omapStore("T").getFlatStreamingClaims();
+        assertEquals(40, rows("SELECT RAND(), ID FROM T").size());
+        assertEquals(claimsBefore, omapStore("T").getFlatStreamingClaims(),
+                "非确定表达式不得命中平面流式");
+    }
+
+    @Test
+    void flatStreamingNotClaimedForLimitDistinctOrderOrAggregate() throws SQLException {
+        createFlatStreamingTable();
+        com.hyd.h2omap.storage.ColumnarStore store = omapStore("T");
+        long flatClaims = store.getFlatStreamingClaims();
+        long orderedClaims = store.getOrderedStreamingClaims();
+        assertEquals(List.of("1", "2", "3"), rows("SELECT ID FROM T LIMIT 3"));
+        List<String> distinct = new ArrayList<>(rows("SELECT DISTINCT V % 10 FROM T"));
+        distinct.sort(null);
+        assertEquals(List.of("0", "2", "4", "6", "8"), distinct);
+        assertEquals(List.of("80"), rows("SELECT MAX(V) FROM T"));
+        assertEquals(flatClaims, store.getFlatStreamingClaims(),
+                "LIMIT、DISTINCT、聚合均不得命中平面流式");
+        // 无 LIMIT 的 ORDER BY 走 M20 有序流式
+        List<String> expected = new ArrayList<>();
+        for (int i = 1; i <= 40; i++) {
+            expected.add(String.valueOf(i));
+        }
+        assertEquals(expected, rows("SELECT ID FROM T ORDER BY ID"));
+        assertEquals(flatClaims, store.getFlatStreamingClaims());
+        assertEquals(orderedClaims + 1, store.getOrderedStreamingClaims());
+    }
+
     private com.hyd.h2omap.storage.ColumnarStore omapStore(String table) {
         org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
                 ((org.h2.jdbc.JdbcConnection) conn).getSession();
