@@ -2971,7 +2971,26 @@ class OmapTableContractTest {
     }
 
     @Test
-    void orderedStreamingNullableFirstColumnFallsBackToH2() throws SQLException {
+    void orderedStreamingNullWrittenBackByCompactionFallsBack() throws SQLException {
+        execute(createTable("T8", "ID INT, TS BIGINT, V INT",
+                "\"segmentSize=4\", \"compactionMinRows=1\""));
+        execute("INSERT INTO T8 VALUES (1, 10, 1), (2, 5, 2), (3, 8, 3), (4, 2, 4)");
+        execute("INSERT INTO T8 VALUES (5, 20, 5), (6, 11, 6), (7, 15, 7), (8, 13, 8)");
+        execute("INSERT INTO T8 VALUES (9, 25, 9), (10, 30, 10)");
+        // 无 NULL 时命中流式
+        rows("SELECT ID, TS FROM T8 ORDER BY TS DESC");
+        long claims = omapStore("T8").getOrderedStreamingClaims();
+        // delta 新像把 TS 改为 NULL 并同步触发合并写回段：段 hasNull 必须随之置真
+        execute("UPDATE T8 SET TS = NULL WHERE ID = 6");
+        assertEquals(List.of(
+                "10/30", "9/25", "5/20", "7/15", "8/13", "1/10", "3/8", "2/5", "4/2", "6/null"),
+                rows("SELECT ID, TS FROM T8 ORDER BY TS DESC"));
+        assertEquals(claims, omapStore("T8").getOrderedStreamingClaims(),
+                "合并把 NULL 写回段后应交回 H2 行式路径");
+    }
+
+    @Test
+    void orderedStreamingSegmentsContainingNullFallBackToH2() throws SQLException {
         execute(createTable("T5", "ID INT, TS BIGINT, V INT",
                 "\"segmentSize=4\", \"compactionMinRows=100000\""));
         execute("INSERT INTO T5 VALUES (1, 10, 1), (2, NULL, 2), (3, 5, 3), (4, 8, 4)");
@@ -2981,7 +3000,43 @@ class OmapTableContractTest {
         assertEquals(List.of("8/25", "5/20", "7/15", "1/10", "4/8", "3/5", "2/null", "6/null"),
                 rows("SELECT ID, TS FROM T5 ORDER BY TS DESC"));
         assertEquals(claims, omapStore("T5").getOrderedStreamingClaims(),
-                "首列可空应交回 H2 行式路径");
+                "参与段首列实际含 NULL 应交回 H2 行式路径");
+    }
+
+    @Test
+    void orderedStreamingNullableColumnWithoutNullsIsClaimed() throws SQLException {
+        execute(createTable("T6", "ID INT, TS BIGINT, V INT",
+                "\"segmentSize=4\", \"compactionMinRows=100000\""));
+        execute("INSERT INTO T6 VALUES (1, 10, 1), (2, 5, 2), (3, 8, 3), (4, 2, 4)");
+        execute("INSERT INTO T6 VALUES (5, 20, 5), (6, 11, 6), (7, 15, 7), (8, 13, 8)");
+        execute("INSERT INTO T6 VALUES (9, 25, 9), (10, 30, 10)");
+        long claims = omapStore("T6").getOrderedStreamingClaims();
+        assertEquals(List.of(
+                "10/30", "9/25", "5/20", "7/15", "8/13", "6/11", "1/10", "3/8", "2/5", "4/2"),
+                rows("SELECT ID, TS FROM T6 ORDER BY TS DESC"));
+        assertTrue(omapStore("T6").getOrderedStreamingClaims() > claims,
+                "首列声明可空但全部参与段不含 NULL 应命中有序流式下推");
+    }
+
+    @Test
+    void orderedStreamingNullNewImageSortsAcrossSegments() throws SQLException {
+        execute(createTable("T7", "ID INT, TS BIGINT, V INT",
+                "\"segmentSize=4\", \"compactionMinRows=100000\""));
+        execute("INSERT INTO T7 VALUES (1, 10, 1), (2, 5, 2), (3, 8, 3), (4, 2, 4)");
+        execute("INSERT INTO T7 VALUES (5, 20, 5), (6, 11, 6), (7, 15, 7), (8, 13, 8)");
+        execute("INSERT INTO T7 VALUES (9, 25, 9), (10, 30, 10)");
+        // delta 新像把冻结段内一行的 TS 改为 NULL：合并前不写回段，段 hasNull 仍为 false
+        execute("UPDATE T7 SET TS = NULL WHERE ID = 6");
+        // DESC 默认 NULL 视最小：NULL 新像整体排在末尾，不得拆散进段流
+        assertEquals(List.of(
+                "10/30", "9/25", "5/20", "7/15", "8/13", "1/10", "3/8", "2/5", "4/2", "6/null"),
+                rows("SELECT ID, TS FROM T7 ORDER BY TS DESC"));
+        // 显式 NULLS FIRST：NULL 新像整体排在最前
+        assertEquals(List.of(
+                "6/null", "10/30", "9/25", "5/20", "7/15", "8/13", "1/10", "3/8", "2/5", "4/2"),
+                rows("SELECT ID, TS FROM T7 ORDER BY TS DESC NULLS FIRST"));
+        assertTrue(omapStore("T7").getOrderedStreamingClaims() >= 2,
+                "NULL 只出现在 delta 新像时两条查询都应命中流式下推");
     }
 
     // ------------------------------------------------------------------
