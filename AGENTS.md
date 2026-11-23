@@ -24,6 +24,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | 构建 | `mvn -B -q package`；`maven-shade-plugin` 产出单 Jar `target/h2omap-0.1.0-SNAPSHOT.jar`，其中已排除被替换的 H2 同名类 |
 | 测试 | `mvn -B test`；一次性运行 Gradle 时加 `--no-daemon`（本仓库用 Maven） |
 | 性能测试 | 不对原版 H2（`ENGINE "org.h2.mvstore.db.Store"`）做耗时测量。H2 自身的执行缺陷（关联子查询不做去关联化、派生表被编译成参数化视图等）会让这类测量跑到小时级甚至无法结束，得不出可用数据。MVStore 只用作**结果正确性**的对照：契约与规模用例里的 `T_MV` 表用于逐行比对，不记录耗时；需要性能数字时只测 OMAP 侧，并与历史 OMAP 数字对照 |
+| 性能目标 | 面向 OLAP：接受最快查询场景的适度放宽（如原 10 ms 级的查询增至几百 ms 可接受），优先把最慢场景的耗时与 IO 压到尽可能低（逐出段全表扫描、大规模排序与聚合、冷段读盘等）。优化提案与取舍判断都以这个目标为准：不为快场景微调而牺牲慢场景，慢场景的收益可以用快场景的开销换取 |
 | JDK | 构建与运行用 JDK 21.0.11；字节码目标 `maven.compiler.release=17` |
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变）。被替换的 8 个 H2 类按该版本源码合入，升级时必须逐类重新比对 |
 | 依赖 | 运行期只有 `com.h2database:h2`，测试用 `junit-jupiter`，构建期插件 `maven-shade-plugin` |
