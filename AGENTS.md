@@ -28,7 +28,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变）。被替换的 8 个 H2 类按该版本源码合入，升级时必须逐类重新比对 |
 | 依赖 | 运行期只有 `com.h2database:h2`，测试用 `junit-jupiter`，构建期插件 `maven-shade-plugin` |
 | 测试口径 | 新增测试不建 `T_MV` MVStore 对照表，用例内预置期望值直接断言；既有含 MVStore 对照的用例保持不动，MVStore 仅保留结果正确性对照用途 |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（101 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（24 个用例）、`src/test/java/com/hyd/h2omap/storage/SegmentFileFormatTest.java`（10 个用例）、`src/test/java/com/hyd/h2omap/persistence/SegmentUpgradeTest.java`（6 个用例：v2→v3 升级、幂等重入、损坏文件拒绝开库）、`src/test/java/com/hyd/h2omap/persistence/ValueCodecTest.java`（3 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（103 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（24 个用例）、`src/test/java/com/hyd/h2omap/storage/SegmentFileFormatTest.java`（10 个用例）、`src/test/java/com/hyd/h2omap/persistence/SegmentUpgradeTest.java`（6 个用例：v2→v3 升级、幂等重入、损坏文件拒绝开库）、`src/test/java/com/hyd/h2omap/persistence/ValueCodecTest.java`（3 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/`。该目录可能不存在（已排除在版本控制之外）。Maven Central 的 `h2-2.5.252-sources.jar` 内容等价，但个别文件与该 zip 相差数行，核对行号时以 zip 为准 |
 | 临时目录 | 一次性脚本、探针程序与中间产物统一放 `.tmp/`（已在 `.gitignore` 排除，不进版本控制），任务收尾时清空；不再用 `target/dbg/` 或系统临时目录存放本仓库的调试产物 |
 | 文件规模 | 新增或重构的生产类控制在单次文件读取窗口内（约 1200 行 / 45 KB，源自我代理工具的读取上限），超出时按职责拆分；拆分提交只做纯搬移（包声明、可见性、import、限定名），不得顺带改逻辑，验收是全部判定用例与用例计数不变。判定依据：超限文件只能分段读取，分段读会丢失锁契约等跨段不变量的上下文，是代理误判的主要来源 |
@@ -73,7 +73,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | `org.h2.expression.condition.Comparison` | 只新增一个 `public int getCompareType()`，供 `VectorizedFilter` 读取比较类型 |
 | `org.h2.expression.condition.ConditionInQuery` | 按 `2.5.252` 源码逐字合入，末尾新增 `getLeft()`、`isNot()`、`isAll()`、`getCompareType()` 四个访问器，供 `SubqueryFold` 读取 `IN (SELECT)` 谓词的成员 |
 | `org.h2.engine.DbSettings` | 按 `2.5.252` 源码逐字合入，加两处：构造器末尾把 `DEFAULT_TABLE_ENGINE` 的展示值写成 `com.hyd.h2omap.engine.OmapTableEngine`（`defaultTableEngine` 字段仍为 `null`，`Schema.createTable` 用它判断默认引擎路径，改的只是 `INFORMATION_SCHEMA.SETTINGS` 读的那张 map；`MV_STORE` 不动，H2 元数据确实在 MVStore 里）；新增 `public final boolean omapLazyLoad = get("OMAP_LAZY_LOAD", false)`，由服务端系统属性 `-Dh2.omapLazyLoad=true` 打开（连接串参数 `;OMAP_LAZY_LOAD=TRUE` 会被 H2 以 `Unsupported connection setting` 拒绝），库打开时读一次。开关打开后 `recover()` 只登记段的 id、generation 与骨架元数据，段内容由加载线程池逐段读入 |
-| `org.h2.command.Parser` | 按 `2.5.252` 源码逐字合入，只改两处：`parseAlterTable()` 的 `SET` 分支先认 `RESIDENT_BYTES` 关键字就交给 `parseAlterTableSetResidentBytes()`（构造 `com.hyd.h2omap.command.OmapAlterTableSetResidentBytes`），否则保持 `parseAlterTableSet()` 原语义；`parseSet()` 的名字链头部认 `OMAP_SLICE_CACHE_BYTES` 关键字，构造 `com.hyd.h2omap.command.OmapSetOmapSliceCacheBytes`，其余 SET 名保持原语义。其余全部逐字保留。`ParserBase` 不替换 |
+| `org.h2.command.Parser` | 按 `2.5.252` 源码逐字合入，只改一处：`parseSet()` 的名字链头部先认 `OMAP_RESIDENT_BYTES` 与 `OMAP_SLICE_CACHE_BYTES` 两个关键字，分别构造 `com.hyd.h2omap.command.OmapSetOmapResidentBytes` 与 `com.hyd.h2omap.command.OmapSetOmapSliceCacheBytes`，其余 SET 名保持原语义。`parseAlterTable()` 不改动、与上游一致。其余全部逐字保留。`ParserBase` 不替换 |
 | `org.h2.command.Command` | 按 `2.5.252` 源码逐字合入，只在 `executeQuery()` 外包一对 `QueryIoStats.begin()/end()`，把一次查询（含其内部子命令）的段文件读取归到同一组。所有语句类型（`Statement` 与 `PreparedStatement`）都经过这里 |
 | `org.h2.jdbc.JdbcStatement` | 按 `2.5.252` 源码逐字合入，改 `getMoreResults()`：取走本次查询的统计后返回一个六列结果集（`SEGMENT_ID`、`GENERATION`、`COLUMNS`、`DATA_BYTES`、`FOOTER_BYTES`、`IO_READS`），没有统计时维持原来的 `false`；另加 public `getLastQueryIoStats()` 供强转后直接拿结构化明细。`JdbcResultSet` 是 final，无法派生专用子类，所以统计以普通结果集的行承载 |
 
@@ -87,7 +87,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 
 升级 H2 时必须重做：
 
-1. 按上表逐类重新比对替换点，确认上游没有改名、没有改变控制流、没有挪动 `vectorized` 标志要跳过的语句；`Parser` 只需比对 `parseAlterTable()` 的 SET 分支与新增方法周边，其余逐字合入。
+1. 按上表逐类重新比对替换点，确认上游没有改名、没有改变控制流、没有挪动 `vectorized` 标志要跳过的语句；`Parser` 只需比对 `parseSet()` 名字链头部两个 `OMAP_*` 分支周边，其余逐字合入。
 2. `Comparison.getCompareType()` 若上游已公开，删除本项目的 `Comparison.java`，同步 `pom.xml` 的排除清单；`ConditionInQuery` 的四个访问器同理。
 3. 复核 `Table`、`Index`、`Cursor` 的抽象方法集合，以及 `CreateTableData` 的构造器与所在包。
 4. 复核 `pom.xml` 的 shade 排除清单与替换类一一对应；漏掉内部类会留下同一个类的两个版本。
@@ -148,7 +148,7 @@ delta rowset（Merge-on-Read 批次 2）：更新新像不再按行存放（`Map
 
 段级部分聚合缓存（Merge-on-Read 批次 3）：`SegmentAggCache` 按「查询签名 × 段」缓存部分聚合结果，无分组时是 `AggState[]`、单列分组时是 `Map<Value, AggState[]>`。签名 = 过滤树语义签名（各谓词节点的列、比较、常量、集合内容）+ 分组键列 + 每个聚合的类型/列/算术口径/结果类型；`COUNT(DISTINCT)`、多列分组与含子查询预计算的谓词不参与。失效坐标是「段的 generation + 该段的 delta 屏蔽位版本」：合并会换 generation，未回写删除与更新新像的每次变化都递增 `DeltaStore` 的段版本；跨段写因此只使被改动的段失效，其余段在下一轮同签名聚合中直接合并缓存的部分结果（40 万行实测 26 ms → 1-2 ms）。合并部分结果时绝不与缓存对象按引用共享：`groups` 里的状态随后还会被 delta/开放段行累加，共享会污染缓存。分组部分结果基数超过 4096 不缓存；签名数量上限 64（访问序淘汰）。
 
-段级逐出（Merge-on-Read 批次 4）：表级 WITH 参数 `residentBytes` 给出冻结段驻留堆的估算字节数预算（纯数字按字节，可跟后缀 k/m/g，不区分大小写，按 1024 换算，如 8g；非法后缀建表即报错），默认 0 不逐出；仅文件模式库生效（内存库无段文件可读回，不逐出）。预算可随时用 `ALTER TABLE [IF EXISTS] t SET RESIDENT_BYTES '40k'` 修改（`=` 可选，值解析与建表参数共用同一 `parseByteSize`；非 OMAP 表、非法后缀、NULL 值报 SQL 错误）：调小立即在写锁内逐出到新预算，调大不重启预载、由后续查询自然填驻留（预算变化不改变数据，H2 结果缓存对重复查询仍直接命中）。修改同步进 H2 目录的建表 SQL，重开库按新值生效：`CreateTableData.tableEngineParams` 是 public 字段、与 `TableBase` 私有字段同一个 `ArrayList` 实例，改写该条目后调 `database.updateMeta` 重写目录行（`MetaRecord` 经 `getCreateSQLForMeta` 重新渲染）；建表时没有 WITH 子句的表该列表不可变，由 `OmapTable` 覆写 `getCreateSQL`/`getCreateSQLForMeta` 在末尾追加 WITH 子句。逐出后段仍可见、只是慢：行数、已删行数、删除位图与每列 zone map 留在堆上的骨架里，行号级读路径（行迭代器、`collectVisibleRowIds`、可见性判定、全删段丢弃）全部走骨架；需要段内容的读路径先把段同步读回——点查在 `materialize` 前、合并第一阶段在归组前；批量行读与向量化快照不预读，改为推进到当前段/首次读列时按需读回（行式批量读复用驻留通道，向量化走临时切片读，见「逐出段的部分列读」）。逐出顺序按段级 LRU：从未被查询访问的段按段号老优先，访问过的按访问序，与数据写入顺序无关，时间滚动场景自然退化为逐出最老段。预算小于查询工作集时批量行读的读回可能被后续读回逐出，退回「读一份仅供本次使用」的临时读、不回写驻留状态；预算连单个段都容不下时（如 residentBytes=1）所有段保持逐出，点查与批量路径退回临时读，向量化路径的逐出段恒走临时切片读、不进驻留模型，行仍完整可见。逐出检查在段冻结的 checkpoint 之后、合并收尾与恢复收尾触发，读回后的段拥有最新访问序号，不会被紧接着的预算逐出先选中。重开库时恢复收尾把驻留裁回预算；骨架元数据随 manifest（v2）持久化，惰性加载与逐出同时开启时，重开后全部段立即可见可剪枝，预载只填预算内的内容（见「惰性加载」一节）。回归防线是「随机散布写压力用例」：随机 UPDATE/DELETE/INSERT 散布全部段，每轮与 MVStore 逐查询比对，并断言无写的第二遍命中段级部分聚合缓存，防止后续机制窄化到「只改最老几段」的滚动场景。
+段级逐出（Merge-on-Read 批次 4）：驻留预算是数据库级共享账本（`ResidentBudget`，按 `Database` 维护），给出冻结段驻留堆的估算字节数总预算，默认 0 不逐出；仅文件模式库生效（内存库无段文件可读回，不逐出）。配置命令是 `SET OMAP_RESIDENT_BYTES '8g'`（等号可选，纯数字按字节，可跟后缀 k/m/g 不区分大小写按 1024 换算，允许 0 = 关闭，无下限，需 admin）：值持久化进 H2 目录的 `Setting`，重开库重放后生效，重放之后建的表在构造时读同一值；调小立即在各表自己的写锁内再平衡逐出，调大不重启预载、由后续查询自然填驻留。逐出判定在各表自己的写锁内、只能逐本表的段，因此预算是软上限：一张长期无写入的冷表持量不会被热表逐出动作清掉（超出量以冷表持量为上界）。全局占用是无锁 `AtomicLong` 账本，各表写锁内经 `residentAdd` 统一入口增量维护（冻结、发布、读回、合并、逐出、摘除、truncate、注销）；账本求和不得逐个加其他表的锁，跨表锁序会死锁（两表并发发布已实证）。旧目录里的表级 `WITH "residentBytes=..."` 参数保留解析但被忽略（非法后缀仍建表报错），以免现网目录重放拒绝开库；`ALTER TABLE SET RESIDENT_BYTES` 命令已删除。逐出后段仍可见、只是慢：行数、已删行数、删除位图与每列 zone map 留在堆上的骨架里，行号级读路径（行迭代器、`collectVisibleRowIds`、可见性判定、全删段丢弃）全部走骨架；需要段内容的读路径先把段同步读回——点查在 `materialize` 前、合并第一阶段在归组前；批量行读与向量化快照不预读，改为推进到当前段/首次读列时按需读回（行式批量读复用驻留通道，向量化走临时切片读，见「逐出段的部分列读」）。逐出顺序按段级 LRU：从未被查询访问的段按段号老优先，访问过的按访问序，与数据写入顺序无关，时间滚动场景自然退化为逐出最老段。预算小于查询工作集时批量行读的读回可能被后续读回逐出，退回「读一份仅供本次使用」的临时读、不回写驻留状态；预算连单个段都容不下时（如 SET OMAP_RESIDENT_BYTES '1'）所有段保持逐出，点查与批量路径退回临时读，向量化路径的逐出段恒走临时切片读、不进驻留模型，行仍完整可见。逐出检查在段冻结的 checkpoint 之后、合并收尾与恢复收尾触发，读回后的段拥有最新访问序号，不会被紧接着的预算逐出先选中。重开库时恢复收尾把驻留裁回预算；骨架元数据随 manifest（v2）持久化，惰性加载与逐出同时开启时，重开后全部段立即可见可剪枝，预载只填预算内的内容（见「惰性加载」一节）。回归防线是「随机散布写压力用例」：随机 UPDATE/DELETE/INSERT 散布全部段，每轮与 MVStore 逐查询比对，并断言无写的第二遍命中段级部分聚合缓存，防止后续机制窄化到「只改最老几段」的滚动场景。
 
 ## 向量化执行
 
@@ -216,7 +216,7 @@ manifest 与段文件当前为 v3 格式（manifest 魔数 OMAPR、段文件魔�
 
 开关打开时，`recover()` 只读 `manifest.dat` 登记每段的 id、generation 与骨架元数据，段文件不读，随后 `ColumnarStore.startLazyLoading()` 在 `OmapPersistence.LOAD_CONCURRENCY`（固定 4，代码常量、无对外参数）的共享加载线程池上按段号**倒序**加载：4 个工人线程共享一个递减游标，段号与写入顺序同向，最近写入的数据最先驻留；非惰性恢复同样经该线程池并行读回全部段，任一段读失败按段序号最小者抛出。实测 800 个段 4 万行：开库 328 → 198 ms。
 
-可见性口径：骨架随 manifest 恢复后，**未加载段对全部读路径整体可见且可剪枝**——行数（骨架行数减已删行数）、删除位图与每列 zone map 都在堆上，开库第一次 `COUNT(*)` 就是全量；需要段内容的读路径（点查 `materialize`、批量 `nextBatch`、向量化快照、合并归组）按需读回。无持久化的内存库没有 manifest，未加载段整体不参与，`publishLoaded` 发布时才计入行数与递增 modificationId。预载与驻留预算（`residentBytes`）同时开启时，预载在两个条件下停止：取段前驻留量已达预算即停；本次发布触发了任何预算逐出即停（并发下预算边界最多多读「并发数 - 1」个装不下的段，此后零无效读；终驻留集与顺序预载一致，逐出永远选已加载段中 id 最小者）。全表聚合会把驻留集滚动到最近触碰的段，目标查询只读回骨架 zone map 相交的段。
+可见性口径：骨架随 manifest 恢复后，**未加载段对全部读路径整体可见且可剪枝**——行数（骨架行数减已删行数）、删除位图与每列 zone map 都在堆上，开库第一次 `COUNT(*)` 就是全量；需要段内容的读路径（点查 `materialize`、批量 `nextBatch`、向量化快照、合并归组）按需读回。无持久化的内存库没有 manifest，未加载段整体不参与，`publishLoaded` 发布时才计入行数与递增 modificationId。预载与驻留预算同时开启时，预载在两个条件下停止（预算判定读库级共享账本）：取段前全库驻留量已达预算即停；本次发布触发了任何预算逐出即停（并发下预算边界最多多读「并发数 - 1」个装不下的段，此后零无效读；终驻留集与顺序预载一致，逐出永远选已加载段中 id 最小者）。全表聚合会把驻留集滚动到最近触碰的段，目标查询只读回骨架 zone map 相交的段。
 
 三处配套规则：
 
@@ -257,12 +257,12 @@ manifest 与段文件当前为 v3 格式（manifest 魔数 OMAPR、段文件魔�
 | --- | --- |
 | 开关与预算 | 数据库全局变量 `SET OMAP_SLICE_CACHE_BYTES '64m'`（等号可选），值是带单位的数字：纯数字按字节，可跟后缀 k/m/g（不区分大小写，按 1024 换算），带后缀时写成字符串字面量；默认与下限均为 32 MiB（32768k），更小值与 NULL 报 Invalid value，即缓存不可关闭、不可低于 32 MiB。需要 admin 权限。值以规范化字节数存进 H2 目录的 `Setting`（`INFORMATION_SCHEMA.SETTINGS` 可查），重开库重放 `SET` 后仍生效，重放之后建的表在构造时从目录读同一值 |
 | 生效范围 | 库内全部 OMAP 表：`SET` 时对已存在的表立即下推新预算，每个表的切片缓存各自持有该预算（多表时总占用为预算 × 表数） |
-| 预算调整 | 调小立即按 LRU 淘汰到新一档；调大不主动预载，由后续查询自然填入缓存（与 `residentBytes` 语义对称） |
+| 预算调整 | 调小立即按 LRU 淘汰到新一档；调大不主动预载，由后续查询自然填入缓存（与全局驻留预算语义对称） |
 | 缓存对象 | 段列切片（`ColumnSlice`：列向量 + zone map + 行数 + 删除位图），不是查询结果 |
 | 缓存键 | `(段号, 代数, 列集位掩码)`；列 id ≥ 64 时 `maskOf` 返回 `Long.MIN_VALUE`，该请求不参与缓存 |
 | 失效坐标 | 只有 generation。冻结段内容在合并前不可变，delta 的未回写删除与更新新像不在切片内（可见性判定另走 delta），因此 delta 变化不影响正确性。合并、全删段摘除、`truncate` 都会清掉该段号的全部条目 |
 | 淘汰 | 字节预算 + LRU（`LinkedHashMap` 访问序）；单个切片就超预算时不放入，避免插入即淘汰自身 |
-| 与驻留的关系 | 相互独立：不计入 `residentBytes` 预算、不参与逐出、不触发逐出；驻留段走内存，逐出段走本缓存 |
+| 与驻留的关系 | 相互独立：不计入全局驻留预算、不参与逐出、不触发逐出；驻留段走内存，逐出段走本缓存 |
 | 并发 | 全部方法同步在同一个锁上；取出的切片其向量与删除位图只读，可跨线程共享 |
 
 收益取决于查询形态：全表扫描类查询的读只占总耗时一小部分（实测同一查询段驻留后 1098 → 1032 ms，约 6%），宽窗口有序扫描类查询读几乎就是全部（实测 48 → 4 ms，约 90%）。判定用例：`SegmentFileFormatTest.sliceCacheServesRepeatReadsOfEvictedSegment`（重复读命中、IO 归零、同一向量实例）、`sliceCacheInvalidatesWhenSegmentIsCompacted`（合并换代后旧条目清除）、`sliceCacheBudgetShrinkEvictsImmediately`（调小立即 LRU 淘汰），契约用例 `OmapTableContractTest.setOmapSliceCacheBytesIsGlobalWithLowerBoundAndPersists`（默认 32 MiB、下限拒绝、目录持久化与重开生效）。
@@ -323,11 +323,11 @@ manifest 与段文件当前为 v3 格式（manifest 魔数 OMAPR、段文件魔�
 
 ```
 src/main/java/com/hyd/h2omap/
-├── command/       ALTER TABLE SET RESIDENT_BYTES 与 SET OMAP_SLICE_CACHE_BYTES 命令
+├── command/       SET OMAP_RESIDENT_BYTES 与 SET OMAP_SLICE_CACHE_BYTES 命令
 ├── engine/        接入 H2：TableEngine 与 WITH 参数
 ├── table/         OmapTable，继承 TableBase
 ├── index/         扫描索引、rowId 索引、游标
-├── storage/       列段、开放段缓冲、delta、rowId 编码、延迟行、部分列读的列切片与占位列向量；段内行迭代器独立成文件 SegmentRowIterator，向量化快照的顶层记录 VectorizedSnapshot、极值结果 ExtremeValue 与快照构建器 SnapshotQuery；后台段加载与发布 SegmentLoader；检查点与开库恢复 StorePersistence；逐出段列切片缓存 SliceCache（预算由全局 SET OMAP_SLICE_CACHE_BYTES 配置，默认 32 MiB）
+├── storage/       列段、开放段缓冲、delta、rowId 编码、延迟行、部分列读的列切片与占位列向量；段内行迭代器独立成文件 SegmentRowIterator，向量化快照的顶层记录 VectorizedSnapshot、极值结果 ExtremeValue 与快照构建器 SnapshotQuery；后台段加载与发布 SegmentLoader；检查点与开库恢复 StorePersistence；跨表驻共享账本 ResidentBudget（按 Database 经 OmapResidentBudgets 维护）；逐出段列切片缓存 SliceCache（预算由全局 SET OMAP_SLICE_CACHE_BYTES 配置，默认 32 MiB）
 ├── persistence/   WAL 增量日志、增量列段快照与重启恢复
 ├── vector/        列向量（含字典向量、数组列与 CLOB 打包）、ValueVector 回退、null 位图
 ├── vectorized/    单表过滤与聚合下推：谓词编译入口 VectorizedFilter（含过滤树编译与区间/签名工具），各谓词节点独立成文件 AndNode/OrNode/ColCmpNode/ArithLongCmpNode/InNode/NullCheckNode/CardinalityCmpNode/ArrayContainsNode/LikeNode 与原始 long 集合 LongSet；子查询折叠（SubqueryFold 入口 + SubqueryInner + CorrelatedAggFold/CorrelatedInFold/CorrelatedExistsFold）；执行入口 OmapVectorizedExecutor（facade，含共用快照管线）+ FlatExecutor/OrderedExecutor/GroupExecutor；聚合口径 AggSpec、累加器 AggState、HAVING 编译 HavingPredicates；段级部分聚合缓存（SegmentAggCache）
@@ -335,7 +335,7 @@ src/main/java/com/hyd/h2omap/
 
 src/main/java/org/h2/                     被替换的 H2 类与访问桥
 ├── command/Command.java                      替换：查询期 IO 统计的归组边界
-├── command/Parser.java                       替换：ALTER TABLE SET RESIDENT_BYTES 与 SET OMAP_SLICE_CACHE_BYTES 语法入口
+├── command/Parser.java                       替换：SET OMAP_RESIDENT_BYTES 与 SET OMAP_SLICE_CACHE_BYTES 语法入口
 ├── command/query/Select.java                 替换：向量化下推入口
 ├── engine/DbSettings.java                     替换：默认引擎展示值与 omapLazyLoad 开关
 ├── jdbc/JdbcStatement.java                   替换：getMoreResults() 返回 IO 统计结果集
@@ -368,7 +368,7 @@ src/test/java/com/hyd/h2omap/
 
 ### residentBytes 驻留预算测试环境（本机）
 
-一键重建：`./scripts/resident-env.sh`。数据目录默认 `/Volumes/Yotta/Temp/h2omap`（本机 SSD APFS 卷），可用 `OMAP_RESIDENT_DATA_DIR`、`OMAP_RESIDENT_ROWS`（默认 900 万）、`OMAP_RESIDENT_BUDGET`（默认 `100m`）、`OMAP_RESIDENT_XMX`（默认 `8g`）覆盖。流程：生成 900 万行 10 列表 `T`（文件库 `benchdb`，磁盘约 1 GB、139 个段）→ `ALTER TABLE T SET RESIDENT_BYTES '100m'` 设 100 MiB 驻留预算 → 校验行数与 H2 目录里的 `WITH "residentBytes=104857600"`。重建耗时约 5 分钟（含 `benchSetup` 的双插与收尾查询）；脚本重置时会删除 `benchdb*` 全部文件（含 `.trace.db`）。
+一键重建：`./scripts/resident-env.sh`（驻留预算已改库级 SET OMAP_RESIDENT_BYTES）。数据目录默认 `/Volumes/Yotta/Temp/h2omap`（本机 SSD APFS 卷），可用 `OMAP_RESIDENT_DATA_DIR`、`OMAP_RESIDENT_ROWS`（默认 900 万）、`OMAP_RESIDENT_BUDGET`（默认 `100m`）、`OMAP_RESIDENT_XMX`（默认 `8g`）覆盖。流程：生成 900 万行 10 列表 `T`（文件库 `benchdb`，磁盘约 1 GB、139 个段）→ `SET OMAP_RESIDENT_BYTES '100m'` 设 100 MiB 库级驻留预算 → 校验行数与 `INFORMATION_SCHEMA.SETTINGS` 里的 `OMAP_RESIDENT_BYTES` 值。重建耗时约 5 分钟（含 `benchSetup` 的双插与收尾查询）；脚本重置时会删除 `benchdb*` 全部文件（含 `.trace.db`）。
 
 实测口径（Apple M4、900 万行）：开库 7–10 s，瓶颈不是磁盘——1 GB 段文件由 4 线程并行读只占零点几秒，大头是 `ID BIGINT PRIMARY KEY` 的 rowId 索引回填（900 万次 `ConcurrentSkipListMap.put` 串行，约 1 µs/行）；`COUNT(*)` 走骨架零段读（≤5 ms）；冷 `SUM(INT_COL)` 按列目录只读约 36 MB 列切片（13–19 ms）；二次 `SUM` 命中段级聚合缓存（0 ms）；开库后驻留 100,382,915 B ≤ 预算，逐出后 8 项聚合签名与逐出前一致。进程堆约 1.8 GB，其中段内容 100 MB，大头是主键索引（约 1 GB）与 JVM/H2 开销：`residentBytes` 只管冻结段内容，不管索引。
 
@@ -378,7 +378,7 @@ src/test/java/com/hyd/h2omap/
 
 ## 当前状态与后续阶段
 
-M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成，M12（Merge-on-Read 与冷热分层）四个批次全部交付；M13（CLOB 打包存储，方案 B2）已完成；M14（段文件尾部列目录重设计，P2）、M15（裸 MIN/MAX 定界与逐出段部分列读，A+P3）、M16（快照按段懒加载与大块 I/O）、M17（并行段加载，P1）、M18（查询期段文件 IO 统计与在途读合并）、M19（逐出段列切片缓存）、M20（无 LIMIT 的 ORDER BY 有序流式执行）与 M21（磁盘格式 v3、启动自动升级与有序流式 claim 门控放宽）已完成。判定依据为 97 个契约用例、33 个存储层用例（ColumnarStoreTest 24 + SegmentFileFormatTest 9）、6 个 SegmentUpgradeTest 升级用例、3 个编码用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
+M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成，M12（Merge-on-Read 与冷热分层）四个批次全部交付；M13（CLOB 打包存储，方案 B2）已完成；M14（段文件尾部列目录重设计，P2）、M15（裸 MIN/MAX 定界与逐出段部分列读，A+P3）、M16（快照按段懒加载与大块 I/O）、M17（并行段加载，P1）、M18（查询期段文件 IO 统计与在途读合并）、M19（逐出段列切片缓存）、M20（无 LIMIT 的 ORDER BY 有序流式执行）与 M21（磁盘格式 v3、启动自动升级与有序流式 claim 门控放宽）已完成。判定依据为 103 个契约用例、34 个存储层用例（ColumnarStoreTest 24 + SegmentFileFormatTest 10）、6 个 SegmentUpgradeTest 升级用例、3 个编码用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
 
 阶段编号按提出顺序，M7、M8 的实际交付早于 M6。
 
@@ -396,7 +396,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 | M9 数组列列式存储 | 段内数组列拆成「前缀和下标数组 + 元素列」，`CARDINALITY` 退化为整数减法；段快照新增 `VEC_ARRAY` | 完成 |
 | M10 子查询下推 | `WHERE` 里的子查询谓词折进向量化过滤：不相关标量子查询/EXISTS 常量化、`IN (SELECT)` 集合化、关联标量聚合预计算、关联 EXISTS 半连接 | 完成 |
 | M11 段级剪枝与有序 LIMIT | 向量化快照按过滤条件给出的列值区间跳过不相交的段；`ORDER BY` 单列加 `LIMIT` 时按段边界排序扫描、用堆取前 N 行并整段早停 | 完成 |
-| M12 Merge-on-Read 与冷热分层 | 参考 Doris/ClickHouse 的 MOR 机制支撑跨段写与冷热分层。批次 1：删除标记常驻为段级位图、全删段整体丢弃、纯删除段恢复剪枝。批次 2：更新新像移入带列向量与 zone map 的 delta rowset。批次 3：按「查询签名 × 段」的部分聚合缓存。批次 4：residentBytes 驻留预算 + 段级 LRU 逐出与同步读回 | 完成 |
+| M12 Merge-on-Read 与冷热分层 | 参考 Doris/ClickHouse 的 MOR 机制支撑跨段写与冷热分层。批次 1：删除标记常驻为段级位图、全删段整体丢弃、纯删除段恢复剪枝。批次 2：更新新像移入带列向量与 zone map 的 delta rowset。批次 3：按「查询签名 × 段」的部分聚合缓存。批次 4：驻留预算 + 段级 LRU 逐出与同步读回（预算已从表级 WITH 参数改为库级共享 SET OMAP_RESIDENT_BYTES） | 完成 |
 | M13 CLOB 打包存储 | 方案 B2：段内 CLOB 列复用「字节池 + 偏移」机制（ClobVector），装箱时才切出 ValueClob，消掉逐值对象开销；内容仍驻堆、不读盘，谓词语义不变；段文件新增 VEC_CLOB，旧段 VEC_VALUE 读路径不变 | 完成 |
 | M14 段文件尾部列目录 | 段文件重设计：头部记目录偏移，列块顺序存放，尾部目录存每列偏移/长度/zone map；全量读免重算、部分列读返回不进驻留模型的 ColumnSlice；manifest 与段文件单一 v2 格式，旧 v1 回退删除，旧数据靠重新灌入 | 完成 |
 | M15 逐出段读优化 | A：裸 MIN/MAX 按骨架 zone map 迭代定界，候选段按边界排序、命中即停，逐出段只读目标列；P3：向量化快照命中逐出段时按列目录只读所需列集，临时 ColumnSlice 不进驻留模型 | 完成 |
@@ -427,7 +427,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - 预载的停止条件（取段前驻留量达预算即停、本次发布触发任何预算逐出即停）是内容寻址的：不依赖段号顺序，预算内的新段照常预载，预算外只在并发窗口内多读「并发数 - 1」个装不下的段，老段等查询命中时带访问标记读回；并发发布下「自己发布的段被逐出」不再可靠，停止信号取发布路径在写锁内观测到的任意逐出。
 - 裸 MIN/MAX 的定界用按 zone 边界升序扫描候选段、命中即停的迭代法，而不是一次取全局最优边界，因为候选段内最优值所在行可能已被删除、一次性全局边界会算错，迭代法在任何删除形态下都精确。
 - 向量化查询命中逐出段时按段文件列目录只读所需列集，返回不进驻留模型的临时 `ColumnSlice`，不再整段读回驻留，预算稳态不被冷查询搅动；行式路径不受此影响，仍读回并驻留。
-- `residentBytes` 的运行时修改用 `ALTER TABLE ... SET RESIDENT_BYTES`（关键字形态，扩展 H2 既有 `ALTER TABLE SET` 语句族，需要替换 `Parser`）并持久化进 H2 目录：`CreateTableData.tableEngineParams` 是 public 字段且与 `TableBase` 私有字段共享同一个 `ArrayList`，改写条目后 `database.updateMeta` 经 `getCreateSQLForMeta` 重新渲染目录行，重开库即按新值生效；建表时没有 WITH 子句的表该列表不可变，由 `OmapTable` 覆写 `getCreateSQL`/`getCreateSQLForMeta` 在末尾追加 WITH 子句。预载只在启动时执行，预算调大不重启预载线程，由后续查询自然填驻留。
+- 驻留预算是库级共享账本而非表级 WITH 参数：`SET OMAP_RESIDENT_BYTES` 的值持久化进 H2 目录 `Setting`，建表时经 `OmapResidentBudgets` 读同一值，重放之后建的表共享同一预算；逐出判定在各表自己的写锁内只能逐本表的段，预算因此是软上限（超出量以长期无写入的冷表持量为上界，硬上限需要跨表锁或后台线程，违反现有约定）。全局占用是无锁 `AtomicLong` 账本、各表写锁内经 `residentAdd` 统一入口增量维护：账本求和不得逐个加其他表的锁，跨表锁序在两表并发发布下死锁（已实证并被「共享预算多表预载」用例覆盖）。旧目录里的表级 `WITH "residentBytes=..."` 保留解析但忽略，`ALTER TABLE SET RESIDENT_BYTES` 命令与 `Parser` 对应分支删除（缩小 H2 升级比对面）。预载只在启动时执行，预算调大不重启预载线程，由后续查询自然填驻留。
 - 冻结同步在 `append` 的写锁内完成，不交给后台线程。
 - 合并采用「就地写回」而不是「写新段」：段内保留删除位图，delta 的新值写回列向量，rowId 全程不变，因此不需要段集合快照与引用计数。
 - 合并分两阶段：写锁内按段归组 delta 改动并记下段引用，锁外 `applyDelta` 生成新段（Copy-On-Compact，先前取到的迭代器仍读旧段），写锁内替换段引用并按「rowId 加值」双重比对移除 delta 条目。

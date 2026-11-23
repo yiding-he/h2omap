@@ -3,7 +3,7 @@ set -euo pipefail
 
 # 重建 residentBytes 驻留预算测试环境：
 #   文件库 <数据目录>/benchdb，900 万行 10 列表 T（磁盘约 1 GB），
-#   生成后 ALTER TABLE SET RESIDENT_BYTES '100m'，驻留预算 100 MiB 并持久化。
+#   生成后 SET OMAP_RESIDENT_BYTES '100m'（数据库全局驻留预算），重开库重放后生效。
 #
 # 可用环境变量覆盖：OMAP_RESIDENT_ROWS / OMAP_RESIDENT_BUDGET / OMAP_RESIDENT_DATA_DIR / OMAP_RESIDENT_XMX
 # 用法：./scripts/resident-env.sh
@@ -31,23 +31,24 @@ java -Xmx"$XMX" -cp "${MAIN_JAR}:target/test-classes" \
 
 echo "[4/4] Setting resident budget ${BUDGET} and verifying..."
 java -Xmx"$XMX" -cp "$MAIN_JAR" org.h2.tools.Shell -url "$DB_URL" -user sa \
-    -sql "ALTER TABLE T SET RESIDENT_BYTES '${BUDGET}'"
+    -sql "SET OMAP_RESIDENT_BYTES '${BUDGET}'"
 
 COUNT="$(java -Xmx"$XMX" -cp "$MAIN_JAR" org.h2.tools.Shell -url "$DB_URL" -user sa \
     -sql 'SELECT COUNT(*) FROM T' 2>&1 | awk '/^[0-9]+$/{print; exit}')"
-WITH_LINE="$(java -Xmx"$XMX" -cp "$MAIN_JAR" org.h2.tools.Shell -url "$DB_URL" -user sa \
-    -sql 'SCRIPT NODATA TABLE T' 2>&1 | grep 'residentBytes=' | head -1 | sed 's/^ *//')"
+SETTING_LINE="$(java -Xmx"$XMX" -cp "$MAIN_JAR" org.h2.tools.Shell -url "$DB_URL" -user sa \
+    -sql "SELECT SETTING_VALUE FROM INFORMATION_SCHEMA.SETTINGS WHERE SETTING_NAME = 'OMAP_RESIDENT_BYTES'" \
+    2>&1 | awk '/^[0-9]+$/{print; exit}')"
 SIZE="$(du -sh "${DATA_DIR}/benchdb.omap" | cut -f1)"
 
 echo "--- verify rows=${COUNT} expected=${ROWS}"
-echo "--- verify catalog: ${WITH_LINE}"
+echo "--- verify catalog setting OMAP_RESIDENT_BYTES: ${SETTING_LINE}"
 echo "--- data dir size: ${SIZE}"
 if [[ "$COUNT" != "$ROWS" ]]; then
     echo "ERROR: row count ${COUNT} != ${ROWS}" >&2
     exit 1
 fi
-if [[ "$WITH_LINE" != *"residentBytes="* ]]; then
-    echo "ERROR: residentBytes not persisted in catalog" >&2
+if [[ -z "$SETTING_LINE" ]]; then
+    echo "ERROR: OMAP_RESIDENT_BYTES not persisted in catalog" >&2
     exit 1
 fi
 
