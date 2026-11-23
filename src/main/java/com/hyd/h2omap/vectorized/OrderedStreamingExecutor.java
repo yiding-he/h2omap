@@ -62,6 +62,56 @@ final class OrderedStreamingExecutor {
             SessionLocal session, TableFilter tableFilter, Expression condition,
             List<Expression> expressions, int resultColumnCount, long offset,
             SortOrder sortOrder) {
+        Prepared p = prepare(session, tableFilter, condition, expressions,
+                resultColumnCount, sortOrder);
+        if (p == null) {
+            return null;
+        }
+        ProjectionPlan plan = p.plan;
+        Built built = build(session, p.table, tableFilter, p.filter, p.snapshotColumns,
+                p.sortCols, p.desc, p.nullsFirst, compareMode(p.table));
+        if (built == null) {
+            return null;
+        }
+        p.table.getStore().recordOrderedStreamingClaim();
+        return new Cursor(session, p.table, tableFilter, p.filter, compareMode(p.table),
+                plan.projCols, plan.projConsts, plan.projExprs, plan.projToUnique,
+                plan.uniqueProjCols, plan.uniqueCount, plan.outLen,
+                p.sortCols, p.desc, p.nullsFirst, p.snapshotColumns, offset, built);
+    }
+
+    /** 流式 ORDER BY 共用的 claim 前置判定结果：M20/M22 有序流式与 M24 归并流式同口径。 */
+    static final class Prepared {
+        final OmapTable table;
+        final TableFilter tableFilter;
+        final int[] sortCols;
+        final boolean[] desc;
+        final boolean[] nullsFirst;
+        final ProjectionPlan plan;
+        final VectorizedFilter filter;
+        /** 排序阶段最小读取列集：排序键 ∪ 谓词列。 */
+        final int[] snapshotColumns;
+
+        Prepared(OmapTable table, TableFilter tableFilter, int[] sortCols, boolean[] desc,
+                boolean[] nullsFirst, ProjectionPlan plan, VectorizedFilter filter,
+                int[] snapshotColumns) {
+            this.table = table;
+            this.tableFilter = tableFilter;
+            this.sortCols = sortCols;
+            this.desc = desc;
+            this.nullsFirst = nullsFirst;
+            this.plan = plan;
+            this.filter = filter;
+            this.snapshotColumns = snapshotColumns;
+        }
+    }
+
+    /**
+     * 流式 ORDER BY 的共用前置判定：单表、扫描索引、排序键为单表列引用、
+     * 投影可分类、谓词可编译。返回 {@code null} 表示两条流式路径都不接受，交回 H2。
+     */
+    static Prepared prepare(SessionLocal session, TableFilter tableFilter, Expression condition,
+            List<Expression> expressions, int resultColumnCount, SortOrder sortOrder) {
         if (!(tableFilter.getTable() instanceof OmapTable)) {
             return null;
         }
@@ -85,13 +135,6 @@ final class OrderedStreamingExecutor {
         if (plan == null) {
             return null;
         }
-        int outLen = plan.outLen;
-        int[] projCols = plan.projCols;
-        Value[] projConsts = plan.projConsts;
-        Expression[] projExprs = plan.projExprs;
-        int[] projToUnique = plan.projToUnique;
-        int[] uniqueProjCols = plan.uniqueProjCols;
-        int uniqueCount = plan.uniqueCount;
 
         int keyCount = orderList.size();
         int[] sortCols = new int[keyCount];
@@ -116,17 +159,8 @@ final class OrderedStreamingExecutor {
         // 排序阶段的最小读取集：排序键与谓词列；投影列延迟到行发出时读回。
         int[] snapshotColumns = OmapVectorizedExecutor.unionColumns(
                 sortCols, filter != null ? filter.referencedColumns() : null);
-
-        Built built = build(session, table, tableFilter, filter, snapshotColumns,
-                sortCols, desc, nullsFirst, compareMode(table));
-        if (built == null) {
-            return null;
-        }
-        table.getStore().recordOrderedStreamingClaim();
-        return new Cursor(session, table, tableFilter, filter, compareMode(table),
-                projCols, projConsts, projExprs, projToUnique,
-                uniqueProjCols, uniqueCount, outLen,
-                sortCols, desc, nullsFirst, snapshotColumns, offset, built);
+        return new Prepared(table, tableFilter, sortCols, desc, nullsFirst, plan, filter,
+                snapshotColumns);
     }
 
     private static CompareMode compareMode(OmapTable table) {
@@ -220,7 +254,7 @@ final class OrderedStreamingExecutor {
         return new Built(snap, ordered, nearBounds, extras, extraKeys, extraIds);
     }
 
-    private static Value[] extractKeys(Value[] row, int[] sortCols) {
+    static Value[] extractKeys(Value[] row, int[] sortCols) {
         Value[] keys = new Value[sortCols.length];
         for (int i = 0; i < sortCols.length; i++) {
             keys[i] = row[sortCols[i]];
@@ -694,7 +728,7 @@ final class OrderedStreamingExecutor {
         }
     }
 
-    private static int fillAll(int[] sel, int rowCount, BitSet masked) {
+    static int fillAll(int[] sel, int rowCount, BitSet masked) {
         if (masked == null) {
             for (int i = 0; i < rowCount; i++) {
                 sel[i] = i;

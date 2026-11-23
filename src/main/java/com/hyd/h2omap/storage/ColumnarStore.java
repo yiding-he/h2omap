@@ -106,6 +106,8 @@ public final class ColumnarStore {
 
     /** 有序流式执行命中下推的次数累计，供测试断言回退口径（区间相交等场景不命中）。 */
     private final AtomicLong orderedStreamingClaims = new AtomicLong();
+    /** 归并流式（M24）命中下推的次数累计，供测试与有序流式命中区分口径。 */
+    private final AtomicLong mergeStreamingClaims = new AtomicLong();
     private final AtomicLong flatStreamingClaims = new AtomicLong();
 
     /** 有序流式延迟投影读回的累计次数（含驻留段内存直读），供测试断言延迟物化生效。 */
@@ -1383,6 +1385,16 @@ public final class ColumnarStore {
     /** 记一次有序流式下推命中。 */
     public void recordOrderedStreamingClaim() {
         orderedStreamingClaims.incrementAndGet();
+    }
+
+    /** 归并流式下推（M24）命中次数累计（不含回退），供测试断言命中与回退口径。 */
+    public long getMergeStreamingClaims() {
+        return mergeStreamingClaims.get();
+    }
+
+    /** 记一次归并流式下推命中。 */
+    public void recordMergeStreamingClaim() {
+        mergeStreamingClaims.incrementAndGet();
     }
 
     /** 平面流式下推（M23）命中次数累计（不含回退），供测试断言命中与回退口径。 */

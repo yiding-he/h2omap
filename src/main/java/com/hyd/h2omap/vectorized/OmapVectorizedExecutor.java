@@ -83,8 +83,9 @@ public final class OmapVectorizedExecutor {
     }
 
     /**
-     * 无 {@code LIMIT} 的有序下推（M20）：段间区间不相交时返回流式行源，
-     * 逐行驱动、客户端停止取数即停扫；形态或区间不满足时返回 {@code null} 交回 H2。
+     * 无 {@code LIMIT} 的有序下推（M20/M24）：先试有序流式（次邻分离，任一时刻只驻留
+     * 一个发射单元），不命中再试归并流式（随机键形态，全体段键流归并，键流量超上限
+     * 返回 {@code null}）；两者都不命中交回 H2 行式路径。
      */
     public static OrderedStreamingRowSource tryExecuteOrderedStreaming(
             SessionLocal session,
@@ -94,7 +95,13 @@ public final class OmapVectorizedExecutor {
             int resultColumnCount,
             long offset,
             SortOrder sortOrder) {
-        return OrderedStreamingExecutor.tryClaim(session, tableFilter, condition, expressions,
+        OrderedStreamingRowSource cursor = OrderedStreamingExecutor.tryClaim(
+                session, tableFilter, condition, expressions,
+                resultColumnCount, offset, sortOrder);
+        if (cursor != null) {
+            return cursor;
+        }
+        return OrderedMergeExecutor.tryClaim(session, tableFilter, condition, expressions,
                 resultColumnCount, offset, sortOrder);
     }
 
