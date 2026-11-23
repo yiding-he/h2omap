@@ -43,7 +43,9 @@ import com.hyd.h2omap.vector.ColumnVector;
  * 行真正要发出时才经 {@code ColumnarStore.readDeferredProjection} 读回投影列；
  * 谓词整段过滤空的段，投影列一次都不读。
  *
- * <p>首列声明为 {@code NOT NULL} 才下推：NULL 组不受 zone 约束、跨段存在，
+ * <p>首列 NULL 门控按内容而非声明判定：快照内全部参与段的首列都不含 NULL 时才下推
+ * （段级 hasNull 随段文件 v3 目录与 manifest v3 骨架持久化）；任一段实际含 NULL，
+ * 或段无骨架信息（无持久化内存库的未加载段），则整条查询交回 H2。
  * {@code NULLS FIRST} 时出首行前就得收齐全部段的 NULL 行；可空首列交回 H2。
  * 区间相交（随机写入形态）、多表、表达式排序键等一律交回 H2 行式路径。
  * 形态合法但区间相交时 {@link #tryClaim} 返回 {@code null}，调用方无缝回退。
@@ -94,10 +96,6 @@ final class OrderedStreamingExecutor {
         }
         OmapTable table = (OmapTable) tableFilter.getTable();
         Column[] columns = table.getColumns();
-        // NULL 组跨段：可空首列不参与流式，交回 H2。
-        if (columns[sortCols[0]].isNullable()) {
-            return null;
-        }
 
         int outLen = Math.max(resultColumnCount, expressions.size());
         int[] projCols = new int[outLen];
@@ -242,6 +240,11 @@ final class OrderedStreamingExecutor {
         for (ColumnSegment seg : snap.segments) {
             if (seg.getRowCount() == 0) {
                 continue;
+            }
+            // NULL 组跨段且不受 zone 约束：任一参与段的首列实际含 NULL 即交回 H2。
+            // 惰性加载下无骨架的段拿不到 hasNull，同样拒绝。
+            if (seg.hasNull(sortCols[0])) {
+                return null;
             }
             BitSet m = snap.maskedBySegment.get(seg.getSegmentId());
             if (m != null && m.cardinality() >= seg.getRowCount()) {
@@ -524,11 +527,22 @@ final class OrderedStreamingExecutor {
                     return emitExtra(extraRow, extraIds[extraIdx - 1]);
                 }
                 if (!st.initialized) {
-                    if (extraRow != null && compareFirstCol(session, compareMode, desc[0],
-                            extraRow[sortCols[0]], st.virtualFarBound) < 0) {
-                        // 活像首列严格优于段的边界最优值，必在整段之前
-                        extraIdx++;
-                        return emitExtra(extraRow, extraIds[extraIdx - 1]);
+                    if (extraRow != null) {
+                        Value extraKey = extraRow[sortCols[0]];
+                        boolean extraKeyNull = extraKey == null || extraKey == ValueNull.INSTANCE;
+                        if (extraKeyNull) {
+                            if (nullsFirst[0]) {
+                                // NULLS FIRST：NULL 键活像先于一切段行发射。
+                                extraIdx++;
+                                return emitExtra(extraRow, extraIds[extraIdx - 1]);
+                            }
+                            // NULLS LAST：段初始化后由 compareKeys 正确把 NULL 活像排到全部段行之后。
+                        } else if (compareFirstCol(session, compareMode, desc[0],
+                                extraKey, st.virtualFarBound) < 0) {
+                            // 活像首列严格优于段的边界最优值，必在整段之前
+                            extraIdx++;
+                            return emitExtra(extraRow, extraIds[extraIdx - 1]);
+                        }
                     }
                     initSeg(st);
                     continue;

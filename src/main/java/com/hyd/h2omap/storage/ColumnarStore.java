@@ -157,11 +157,16 @@ public final class ColumnarStore {
 
         public final ZoneMap[] zoneMaps;
 
-        public SkeletonData(int rowCount, int deletedCount, NullBitmap deleted, ZoneMap[] zoneMaps) {
+        /** 每列是否含 NULL 值；v2 manifest 升级前为 null，由启动升级流程回填。 */
+        public final boolean[] hasNull;
+
+        public SkeletonData(int rowCount, int deletedCount, NullBitmap deleted, ZoneMap[] zoneMaps,
+                boolean[] hasNull) {
             this.rowCount = rowCount;
             this.deletedCount = deletedCount;
             this.deleted = deleted;
             this.zoneMaps = zoneMaps;
+            this.hasNull = hasNull;
         }
     }
 
@@ -194,7 +199,7 @@ public final class ColumnarStore {
         }
     }
 
-    /** 逐出时留在堆上的段级元数据：行数、删除位图与每列 zone map。 */
+    /** 逐出时留在堆上的段级元数据：行数、删除位图、每列 zone map 与每列 hasNull。 */
     static final class SegmentSkeleton {
 
         final int rowCount;
@@ -206,6 +211,9 @@ public final class ColumnarStore {
 
         final ZoneMap[] zoneMaps;
 
+        /** 每列是否含 NULL 值，有序流式 claim 的免 I/O 判定依据；缺失时保守全真。 */
+        final boolean[] hasNull;
+
         SegmentSkeleton(ColumnSegment segment) {
             this.rowCount = segment.getRowCount();
             this.deletedCount = segment.getDeletedCount();
@@ -214,6 +222,7 @@ public final class ColumnarStore {
             for (int c = 0; c < zoneMaps.length; c++) {
                 this.zoneMaps[c] = segment.getZoneMap(c);
             }
+            this.hasNull = segment.getHasNull();
         }
 
         SegmentSkeleton(SkeletonData data) {
@@ -221,6 +230,12 @@ public final class ColumnarStore {
             this.deletedCount = data.deletedCount;
             this.deleted = data.deleted;
             this.zoneMaps = data.zoneMaps;
+            boolean[] h = data.hasNull;
+            if (h == null) {
+                h = new boolean[data.zoneMaps.length];
+                Arrays.fill(h, true);
+            }
+            this.hasNull = h;
         }
     }
 
@@ -1090,7 +1105,8 @@ public final class ColumnarStore {
             zones[c] = slice.getZoneMap(c);
         }
         return ColumnSegment.restore(ref.segmentId, ref.generation, slice.getRowCount(),
-                vectors, zones, slice.getDeletedBitmap(), slice.getDeletedCount(), compareMode);
+                vectors, zones, slice.getDeletedBitmap(), slice.getDeletedCount(),
+                ColumnSegment.computeHasNull(vectors), compareMode);
     }
 
     /**
@@ -1153,13 +1169,15 @@ public final class ColumnarStore {
                 for (int c = 0; c < zones.length; c++) {
                     zones[c] = seg.getZoneMap(c);
                 }
-                return new SkeletonData(seg.getRowCount(), seg.getDeletedCount(), seg.getDeleted(), zones);
+                return new SkeletonData(seg.getRowCount(), seg.getDeletedCount(), seg.getDeleted(),
+                        zones, seg.getHasNull());
             }
             SegmentSkeleton sk = ref.skeleton;
             if (sk == null) {
                 return null;
             }
-            return new SkeletonData(sk.rowCount, sk.deletedCount, sk.deleted, sk.zoneMaps);
+            return new SkeletonData(sk.rowCount, sk.deletedCount, sk.deleted, sk.zoneMaps,
+                    sk.hasNull);
         } finally {
             lock.readLock().unlock();
         }

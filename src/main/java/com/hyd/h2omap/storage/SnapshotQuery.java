@@ -68,7 +68,8 @@ final class SnapshotQuery {
                     ColumnarStore.SegmentSkeleton sk = ref.skeleton;
                     seg = ColumnSegment.lazy(ref.segmentId, ref.generation, sk.rowCount,
                             store.valueTypes.length, sk.zoneMaps, sk.deleted, sk.deletedCount,
-                            store.compareMode, () -> loadSnapshotVectors(store, target, columns));
+                            sk.hasNull, store.compareMode,
+                            () -> loadSnapshotVectors(store, target, columns));
                 }
                 if (seg != null) {
                     loadedSegments.add(seg);

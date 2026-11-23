@@ -44,6 +44,9 @@ public final class ColumnSegment {
 
     private final ZoneMap[] zoneMaps;
 
+    /** 每列是否含 NULL 值（含已删行，保守方向）。逐出后随骨架留存，供有序流式的 claim 免 I/O 判定。 */
+    private final boolean[] hasNull;
+
     /** 删除标记。被标记的行对读路径不可见，rowId 保留。 */
     private final NullBitmap deleted;
 
@@ -54,7 +57,7 @@ public final class ColumnSegment {
 
     private ColumnSegment(int segmentId, int generation, int rowCount, ColumnVector[] columns,
             int columnCount, ZoneMap[] zoneMaps, NullBitmap deleted, int deletedCount,
-            CompareMode compareMode) {
+            boolean[] hasNull, CompareMode compareMode) {
         this.segmentId = segmentId;
         this.generation = generation;
         this.rowCount = rowCount;
@@ -63,26 +66,29 @@ public final class ColumnSegment {
         this.zoneMaps = zoneMaps;
         this.deleted = deleted;
         this.deletedCount = deletedCount;
+        this.hasNull = hasNull;
         this.compareMode = compareMode;
     }
 
     private ColumnSegment(int segmentId, int generation, int rowCount, ColumnVector[] columns,
-            ZoneMap[] zoneMaps, NullBitmap deleted, int deletedCount, CompareMode compareMode) {
+            ZoneMap[] zoneMaps, NullBitmap deleted, int deletedCount, boolean[] hasNull,
+            CompareMode compareMode) {
         this(segmentId, generation, rowCount, columns, columns.length, zoneMaps, deleted,
-                deletedCount, compareMode);
+                deletedCount, hasNull, compareMode);
     }
 
     private ColumnSegment(int segmentId, int rowCount, ColumnVector[] columns, ZoneMap[] zoneMaps,
             CompareMode compareMode) {
-        this(segmentId, 0, rowCount, columns, zoneMaps, new NullBitmap(rowCount), 0, compareMode);
+        this(segmentId, 0, rowCount, columns, zoneMaps, new NullBitmap(rowCount), 0,
+                computeHasNull(columns), compareMode);
     }
 
     /** 由段文件恢复：zone map 与删除计数直接取自文件尾部目录，不再全列重算。 */
     public static ColumnSegment restore(int segmentId, int generation, int rowCount,
             ColumnVector[] columns, ZoneMap[] zoneMaps, NullBitmap deleted, int deletedCount,
-            CompareMode compareMode) {
+            boolean[] hasNull, CompareMode compareMode) {
         return new ColumnSegment(segmentId, generation, rowCount, columns, zoneMaps, deleted,
-                deletedCount, compareMode);
+                deletedCount, hasNull, compareMode);
     }
 
     /**
@@ -91,9 +97,9 @@ public final class ColumnSegment {
      */
     public static ColumnSegment lazy(int segmentId, int generation, int rowCount,
             int columnCount, ZoneMap[] zoneMaps, NullBitmap deleted, int deletedCount,
-            CompareMode compareMode, Supplier<ColumnVector[]> columnLoader) {
+            boolean[] hasNull, CompareMode compareMode, Supplier<ColumnVector[]> columnLoader) {
         ColumnSegment seg = new ColumnSegment(segmentId, generation, rowCount, null,
-                columnCount, zoneMaps, deleted, deletedCount, compareMode);
+                columnCount, zoneMaps, deleted, deletedCount, hasNull, compareMode);
         seg.columnLoader = columnLoader;
         return seg;
     }
@@ -226,6 +232,16 @@ public final class ColumnSegment {
         return zoneMaps[column];
     }
 
+    /** 该列是否含 NULL 值（含已删行）。懒段直接查骨架数组，不触发列加载。 */
+    public boolean hasNull(int column) {
+        return hasNull[column];
+    }
+
+    /** 每列 hasNull 数组。视为不可变：仅在合并写回 NULL 新像时单调置真。 */
+    public boolean[] getHasNull() {
+        return hasNull;
+    }
+
     public boolean isDeleted(int offset) {
         return deleted.isNull(offset);
     }
@@ -275,11 +291,13 @@ public final class ColumnSegment {
         }
         if (updates == null || updates.isEmpty()) {
             return new ColumnSegment(
-                    segmentId, generation + 1, rowCount, columns, zoneMaps, newDeleted, newDeletedCount, compareMode);
+                    segmentId, generation + 1, rowCount, columns, zoneMaps, newDeleted,
+                    newDeletedCount, hasNull, compareMode);
         }
 
         ColumnVector[] newColumns = null;
         ZoneMap[] newZones = null;
+        boolean[] newHasNull = hasNull.clone();
         boolean[] needsRebuildZone = new boolean[columns.length];
 
         for (Map.Entry<Integer, Value[]> entry : updates) {
@@ -305,6 +323,11 @@ public final class ColumnSegment {
                 }
                 newColumns[c].set(off, newVal);
 
+                // hasNull 只向真值方向单调更新：写入 NULL 新像即置真，非 NULL 写入不改。
+                if (newVal == ValueNull.INSTANCE) {
+                    newHasNull[c] = true;
+                }
+
                 if (!needsRebuildZone[c]) {
                     ZoneMap baseZm = newZones != null ? newZones[c] : zoneMaps[c];
                     ZoneMap updatedZm = baseZm.tryUpdate(oldVal, newVal);
@@ -322,7 +345,7 @@ public final class ColumnSegment {
 
         if (newColumns == null) {
             return new ColumnSegment(segmentId, generation + 1, rowCount, columns, zoneMaps,
-                    newDeleted, newDeletedCount, compareMode);
+                    newDeleted, newDeletedCount, hasNull, compareMode);
         }
         for (int c = 0; c < columns.length; c++) {
             if (needsRebuildZone[c]) {
@@ -340,7 +363,17 @@ public final class ColumnSegment {
                 newZones != null ? newZones : zoneMaps,
                 newDeleted,
                 newDeletedCount,
+                newHasNull,
                 compareMode);
+    }
+
+    /** 每列是否含 NULL 值。占位列（部分列读的段外列）保守视为含 NULL。 */
+    public static boolean[] computeHasNull(ColumnVector[] columns) {
+        boolean[] out = new boolean[columns.length];
+        for (int c = 0; c < columns.length; c++) {
+            out[c] = columns[c] instanceof AbsentColumnVector || columns[c].nulls().hasNull();
+        }
+        return out;
     }
 
     public long getEstimatedMemory() {

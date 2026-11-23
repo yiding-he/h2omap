@@ -61,10 +61,16 @@ import com.hyd.h2omap.vector.NullBitmap;
  */
 public final class OmapPersistence {
 
-    /** 每段可选附带骨架元数据（行数、删除位图、每列 zone map）。 */
-    private static final int MANIFEST_MAGIC = 0x4F4D4151;  // OMAPQ
-    /** 段文件 v2：头部带尾部目录偏移，列块顺序存放，尾部目录含每列偏移/长度/zone map。 */
-    private static final int SEGMENT_MAGIC = 0x4F534732;    // OSG2
+    /** manifest v3：骨架每列在 zone 之后追加 hasNull，供有序流式 claim 免 I/O 判定。 */
+    private static final int MANIFEST_MAGIC_V3 = 0x4F4D4152;  // OMAPR
+    /** manifest v2：升级源格式，骨架不含每列 hasNull。 */
+    private static final int MANIFEST_MAGIC_V2 = 0x4F4D4151;  // OMAPQ
+    /** 段文件 v3：头部带格式版本号，尾部目录每列含 hasNull。 */
+    private static final int SEGMENT_MAGIC_V3 = 0x4F534733;   // OSG3
+    /** 段文件 v2：升级源格式，尾部目录不含 hasNull。 */
+    private static final int SEGMENT_MAGIC_V2 = 0x4F534732;   // OSG2
+    /** 当前格式版本号。后续格式变化只递增此值，魔数不再变。 */
+    private static final int FORMAT_VERSION = 3;
     private static final int TAIL_MAGIC = 0x4F544149;     // OTAI
 
     private static final byte OP_INSERT = 1;
@@ -183,10 +189,19 @@ public final class OmapPersistence {
 
             Path manifestPath = dir.resolve("manifest.dat");
             if (Files.exists(manifestPath)) {
+                boolean upgradeFromV2 = false;
                 try (DataInputStream in = new DataInputStream(
                         new BufferedInputStream(Files.newInputStream(manifestPath)))) {
                     int magic = in.readInt();
-                    if (magic != MANIFEST_MAGIC) {
+                    if (magic == MANIFEST_MAGIC_V3) {
+                        int version = in.readInt();
+                        if (version != FORMAT_VERSION) {
+                            throw new IOException("Unsupported manifest format version " + version);
+                        }
+                    } else if (magic == MANIFEST_MAGIC_V2) {
+                        // v2 目录：按段文件实际版本逐段升级为 v3，随后原子重写 manifest。
+                        upgradeFromV2 = true;
+                    } else {
                         throw new IOException("Invalid manifest magic: " + magic);
                     }
                     nextSegmentId = in.readInt();
@@ -203,9 +218,18 @@ public final class OmapPersistence {
                         generations[i] = gen;
                         persistedSegments.put(segId, gen);
                         if (in.readBoolean()) {
-                            skeletons[i] = readSkeleton(in);
+                            skeletons[i] = upgradeFromV2 ? readSkeletonV2(in) : readSkeletonV3(in);
                         }
                     }
+                }
+                if (upgradeFromV2) {
+                    // 启动自动升级：全部段文件检查并转为 v3，回填骨架 hasNull，
+                    // 再原子重写 manifest；崩溃重入时已升级段走快速分支，幂等。
+                    if (segmentIds.length > 0) {
+                        upgradeSegmentsInParallel(segmentIds, generations, skeletons);
+                    }
+                    writeManifestFile(nextSegmentId, manifestWalSeq, segmentIds, generations,
+                            skeletons);
                 }
                 if (!store.isLazyLoad() && segmentIds.length > 0) {
                     loadSegmentsInParallel(segmentIds, generations, preloaded);
@@ -250,7 +274,30 @@ public final class OmapPersistence {
      */
     private void loadSegmentsInParallel(int[] segmentIds, int[] generations,
             ColumnSegment[] preloaded) throws IOException {
-        int count = segmentIds.length;
+        forEachSegmentIndexInParallel(segmentIds.length, i ->
+                preloaded[i] = readSegment(segmentIds[i], generations[i]));
+    }
+
+    /**
+     * 启动升级：对 manifest 登记的全部段文件并行检查版本，过时的转为 v3 写回，
+     * 并回填骨架 hasNull。失败按段序号最小者抛出，与恢复语义一致。
+     */
+    private void upgradeSegmentsInParallel(int[] segmentIds, int[] generations,
+            ColumnarStore.SkeletonData[] skeletons) throws IOException {
+        forEachSegmentIndexInParallel(segmentIds.length, i ->
+                skeletons[i] = upgradeSegmentFile(segmentIds[i], generations[i], skeletons[i]));
+    }
+
+    /** 按索引游标在段加载线程池上并行执行任务，失败按最小索引抛出，在途任务全部完成后退出。 */
+    private interface SegmentIndexTask {
+        void run(int index) throws IOException;
+    }
+
+    private void forEachSegmentIndexInParallel(int count, SegmentIndexTask task)
+            throws IOException {
+        if (count == 0) {
+            return;
+        }
         AtomicInteger nextIndex = new AtomicInteger();
         AtomicInteger failureCount = new AtomicInteger();
         AtomicReferenceArray<IOException> failures = new AtomicReferenceArray<>(count);
@@ -265,9 +312,12 @@ public final class OmapPersistence {
                             return;
                         }
                         try {
-                            preloaded[i] = readSegment(segmentIds[i], generations[i]);
+                            task.run(i);
                         } catch (IOException e) {
                             failures.set(i, e);
+                            failureCount.incrementAndGet();
+                        } catch (RuntimeException e) {
+                            failures.set(i, new IOException("并行段任务失败", e));
                             failureCount.incrementAndGet();
                         }
                     }
@@ -452,26 +502,18 @@ public final class OmapPersistence {
                         StandardCopyOption.ATOMIC_MOVE);
 
                 // 3. 原子替换 manifest.dat
-                Path manifestTmp = dir.resolve("manifest.dat.tmp");
-                Path manifestDst = dir.resolve("manifest.dat");
-                try (DataOutputStream out = new DataOutputStream(
-                        new BufferedOutputStream(Files.newOutputStream(manifestTmp)))) {
-                    out.writeInt(MANIFEST_MAGIC);
-                    out.writeInt(nextSegmentId);
-                    out.writeLong(checkpointWalSeq);
-                    out.writeInt(segmentsSnapshot.size());
-                    for (ColumnarStore.SegmentMeta meta : segmentsSnapshot) {
-                        out.writeInt(meta.segmentId());
-                        out.writeInt(meta.generation());
-                        ColumnarStore.SkeletonData sk = store.segmentSkeletonData(meta.segmentId());
-                        out.writeBoolean(sk != null);
-                        if (sk != null) {
-                            writeSkeleton(out, sk);
-                        }
-                    }
+                int segCount = segmentsSnapshot.size();
+                int[] ids = new int[segCount];
+                int[] gens = new int[segCount];
+                ColumnarStore.SkeletonData[] manifestSkeletons =
+                        new ColumnarStore.SkeletonData[segCount];
+                for (int i = 0; i < segCount; i++) {
+                    ColumnarStore.SegmentMeta meta = segmentsSnapshot.get(i);
+                    ids[i] = meta.segmentId();
+                    gens[i] = meta.generation();
+                    manifestSkeletons[i] = store.segmentSkeletonData(meta.segmentId());
                 }
-                Files.move(manifestTmp, manifestDst, StandardCopyOption.REPLACE_EXISTING,
-                        StandardCopyOption.ATOMIC_MOVE);
+                writeManifestFile(nextSegmentId, checkpointWalSeq, ids, gens, manifestSkeletons);
 
                 // 4. 清理旧 WAL、旧 tail、旧版段文件
                 cleanupObsoleteFiles(checkpointWalSeq, segmentsSnapshot);
@@ -482,8 +524,8 @@ public final class OmapPersistence {
     }
 
     /**
-     * 骨架元数据的磁盘形态：行数、已删行数、删除位图、列数与每列 zone map 的 min/max。
-     * zone map 的 min/max 为 null 表示该列恒相交，不参与剪枝。
+     * 骨架元数据的磁盘形态（v3）：行数、已删行数、删除位图、列数、每列 zone map 的 min/max，
+     * 以及每列是否含 NULL。zone map 的 min/max 为 null 表示该列恒相交，不参与剪枝。
      */
     private void writeSkeleton(DataOutputStream out, ColumnarStore.SkeletonData sk) throws IOException {
         out.writeInt(sk.rowCount);
@@ -502,9 +544,12 @@ public final class OmapPersistence {
                 ckptCodec.writeValue(out, max);
             }
         }
+        for (int c = 0; c < sk.zoneMaps.length; c++) {
+            out.writeBoolean(sk.hasNull != null && sk.hasNull[c]);
+        }
     }
 
-    private ColumnarStore.SkeletonData readSkeleton(DataInput in) throws IOException {
+    private ColumnarStore.SkeletonData readSkeletonV3(DataInput in) throws IOException {
         int rowCount = in.readInt();
         int deletedCount = in.readInt();
         NullBitmap deleted = ckptCodec.readNullBitmap(in);
@@ -515,7 +560,52 @@ public final class OmapPersistence {
             Value max = in.readBoolean() ? ckptCodec.readValue(in) : null;
             zones[c] = ZoneMap.restore(min, max, compareMode);
         }
-        return new ColumnarStore.SkeletonData(rowCount, deletedCount, deleted, zones);
+        boolean[] hasNull = new boolean[columnCount];
+        for (int c = 0; c < columnCount; c++) {
+            hasNull[c] = in.readBoolean();
+        }
+        return new ColumnarStore.SkeletonData(rowCount, deletedCount, deleted, zones, hasNull);
+    }
+
+    /** v2 骨架：不含每列 hasNull，由启动升级流程读段文件后回填。 */
+    private ColumnarStore.SkeletonData readSkeletonV2(DataInput in) throws IOException {
+        int rowCount = in.readInt();
+        int deletedCount = in.readInt();
+        NullBitmap deleted = ckptCodec.readNullBitmap(in);
+        int columnCount = in.readInt();
+        ZoneMap[] zones = new ZoneMap[columnCount];
+        for (int c = 0; c < columnCount; c++) {
+            Value min = in.readBoolean() ? ckptCodec.readValue(in) : null;
+            Value max = in.readBoolean() ? ckptCodec.readValue(in) : null;
+            zones[c] = ZoneMap.restore(min, max, compareMode);
+        }
+        return new ColumnarStore.SkeletonData(rowCount, deletedCount, deleted, zones, null);
+    }
+
+    /** manifest v3 单一写入口：检查点与启动升级共用，tmp + 原子替换。 */
+    private void writeManifestFile(int nextSegmentId, long walSeq, int[] segmentIds,
+            int[] generations, ColumnarStore.SkeletonData[] skeletons) throws IOException {
+        Path manifestTmp = dir.resolve("manifest.dat.tmp");
+        Path manifestDst = dir.resolve("manifest.dat");
+        try (DataOutputStream out = new DataOutputStream(
+                new BufferedOutputStream(Files.newOutputStream(manifestTmp)))) {
+            out.writeInt(MANIFEST_MAGIC_V3);
+            out.writeInt(FORMAT_VERSION);
+            out.writeInt(nextSegmentId);
+            out.writeLong(walSeq);
+            out.writeInt(segmentIds.length);
+            for (int i = 0; i < segmentIds.length; i++) {
+                out.writeInt(segmentIds[i]);
+                out.writeInt(generations[i]);
+                ColumnarStore.SkeletonData sk = skeletons != null ? skeletons[i] : null;
+                out.writeBoolean(sk != null);
+                if (sk != null) {
+                    writeSkeleton(out, sk);
+                }
+            }
+        }
+        Files.move(manifestTmp, manifestDst, StandardCopyOption.REPLACE_EXISTING,
+                StandardCopyOption.ATOMIC_MOVE);
     }
 
     public void close() {
@@ -665,10 +755,10 @@ public final class OmapPersistence {
     }
 
     /**
-     * 段文件布局：头部（魔数/段号/代数/行数/已删行数/目录偏移）→ 删除位图 → 列数 →
+     * 段文件布局（v3）：头部（魔数/版本/段号/代数/行数/已删行数/目录偏移）→ 删除位图 → 列数 →
      * 列块（沿用 {@link ValueCodec} 的 VEC_* 编码，编码标签写在列块首字节）→ 尾部列目录。
-     * 目录每项含列块的文件内偏移与长度，以及该列 zone map 的 min/max，
-     * 供全量读免重算、部分列读按列定位。
+     * 目录每项含列块的文件内偏移与长度、该列是否含 NULL，以及该列 zone map 的 min/max，
+     * 供全量读免重算、部分列读按列定位、启动升级免全量读取 hasNull。
      */
     private void writeSegment(ColumnSegment seg) throws IOException {
         String name = "seg_" + seg.getSegmentId() + "_" + seg.getGeneration() + ".omap";
@@ -677,11 +767,16 @@ public final class OmapPersistence {
         int cols = seg.getColumnCount();
         long[] offsets = new long[cols];
         int[] lengths = new int[cols];
+        boolean[] hasNull = seg.getHasNull();
         ByteArrayOutputStream buf = new ByteArrayOutputStream(64 * 1024);
         long footerOffset;
         byte[] bytes;
+        // ckptCodec 的 writeBuffer 是共享可变状态：启动升级会在加载线程池上并发写段，
+        // 序列化段在 codec 上互斥，文件 I/O 留在锁外。
+        synchronized (ckptCodec) {
         try (DataOutputStream out = new DataOutputStream(buf)) {
-            out.writeInt(SEGMENT_MAGIC);
+            out.writeInt(SEGMENT_MAGIC_V3);
+            out.writeInt(FORMAT_VERSION);
             out.writeInt(seg.getSegmentId());
             out.writeInt(seg.getGeneration());
             out.writeInt(seg.getRowCount());
@@ -698,11 +793,13 @@ public final class OmapPersistence {
             for (int c = 0; c < cols; c++) {
                 out.writeLong(offsets[c]);
                 out.writeInt(lengths[c]);
+                out.writeBoolean(hasNull != null && hasNull[c]);
                 writeZoneBounds(out, seg.getZoneMap(c));
             }
         }
+        }
         bytes = buf.toByteArray();
-        patchLong(bytes, 20, footerOffset);
+        patchLong(bytes, 24, footerOffset);
         Files.write(tmp, bytes);
         Files.move(tmp, dst, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
     }
@@ -880,6 +977,7 @@ public final class OmapPersistence {
             for (int c = 0; c < cols; c++) {
                 offsets[c] = footer.getLong();
                 lengths[c] = footer.getInt();
+                footer.get(); // hasNull：切片读不消费，跳过
                 footerZones[c] = readZoneEntry(footer);
             }
             // 请求列在文件上首尾相接时合并成单次大块连续读。
@@ -970,11 +1068,13 @@ public final class OmapPersistence {
         int headerEnd = buf.position();
         long[] offsets = new long[cols];
         int[] lengths = new int[cols];
+        boolean[] hasNull = new boolean[cols];
         ZoneMap[] zones = new ZoneMap[cols];
         buf.position((int) footerOffset);
         for (int c = 0; c < cols; c++) {
             offsets[c] = buf.getLong();
             lengths[c] = buf.getInt();
+            hasNull[c] = buf.get() != 0;
             zones[c] = readZoneEntry(buf);
         }
         // 街接校验：首列块紧接头，列块首尾相接，末列块止于尾部目录。
@@ -998,7 +1098,177 @@ public final class OmapPersistence {
             }
         }
         return ColumnSegment.restore(expectedId, expectedGen, rowCount, vectors, zones,
-                deleted, deletedCount, compareMode);
+                deleted, deletedCount, hasNull, compareMode);
+    }
+
+    /**
+     * 旧版段（v2）全量读取：仅供启动升级使用。尾部目录不含 hasNull，
+     * 由内存中的列向量扫描得出。升级完成后正常读路径只解析 v3。
+     */
+    private ColumnSegment readSegmentV2(int expectedId, int expectedGen) throws IOException {
+        Path p = dir.resolve("seg_" + expectedId + "_" + expectedGen + ".omap");
+        long fileSize;
+        byte[] fileBytes;
+        int ioReads = 0;
+        try (FileChannel ch = FileChannel.open(p, StandardOpenOption.READ)) {
+            fileSize = ch.size();
+            if (fileSize > Integer.MAX_VALUE - 8) {
+                throw new IOException("Segment file too large: " + p);
+            }
+            fileBytes = new byte[(int) fileSize];
+            ByteBuffer wrap = ByteBuffer.wrap(fileBytes);
+            while (wrap.hasRemaining()) {
+                if (ch.read(wrap) < 0) {
+                    throw new EOFException("Unexpected end of " + p);
+                }
+                ioReads++;
+            }
+        }
+        QueryIoStats.record(expectedId, expectedGen, "*", fileSize, 0, ioReads);
+        ByteBuffer buf = ByteBuffer.wrap(fileBytes);
+        int magic = buf.getInt();
+        if (magic != SEGMENT_MAGIC_V2) {
+            throw new IOException("Invalid segment magic in " + p);
+        }
+        int segId = buf.getInt();
+        int gen = buf.getInt();
+        if (segId != expectedId || gen != expectedGen) {
+            throw new IOException("Segment id/generation mismatch in " + p);
+        }
+        int rowCount = buf.getInt();
+        int deletedCount = buf.getInt();
+        long footerOffset = buf.getLong();
+        if (footerOffset <= 0 || footerOffset >= fileSize) {
+            throw new IOException("Invalid footer offset " + footerOffset + " in " + p);
+        }
+        NullBitmap deleted = ckptCodec.readNullBitmap(buf);
+        int cols = buf.getInt();
+        int headerEnd = buf.position();
+        long[] offsets = new long[cols];
+        int[] lengths = new int[cols];
+        ZoneMap[] zones = new ZoneMap[cols];
+        buf.position((int) footerOffset);
+        for (int c = 0; c < cols; c++) {
+            offsets[c] = buf.getLong();
+            lengths[c] = buf.getInt();
+            zones[c] = readZoneEntry(buf);
+        }
+        for (int c = 0; c < cols; c++) {
+            long expectedStart = c == 0 ? headerEnd : offsets[c - 1] + lengths[c - 1];
+            if (offsets[c] != expectedStart) {
+                throw new IOException("Column block " + c + " starts at " + offsets[c]
+                        + " but expected " + expectedStart + " in " + p);
+            }
+        }
+        if (cols > 0 && offsets[cols - 1] + lengths[cols - 1] != footerOffset) {
+            throw new IOException("Column blocks end at " + (offsets[cols - 1] + lengths[cols - 1])
+                    + " but footer offset is " + footerOffset + " in " + p);
+        }
+        ColumnVector[] vectors = new ColumnVector[cols];
+        for (int c = 0; c < cols; c++) {
+            buf.position((int) offsets[c]);
+            vectors[c] = ckptCodec.readVector(buf, lengths[c]);
+            if (buf.position() != offsets[c] + lengths[c]) {
+                throw new IOException("Column " + c + " block length mismatch in " + p);
+            }
+        }
+        return ColumnSegment.restore(expectedId, expectedGen, rowCount, vectors, zones,
+                deleted, deletedCount, ColumnSegment.computeHasNull(vectors), compareMode);
+    }
+
+    /**
+     * 启动升级的单段处理：v2 段全量读入后按 v3 写回；v3 段只读尾部目录回填骨架 hasNull，
+     * 不重写（升级中途崩溃重入的幂等分支）；其他魔数报错。
+     * 段号、代数与内容语义不变，仅磁盘布局升级。
+     */
+    private ColumnarStore.SkeletonData upgradeSegmentFile(int expectedId, int expectedGen,
+            ColumnarStore.SkeletonData skeleton) throws IOException {
+        Path p = dir.resolve("seg_" + expectedId + "_" + expectedGen + ".omap");
+        int magic;
+        try (FileChannel ch = FileChannel.open(p, StandardOpenOption.READ)) {
+            ByteBuffer b = ByteBuffer.allocate(4);
+            while (b.hasRemaining()) {
+                if (ch.read(b) < 0) {
+                    throw new EOFException("Unexpected end of " + p);
+                }
+            }
+            magic = b.getInt(0);
+        }
+        if (magic == SEGMENT_MAGIC_V3) {
+            boolean[] hasNull = readSegmentHasNull(p, expectedId, expectedGen);
+            return withHasNull(skeleton, hasNull);
+        }
+        if (magic == SEGMENT_MAGIC_V2) {
+            ColumnSegment seg = readSegmentV2(expectedId, expectedGen);
+            writeSegment(seg);
+            return withHasNull(skeleton, seg.getHasNull());
+        }
+        throw new IOException("Invalid segment magic in " + p);
+    }
+
+    /** 把升级得到的 hasNull 填进骨架；v2 manifest 无骨架的段维持无骨架，升级信息只在段文件里。 */
+    private static ColumnarStore.SkeletonData withHasNull(ColumnarStore.SkeletonData skeleton,
+            boolean[] hasNull) {
+        if (skeleton == null) {
+            return null;
+        }
+        if (hasNull.length != skeleton.zoneMaps.length) {
+            throw new IllegalStateException("hasNull 列数与骨架列数不一致");
+        }
+        return new ColumnarStore.SkeletonData(skeleton.rowCount, skeleton.deletedCount,
+                skeleton.deleted, skeleton.zoneMaps, hasNull);
+    }
+
+    /** 只读 v3 段头部与尾部目录取每列 hasNull，不解析列块。 */
+    private boolean[] readSegmentHasNull(Path p, int expectedId, int expectedGen)
+            throws IOException {
+        try (FileChannel ch = FileChannel.open(p, StandardOpenOption.READ)) {
+            ByteBuffer head = ByteBuffer.allocate(32);
+            while (head.hasRemaining()) {
+                if (ch.read(head) < 0) {
+                    throw new EOFException("Unexpected end of " + p);
+                }
+            }
+            head.flip();
+            int magic = head.getInt();
+            int version = head.getInt();
+            int segId = head.getInt();
+            int gen = head.getInt();
+            if (magic != SEGMENT_MAGIC_V3 || version != FORMAT_VERSION
+                    || segId != expectedId || gen != expectedGen) {
+                throw new IOException("Segment header mismatch in " + p);
+            }
+            head.getInt(); // rowCount
+            head.getInt(); // deletedCount
+            long footerOffset = head.getLong();
+            if (footerOffset <= 0 || footerOffset >= ch.size()) {
+                throw new IOException("Invalid footer offset " + footerOffset + " in " + p);
+            }
+            int footerSize = (int) (ch.size() - footerOffset);
+            ch.position(footerOffset);
+            ByteBuffer footer = ByteBuffer.allocate(footerSize);
+            while (footer.hasRemaining()) {
+                if (ch.read(footer) < 0) {
+                    throw new EOFException("Unexpected end of " + p);
+                }
+            }
+            footer.flip();
+            java.util.List<Boolean> hasNull = new ArrayList<>();
+            while (footer.remaining() >= 13) {
+                footer.getLong(); // 列块偏移
+                footer.getInt(); // 列块长度
+                hasNull.add(footer.get() != 0);
+                readZoneEntry(footer);
+            }
+            if (footer.hasRemaining()) {
+                throw new IOException("Incomplete footer in " + p);
+            }
+            boolean[] out = new boolean[hasNull.size()];
+            for (int c = 0; c < out.length; c++) {
+                out[c] = hasNull.get(c);
+            }
+            return out;
+        }
     }
 
     /**
@@ -1030,8 +1300,12 @@ public final class OmapPersistence {
     private void requireSegment(DataInput in, Path p, int expectedId, int expectedGen)
             throws IOException {
         int magic = in.readInt();
-        if (magic != SEGMENT_MAGIC) {
+        if (magic != SEGMENT_MAGIC_V3) {
             throw new IOException("Invalid segment magic in " + p);
+        }
+        int version = in.readInt();
+        if (version != FORMAT_VERSION) {
+            throw new IOException("Unsupported segment format version " + version + " in " + p);
         }
         int segId = in.readInt();
         int gen = in.readInt();
