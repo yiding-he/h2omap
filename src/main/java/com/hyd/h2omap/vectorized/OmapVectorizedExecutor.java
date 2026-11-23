@@ -51,6 +51,21 @@ public final class OmapVectorizedExecutor {
                 resultColumnCount, maxRows, sortOrder, result);
     }
 
+    /**
+     * M23：无 LIMIT 无 ORDER BY 的单表平面查询流式下推。形态判据在执行器内部，
+     * 不命中返回 {@code null}，交回原路径。
+     */
+    public static FlatStreamingRowSource tryExecuteFlatStreaming(
+            SessionLocal session,
+            TableFilter tableFilter,
+            Expression condition,
+            List<Expression> expressions,
+            int resultColumnCount,
+            long offset) {
+        return FlatStreamingExecutor.tryClaim(session, tableFilter, condition,
+                expressions, resultColumnCount, offset);
+    }
+
     public static boolean tryExecuteGroup(
             SessionLocal session,
             TableFilter tableFilter,

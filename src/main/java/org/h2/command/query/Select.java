@@ -838,6 +838,22 @@ public class Select extends Query {
                 return streamed;
             }
         }
+        // M23：无 LIMIT 无 ORDER BY 的单表平面查询流式下推——命中时逐行供给，不建
+        // LocalResult、不全量物化；驻留段优先发射，逐出段在客户端取到该段时才读回。
+        // 必须在建 LocalResult 之前判定，不命中则交回原路径。
+        if (sort == null && target == null && forUpdate == null
+                && !isQuickAggregateQuery && !isGroupQuery && !isWindowQuery
+                && !distinct && distinctExpressions == null && qualifyIndex < 0
+                && inPredicateSortTypes == null && !withTies && !fetchPercent
+                && fetch == -1 && offset >= 0 && filters.size() == 1) {
+            LazyResultSelect streamed = tryVectorizedFlatStreaming(columnCount, offset);
+            if (streamed != null) {
+                topTableFilter.startQuery(session);
+                topTableFilter.reset();
+                topTableFilter.lock(session);
+                return streamed;
+            }
+        }
         LocalResult result = null;
         if (!lazy && (target == null ||
                 !getDatabase().getSettings().optimizeInsertFromSelect)) {
@@ -953,6 +969,18 @@ public class Select extends Query {
                         session, topTableFilter, condition, expressions, resultColumnCount,
                         offset, sort);
         return cursor != null ? new LazyResultOrderedStreaming(cursor, columnCount) : null;
+    }
+
+    /**
+     * M23：无 LIMIT 无 ORDER BY 的平面查询流式下推。形态判据在执行器内部，
+     * 不命中返回 null，交回 H2 原路径。
+     */
+    private LazyResultSelect tryVectorizedFlatStreaming(int columnCount, long offset) {
+        com.hyd.h2omap.vectorized.FlatStreamingRowSource cursor =
+                com.hyd.h2omap.vectorized.OmapVectorizedExecutor.tryExecuteFlatStreaming(
+                        session, topTableFilter, condition, expressions, resultColumnCount,
+                        offset);
+        return cursor != null ? new LazyResultFlatStreaming(cursor, columnCount) : null;
     }
 
     private boolean tryVectorizedGroup(LocalResult result) {
@@ -1974,6 +2002,36 @@ public class Select extends Query {
         private final com.hyd.h2omap.vectorized.OrderedStreamingRowSource cursor;
 
         LazyResultOrderedStreaming(com.hyd.h2omap.vectorized.OrderedStreamingRowSource cursor,
+                int columnCount) {
+            super(expressionArray, columnCount);
+            this.cursor = cursor;
+        }
+
+        @Override
+        protected Value[] fetchNextRow() {
+            Value[] row = cursor.nextRow();
+            if (row == null) {
+                return null;
+            }
+            setCurrentRowNumber(rowNumber + 1);
+            rowNumber++;
+            return row;
+        }
+
+        @Override
+        public void reset() {
+            super.reset();
+            cursor.reset();
+        }
+
+    }
+
+    /** M23：无 LIMIT 无 ORDER BY 的平面查询流式游标。 */
+    private final class LazyResultFlatStreaming extends LazyResultSelect {
+
+        private final com.hyd.h2omap.vectorized.FlatStreamingRowSource cursor;
+
+        LazyResultFlatStreaming(com.hyd.h2omap.vectorized.FlatStreamingRowSource cursor,
                 int columnCount) {
             super(expressionArray, columnCount);
             this.cursor = cursor;

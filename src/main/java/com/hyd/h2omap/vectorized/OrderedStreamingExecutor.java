@@ -6,18 +6,12 @@ package com.hyd.h2omap.vectorized;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
-import java.util.HashSet;
 import java.util.List;
 
 import org.h2.command.query.QueryOrderBy;
 import org.h2.engine.SessionLocal;
 import org.h2.expression.Expression;
-import org.h2.expression.ExpressionColumn;
-import org.h2.expression.ExpressionVisitor;
-import org.h2.expression.Subquery;
-import org.h2.result.Row;
 import org.h2.result.SortOrder;
-import org.h2.table.Column;
 import org.h2.table.TableFilter;
 import org.h2.value.CompareMode;
 import org.h2.value.Value;
@@ -84,6 +78,21 @@ final class OrderedStreamingExecutor {
                 || orderList.size() != sortTypes.length) {
             return null;
         }
+        OmapTable table = (OmapTable) tableFilter.getTable();
+
+        // 投影分类（列引用/常量/确定表达式）与最小读取列集：M23 起与平面流式共用
+        ProjectionPlan plan = ProjectionPlan.claim(session, tableFilter, expressions, resultColumnCount);
+        if (plan == null) {
+            return null;
+        }
+        int outLen = plan.outLen;
+        int[] projCols = plan.projCols;
+        Value[] projConsts = plan.projConsts;
+        Expression[] projExprs = plan.projExprs;
+        int[] projToUnique = plan.projToUnique;
+        int[] uniqueProjCols = plan.uniqueProjCols;
+        int uniqueCount = plan.uniqueCount;
+
         int keyCount = orderList.size();
         int[] sortCols = new int[keyCount];
         boolean[] desc = new boolean[keyCount];
@@ -96,93 +105,6 @@ final class OrderedStreamingExecutor {
             desc[i] = (sortTypes[i] & SortOrder.DESCENDING) != 0;
             nullsFirst[i] = (sortTypes[i] & SortOrder.NULLS_FIRST) != 0;
         }
-        OmapTable table = (OmapTable) tableFilter.getTable();
-        Column[] columns = table.getColumns();
-
-        int outLen = Math.max(resultColumnCount, expressions.size());
-        int[] projCols = new int[outLen];
-        Value[] projConsts = new Value[outLen];
-        Expression[] projExprs = new Expression[outLen];
-        List<Integer> exprRefCols = new ArrayList<>();
-        for (int i = 0; i < outLen; i++) {
-            Expression e = i < expressions.size() ? expressions.get(i) : null;
-            if (e == null) {
-                projCols[i] = -1;
-                projConsts[i] = ValueNull.INSTANCE;
-                continue;
-            }
-            if (e instanceof ExpressionColumn) {
-                ExpressionColumn ec = (ExpressionColumn) e;
-                if (ec.getTableFilter() != tableFilter) {
-                    return null;
-                }
-                int id = ec.getColumn().getColumnId();
-                if (id < 0 || id >= columns.length) {
-                    return null;
-                }
-                projCols[i] = id;
-            } else if (e.isConstant()) {
-                projCols[i] = -1;
-                projConsts[i] = e.getValue(session);
-            } else {
-                // M20-2：表达式投影在行发出时逐行求值；非确定表达式与顶层子查询交回 H2
-                if (e instanceof Subquery
-                        || !e.isEverything(ExpressionVisitor.DETERMINISTIC_VISITOR)) {
-                    return null;
-                }
-                HashSet<Column> refs = new HashSet<>();
-                e.isEverything(ExpressionVisitor.getColumnsVisitor(refs, table));
-                for (Column c : refs) {
-                    if (c.getTable() != table || c.getColumnId() < 0
-                            || c.getColumnId() >= columns.length) {
-                        return null;
-                    }
-                }
-                projCols[i] = -1;
-                projConsts[i] = ValueNull.INSTANCE;
-                projExprs[i] = e;
-                for (Column c : refs) {
-                    exprRefCols.add(c.getColumnId());
-                }
-            }
-        }
-        int[] uniqueProjCols = new int[outLen + exprRefCols.size()];
-        int uniqueCount = 0;
-        int[] projToUnique = new int[outLen];
-        for (int i = 0; i < outLen; i++) {
-            int col = projCols[i];
-            if (col < 0) {
-                projToUnique[i] = -1;
-                continue;
-            }
-            int found = -1;
-            for (int u = 0; u < uniqueCount; u++) {
-                if (uniqueProjCols[u] == col) {
-                    found = u;
-                    break;
-                }
-            }
-            if (found < 0) {
-                found = uniqueCount;
-                uniqueProjCols[uniqueCount++] = col;
-            }
-            projToUnique[i] = found;
-        }
-        // 表达式引用列并入延迟读集：只在段真正发出一行时才读回
-        for (int i = 0; i < exprRefCols.size(); i++) {
-            int col = exprRefCols.get(i);
-            int found = -1;
-            for (int u = 0; u < uniqueCount; u++) {
-                if (uniqueProjCols[u] == col) {
-                    found = u;
-                    break;
-                }
-            }
-            if (found < 0) {
-                uniqueProjCols[uniqueCount++] = col;
-            }
-        }
-
         VectorizedFilter filter = null;
         if (condition != null) {
             filter = VectorizedFilter.compile(condition, tableFilter, session);
@@ -203,7 +125,7 @@ final class OrderedStreamingExecutor {
         table.getStore().recordOrderedStreamingClaim();
         return new Cursor(session, table, tableFilter, filter, compareMode(table),
                 projCols, projConsts, projExprs, projToUnique,
-                Arrays.copyOf(uniqueProjCols, uniqueCount), uniqueCount, outLen,
+                uniqueProjCols, uniqueCount, outLen,
                 sortCols, desc, nullsFirst, snapshotColumns, offset, built);
     }
 
@@ -506,8 +428,7 @@ final class OrderedStreamingExecutor {
                     break;
                 }
             }
-            this.hasExprs = exprs;
-            this.colToVec = new int[table.getColumns().length];
+            this.hasExprs = exprs;            this.colToVec = new int[table.getColumns().length];
             Arrays.fill(colToVec, -1);
             for (int u = 0; u < uniqueCount; u++) {
                 colToVec[uniqueProjCols[u]] = u;
@@ -770,61 +691,6 @@ final class OrderedStreamingExecutor {
                     out[c] = projExprs[c].getValue(session);
                 }
             }
-        }
-    }
-
-    /** 发射期求值用的行视图：列值直接从延迟读回的列向量或活像行读取。 */
-    private static final class EmitRow extends Row {
-
-        private final ColumnVector[] vecs;
-        private final int[] colToVec;
-        private final Value[] row;
-        private final int idx;
-
-        EmitRow(ColumnVector[] vecs, int[] colToVec, int idx, long rowId) {
-            this.vecs = vecs;
-            this.colToVec = colToVec;
-            this.row = null;
-            this.idx = idx;
-            this.key = rowId;
-        }
-
-        EmitRow(Value[] row, long rowId) {
-            this.vecs = null;
-            this.colToVec = null;
-            this.row = row;
-            this.idx = -1;
-            this.key = rowId;
-        }
-
-        @Override
-        public Value getValue(int i) {
-            return vecs != null ? vecs[colToVec[i]].get(idx) : row[i];
-        }
-
-        @Override
-        public void setValue(int i, Value v) {
-            throw new UnsupportedOperationException("流式发射行不可写入");
-        }
-
-        @Override
-        public void copyFrom(org.h2.result.SearchRow source) {
-            throw new UnsupportedOperationException("流式发射行不可写入");
-        }
-
-        @Override
-        public int getColumnCount() {
-            return vecs != null ? colToVec.length : row.length;
-        }
-
-        @Override
-        public Value[] getValueList() {
-            throw new UnsupportedOperationException("流式发射行不支持整行物化");
-        }
-
-        @Override
-        public int getMemory() {
-            return org.h2.engine.Constants.MEMORY_ROW + 24;
         }
     }
 
