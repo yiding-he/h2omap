@@ -61,7 +61,8 @@ class SegmentFileFormatTest {
                         new org.h2.table.Column("B", TypeInfo.getTypeInfo(Value.VARCHAR)) },
                 OmapOptions.from(List.of("segmentSize=" + segmentSize,
                         "compactionMinRows=" + Integer.MAX_VALUE)),
-                CompareMode.getInstance(null, 0));
+                CompareMode.getInstance(null, 0),
+                new ResidentBudget(0));
     }
 
     private static Value[] row(int a, String b) {
@@ -553,11 +554,22 @@ class SegmentFileFormatTest {
     }
 
     private static ColumnarStore newColumnarStore(String... params) {
+        // residentBytes 已改为数据库全局预算：测试里从参数列表提取后注入 ResidentBudget。
+        long residentBudget = 0;
+        java.util.List<String> list = new java.util.ArrayList<>();
+        for (String param : params) {
+            if (param.startsWith("residentBytes=")) {
+                residentBudget = Long.parseLong(param.substring("residentBytes=".length()));
+            } else {
+                list.add(param);
+            }
+        }
         return new ColumnarStore(
                 new org.h2.table.Column[] {
                         new org.h2.table.Column("A", TypeInfo.getTypeInfo(Value.INTEGER)),
                         new org.h2.table.Column("B", TypeInfo.getTypeInfo(Value.VARCHAR)) },
-                OmapOptions.from(List.of(params)),
-                CompareMode.getInstance(null, 0));
+                OmapOptions.from(list),
+                CompareMode.getInstance(null, 0),
+                new ResidentBudget(residentBudget));
     }
 }

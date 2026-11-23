@@ -56,7 +56,7 @@ class ColumnarStoreTest {
                         new Column("B", TypeInfo.getTypeInfo(Value.VARCHAR)) },
                 OmapOptions.from(List.of("segmentSize=" + segmentSize,
                         "compactionMinRows=" + compactionMinRows)),
-                CompareMode.getInstance(null, 0));
+                CompareMode.getInstance(null, 0), new ResidentBudget(0));
     }
 
     private static Value[] row(int a, String b) {
@@ -76,7 +76,7 @@ class ColumnarStoreTest {
                         TypeInfo.getTypeInfo(Value.ARRAY, -1, -1, INTEGER_TYPE)) },
                 OmapOptions.from(List.of("segmentSize=" + segmentSize,
                         "compactionMinRows=" + compactionMinRows)),
-                CompareMode.getInstance(null, 0));
+                CompareMode.getInstance(null, 0), new ResidentBudget(0));
     }
 
     private static Value[] arrayRow(Value array) {
@@ -395,7 +395,7 @@ class ColumnarStoreTest {
                 new Column[] { new Column("S", TypeInfo.getTypeInfo(Value.VARCHAR, 64, 0, null)) },
                 OmapOptions.from(List.of("segmentSize=" + segmentSize,
                         "compactionMinRows=" + compactionMinRows)),
-                CompareMode.getInstance(null, 0));
+                CompareMode.getInstance(null, 0), new ResidentBudget(0));
     }
 
     private static Value[] varcharRow(Value value) {
@@ -407,7 +407,7 @@ class ColumnarStoreTest {
                 new Column[] { new Column("C", TypeInfo.getTypeInfo(Value.CLOB, 1 << 30, 0, null)) },
                 OmapOptions.from(List.of("segmentSize=" + segmentSize,
                         "compactionMinRows=" + compactionMinRows)),
-                CompareMode.getInstance(null, 0));
+                CompareMode.getInstance(null, 0), new ResidentBudget(0));
     }
 
     private static Value[] clobRow(Value value) {

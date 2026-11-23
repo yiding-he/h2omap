@@ -299,7 +299,8 @@ class OmapTableContractTest {
             try (Connection c = DriverManager.getConnection(url, "sa", "");
                     Statement s = c.createStatement()) {
                 s.execute(createTable("T", "ID INT, V INT",
-                        "\"segmentSize=4\", \"residentBytes=1\""));
+                        "\"segmentSize=4\""));
+                s.execute("SET OMAP_RESIDENT_BYTES '1'");
                 try (PreparedStatement ps = c.prepareStatement("INSERT INTO T VALUES (?, ?)")) {
                     for (int i = 0; i < 16; i++) {
                         ps.setInt(1, i);
@@ -346,7 +347,8 @@ class OmapTableContractTest {
             try (Connection first = DriverManager.getConnection(url, "sa", "")) {
                 try (Statement s = first.createStatement()) {
                     s.execute(createTable("T", "ID INT, V VARCHAR(64), IV INT",
-                            "\"segmentSize=50\", \"residentBytes=40k\""));
+                            "\"segmentSize=50\""));
+                    s.execute("SET OMAP_RESIDENT_BYTES '40k'");
                     String pad = "v".repeat(60);
                     try (java.sql.PreparedStatement ps = first.prepareStatement(
                             "INSERT INTO T VALUES (?, ?, ?)")) {
@@ -407,6 +409,83 @@ class OmapTableContractTest {
                 assertEquals("v".repeat(60) + "59", toString(s, "SELECT V FROM T WHERE ID = 59"));
                 assertFalse(store.isSegmentResident(0), "部分列读不进驻留模型");
                 assertTrue(store.isSegmentResident(7), "预载驻留的最新段不受影响");
+            }
+        } finally {
+            if (previous == null) {
+                System.clearProperty(key);
+            } else {
+                System.setProperty(key, previous);
+            }
+        }
+    }
+
+    /**
+     * 共享驻留预算下的多表预载停止：两表合计超出全局预算时，各表的预载以全库驻留量之和
+     * 为停止条件（而不是本表持量），重开后全库驻留压进预算内、至少一张表的最老段不驻留。
+     */
+    @Test
+    void lazyLoadStopsAtSharedResidentBudgetAcrossTables(@TempDir Path dir) throws Exception {
+        String key = "h2.omapLazyLoad";
+        String previous = System.getProperty(key);
+        System.setProperty(key, "true");
+        try {
+            String url = "jdbc:h2:" + dir.resolve("lazySharedBudget");
+            try (Connection first = DriverManager.getConnection(url, "sa", "")) {
+                try (Statement s = first.createStatement()) {
+                    String pad = "v".repeat(60);
+                    for (String t : new String[] { "T1", "T2" }) {
+                        s.execute(createTable(t, "ID INT, V VARCHAR(64), IV INT",
+                                "\"segmentSize=50\""));
+                        try (java.sql.PreparedStatement ps = first.prepareStatement(
+                                "INSERT INTO " + t + " VALUES (?, ?, ?)")) {
+                            for (int i = 0; i < 200; i++) {
+                                ps.setInt(1, i);
+                                ps.setString(2, pad + i);
+                                ps.setInt(3, i);
+                                ps.addBatch();
+                            }
+                            ps.executeBatch();
+                        }
+                    }
+                    // 每表 4 段约 60 KB，两表合计约 120 KB；全局 90k = 92160 装不下合计。
+                    s.execute("SET OMAP_RESIDENT_BYTES '90k'");
+                }
+            }
+            try (Connection second = DriverManager.getConnection(url, "sa", "");
+                    Statement s = second.createStatement()) {
+                org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                        ((org.h2.jdbc.JdbcConnection) second).getSession();
+                com.hyd.h2omap.table.OmapTable t1 = (com.hyd.h2omap.table.OmapTable)
+                        session.getDatabase().getMainSchema().findTableOrView(session, "T1");
+                com.hyd.h2omap.table.OmapTable t2 = (com.hyd.h2omap.table.OmapTable)
+                        session.getDatabase().getMainSchema().findTableOrView(session, "T2");
+                com.hyd.h2omap.storage.ColumnarStore s1 = t1.getStore();
+                com.hyd.h2omap.storage.ColumnarStore s2 = t2.getStore();
+                // 等预载与逐出稳定：出现逐出后计数 500 ms 不变即认为收尾。
+                long deadline = System.currentTimeMillis() + 10_000;
+                long stableSince = -1;
+                long evictedSeen = -1;
+                while (System.currentTimeMillis() < deadline) {
+                    long evicted = s1.getEvictedSegmentCount() + s2.getEvictedSegmentCount();
+                    if (evicted >= 1 && evicted == evictedSeen) {
+                        if (stableSince < 0) {
+                            stableSince = System.currentTimeMillis();
+                        } else if (System.currentTimeMillis() - stableSince >= 500) {
+                            break;
+                        }
+                    } else {
+                        evictedSeen = evicted;
+                        stableSince = -1;
+                    }
+                    Thread.sleep(20);
+                }
+                assertTrue(s1.getResidentUsed() <= 92160,
+                        "全库驻留量之和应压进 90k: " + s1.getResidentUsed());
+                // 120 KB 合计装不进 90k：至少一张表的最老段必须被逐出或未被预载。
+                assertFalse(s1.isSegmentResident(0) && s2.isSegmentResident(0),
+                        "全库预算下两表的最老段不可能都驻留");
+                assertEquals("200", toString(s, "SELECT COUNT(*) FROM T1"));
+                assertEquals("200", toString(s, "SELECT COUNT(*) FROM T2"));
             }
         } finally {
             if (previous == null) {
@@ -2190,7 +2269,8 @@ class OmapTableContractTest {
         try (Connection c = DriverManager.getConnection(url, "sa", "");
                 Statement s = c.createStatement()) {
             s.execute(createTable("T", "ID INT PRIMARY KEY, V VARCHAR(64), IV INT",
-                    "\"segmentSize=50\", \"compactionMinRows=100000\", \"residentBytes=1\""));
+                    "\"segmentSize=50\", \"compactionMinRows=100000\""));
+            s.execute("SET OMAP_RESIDENT_BYTES '1'");
             for (int i = 0; i < 200; i++) {
                 s.execute("INSERT INTO T VALUES (" + i + ", '" + pad + i + "', " + i + ")");
             }
@@ -2222,19 +2302,21 @@ class OmapTableContractTest {
     }
 
     /**
-     * residentBytes 的单位后缀：k/m/g 不区分大小写，按 1024 换算；不带单位即字节；
-     * 非法后缀建表即报错。3 列表形每段约 15 KB：30k=30720 容两段容不下三段，
-     * 若被误解析为 30000 则只容一段，驻留集可以区分两者。
+     * SET OMAP_RESIDENT_BYTES 的单位后缀：k/m/g 不区分大小写，按 1024 换算；不带单位即字节；
+     * 非法后缀、缺失数字与 NULL 报 Invalid value，0 合法（关闭逐出）；旧建表 WITH 参数
+     * residentBytes 仅做兼容校验，不再驱动逐出。3 列表形每段约 15 KB：30k=30720 容两段
+     * 容不下三段，若被误解析为 30000 则只容一段，驻留集可以区分两者。
      */
     @Test
-    void residentBytesAcceptsUnitSuffixes(@TempDir Path dir) throws Exception {
+    void setOmapResidentBytesAcceptsUnitSuffixes(@TempDir Path dir) throws Exception {
         String pad = "v".repeat(60);
         try (Connection c = DriverManager.getConnection(
                 "jdbc:h2:" + dir.resolve("sfx"), "sa", "");
                 Statement s = c.createStatement()) {
             // 逐出只在文件模式库生效，本用例必须建在文件库上。
+            s.execute("SET OMAP_RESIDENT_BYTES '30k'");
             s.execute(createTable("T_SFX", "ID INT PRIMARY KEY, V VARCHAR(64), IV INT",
-                    "\"segmentSize=50\", \"compactionMinRows=100000\", \"residentBytes=30k\""));
+                    "\"segmentSize=50\", \"compactionMinRows=100000\""));
             for (int i = 0; i < 200; i++) {
                 s.execute("INSERT INTO T_SFX VALUES (" + i + ", '" + pad + i + "', " + i + ")");
             }
@@ -2247,32 +2329,39 @@ class OmapTableContractTest {
             assertTrue(t30k.getStore().isSegmentResident(2), "30k 应容两段驻留，与 30000 可区分");
             assertFalse(t30k.getStore().isSegmentResident(0), "30k 应把最老的段逐出");
             assertEquals("200", toString(s, "SELECT COUNT(*) FROM T_SFX"));
+            // 解析值规范化后进 H2 目录的 Setting。
+            assertEquals("30720", settingValue(s, "OMAP_RESIDENT_BYTES"));
 
+            // 调大到 8G（= 形式）：不预载，新表在新预算下写入不逐出。
+            s.execute("SET OMAP_RESIDENT_BYTES = '8G'");
             s.execute(createTable("T_SFX2", "ID INT PRIMARY KEY, V VARCHAR(64), IV INT",
-                    "\"segmentSize=50\", \"compactionMinRows=100000\", \"residentBytes=8G\""));
+                    "\"segmentSize=50\", \"compactionMinRows=100000\""));
             for (int i = 0; i < 200; i++) {
                 s.execute("INSERT INTO T_SFX2 VALUES (" + i + ", '" + pad + i + "', " + i + ")");
             }
             com.hyd.h2omap.table.OmapTable t8g = (com.hyd.h2omap.table.OmapTable)
                     session.getDatabase().getMainSchema().findTableOrView(session, "T_SFX2");
             assertEquals(0, t8g.getStore().getEvictedSegmentCount(), "8G 预算下不应逐出");
+            assertEquals("8589934592", settingValue(s, "OMAP_RESIDENT_BYTES"));
 
-            // 非法后缀与缺失数字都在建表时报错，不会静默忽略。
-            assertThrows(SQLException.class, () -> s.execute(createTable("T_SFX3", "ID INT",
-                    "\"residentBytes=8x\"")));
-            assertThrows(SQLException.class, () -> s.execute(createTable("T_SFX4", "ID INT",
-                    "\"residentBytes=k\"")));
+            // 非法后缀、缺失数字与 NULL 都报 Invalid value，不会静默忽略。
+            assertThrows(SQLException.class, () -> s.execute("SET OMAP_RESIDENT_BYTES '8x'"));
+            assertThrows(SQLException.class, () -> s.execute("SET OMAP_RESIDENT_BYTES 'k'"));
+            assertThrows(SQLException.class, () -> s.execute("SET OMAP_RESIDENT_BYTES NULL"));
+            // 0 合法：关闭逐出。
+            s.execute("SET OMAP_RESIDENT_BYTES '0'");
+            assertEquals("0", settingValue(s, "OMAP_RESIDENT_BYTES"));
         }
     }
 
     /**
-     * ALTER TABLE SET RESIDENT_BYTES：调小立即逐出、查询仍正确（定界与部分列读）；
+     * SET OMAP_RESIDENT_BYTES：调小立即逐出、查询仍正确（定界与部分列读）；
      * 调大后向量化查询不填驻留，行式路径触达的段按新预算读回驻留（不重启预载）；
-     * 改动同步进 H2 目录的建表 SQL，重开库后按新值生效。
+     * 值持久化进 H2 目录的 Setting，重开库重放 SET 后对已存在的表生效、新表构造时读到同一预算。
      */
     @Test
-    void alterTableSetResidentBytesAppliesAndPersists(@TempDir Path dir) throws Exception {
-        String url = "jdbc:h2:" + dir.resolve("alterres");
+    void setOmapResidentBytesAppliesAndPersists(@TempDir Path dir) throws Exception {
+        String url = "jdbc:h2:" + dir.resolve("setres");
         String pad = "v".repeat(60);
         try (Connection c = DriverManager.getConnection(url, "sa", "");
                 Statement s = c.createStatement()) {
@@ -2285,84 +2374,131 @@ class OmapTableContractTest {
                     ((org.h2.jdbc.JdbcConnection) c).getSession();
             com.hyd.h2omap.table.OmapTable t = (com.hyd.h2omap.table.OmapTable)
                     session.getDatabase().getMainSchema().findTableOrView(session, "T");
-            assertTrue(t.getStore().isSegmentResident(0), "无预算时全部驻留");
-            assertTrue(t.getStore().isSegmentResident(3), "无预算时全部驻留");
+            assertTrue(t.getStore().isSegmentResident(0), "默认预算 0 不逐出，全部驻留");
+            assertTrue(t.getStore().isSegmentResident(3), "默认预算 0 不逐出，全部驻留");
 
             // 调小到 1：立即逐出全部段。
-            s.execute("ALTER TABLE T SET RESIDENT_BYTES '1'");
+            s.execute("SET OMAP_RESIDENT_BYTES '1'");
             assertFalse(t.getStore().isSegmentResident(0), "预算 1 应立即逐出");
             assertFalse(t.getStore().isSegmentResident(3), "预算 1 应立即逐出");
             assertEquals("200", toString(s, "SELECT COUNT(*) FROM T"));
             assertEquals("19900", toString(s, "SELECT SUM(ID) FROM T"));
             assertEquals("125", toString(s, "SELECT IV FROM T WHERE ID = 125"));
-            String sql = createTableSqlFromScript(s, "T");
-            assertTrue(sql.contains("residentBytes=1"), "目录 SQL 应含新预算: " + sql);
-            assertTrue(sql.contains("segmentSize=50"), "其他 WITH 参数保留: " + sql);
+            assertEquals("1", settingValue(s, "OMAP_RESIDENT_BYTES"));
 
             // 调大到 400k（= 形式）：向量化查询走骨架定界与部分列读，不填驻留；
             // 行式路径触达的段按新预算读回驻留（不重启预载）。
             // 注意 COUNT(*) 在预算 1 阶段已执行过且数据未变，会命中 H2 结果缓存，
             // 不会触碰存储层；用没执行过的新查询触发重载。
-            s.execute("ALTER TABLE T SET RESIDENT_BYTES = '400k'");
+            s.execute("SET OMAP_RESIDENT_BYTES = '400k'");
             assertEquals("199", toString(s, "SELECT MAX(ID) FROM T"));
             assertFalse(t.getStore().isSegmentResident(0), "定界求值不进驻留模型");
             assertEquals(200, countRows(s, "SELECT DISTINCT V FROM T"));
             assertTrue(t.getStore().isSegmentResident(0), "行式路径触达后按新预算驻留");
             assertTrue(t.getStore().isSegmentResident(3), "行式路径触达后按新预算驻留");
             assertEquals("200", toString(s, "SELECT COUNT(*) FROM T"));
-            sql = createTableSqlFromScript(s, "T");
-            assertTrue(sql.contains("residentBytes=409600"), "单位后缀按 1024 换算: " + sql);
+            assertEquals("409600", settingValue(s, "OMAP_RESIDENT_BYTES"));
         }
-        // 重开库：预算随建表 SQL 持久化，行为一致。
+        // 重开库：SET 随目录重放对已存在的表生效，预算与数据一致。
         try (Connection c = DriverManager.getConnection(url, "sa", "");
                 Statement s = c.createStatement()) {
-            String sql = createTableSqlFromScript(s, "T");
-            assertTrue(sql.contains("residentBytes=409600"), "重开后仍应保持新预算: " + sql);
+            assertEquals("409600", settingValue(s, "OMAP_RESIDENT_BYTES"));
             assertEquals("200", toString(s, "SELECT COUNT(*) FROM T"));
             assertEquals("19900", toString(s, "SELECT SUM(ID) FROM T"));
             assertEquals(pad + "199", toString(s, "SELECT V FROM T WHERE ID = 199"));
+            org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                    ((org.h2.jdbc.JdbcConnection) c).getSession();
+            com.hyd.h2omap.table.OmapTable t = (com.hyd.h2omap.table.OmapTable)
+                    session.getDatabase().getMainSchema().findTableOrView(session, "T");
+            assertEquals(409600L, t.getStore().getResidentBudget(), "重放 SET 应对已存在的表生效");
+            assertTrue(t.getStore().isSegmentResident(0), "400k 预算下应全部驻留");
         }
     }
 
     /**
-     * 建表时没有 WITH 子句的表：TableBase 持有不可变空参数列表，新预算只能在
-     * 渲染结果末尾追加 WITH 子句；重开后走参数列表路径，行为一致。
+     * 驻留预算是数据库全局共享池：两表在同一库内写入后，SET 调小按全库驻留量之和逐出，
+     * 而不是每表各自持有同一预算值（后者两表合计可达两倍预算）。
      */
     @Test
-    void alterTableSetResidentBytesWithoutWithClausePersists(@TempDir Path dir) throws Exception {
-        String url = "jdbc:h2:" + dir.resolve("alternowith");
+    void setOmapResidentBytesIsSharedAcrossTables(@TempDir Path dir) throws Exception {
+        String url = "jdbc:h2:" + dir.resolve("sharedres");
+        String pad = "v".repeat(60);
         try (Connection c = DriverManager.getConnection(url, "sa", "");
                 Statement s = c.createStatement()) {
-            s.execute(createTable("T", "ID INT PRIMARY KEY, V INT", null));
-            for (int i = 0; i < 100; i++) {
-                s.execute("INSERT INTO T VALUES (" + i + ", " + i + ")");
+            s.execute(createTable("T1", "ID INT PRIMARY KEY, V VARCHAR(64), IV INT",
+                    "\"segmentSize=50\", \"compactionMinRows=100000\""));
+            s.execute(createTable("T2", "ID INT PRIMARY KEY, V VARCHAR(64), IV INT",
+                    "\"segmentSize=50\", \"compactionMinRows=100000\""));
+            for (int i = 0; i < 200; i++) {
+                s.execute("INSERT INTO T1 VALUES (" + i + ", '" + pad + i + "', " + i + ")");
+                s.execute("INSERT INTO T2 VALUES (" + i + ", '" + pad + i + "', " + i + ")");
             }
-            s.execute("ALTER TABLE T SET RESIDENT_BYTES '1'");
-            assertEquals("100", toString(s, "SELECT COUNT(*) FROM T"));
-            String sql = createTableSqlFromScript(s, "T");
-            assertTrue(sql.contains("residentBytes=1"), "无 WITH 子句的表也应持久化新参数: " + sql);
-        }
-        try (Connection c = DriverManager.getConnection(url, "sa", "");
-                Statement s = c.createStatement()) {
-            String sql = createTableSqlFromScript(s, "T");
-            assertTrue(sql.contains("residentBytes=1"), "重开后仍应保持新参数: " + sql);
-            assertEquals("100", toString(s, "SELECT COUNT(*) FROM T"));
-            assertEquals("4950", toString(s, "SELECT SUM(ID) FROM T"));
+            org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                    ((org.h2.jdbc.JdbcConnection) c).getSession();
+            com.hyd.h2omap.table.OmapTable t1 = (com.hyd.h2omap.table.OmapTable)
+                    session.getDatabase().getMainSchema().findTableOrView(session, "T1");
+            com.hyd.h2omap.table.OmapTable t2 = (com.hyd.h2omap.table.OmapTable)
+                    session.getDatabase().getMainSchema().findTableOrView(session, "T2");
+            assertTrue(t1.getStore().isSegmentResident(0), "默认预算 0 不逐出");
+            assertTrue(t2.getStore().isSegmentResident(0), "默认预算 0 不逐出");
+            // 每表 4 段约 60 KB，合计约 120 KB；全局 30k = 30720 容不下合计。
+            s.execute("SET OMAP_RESIDENT_BYTES '30k'");
+            assertTrue(t1.getStore().getResidentUsed() <= 30720,
+                    "全库驻留量之和应压进 30k: " + t1.getStore().getResidentUsed());
+            assertEquals(t1.getStore().getResidentUsed(), t2.getStore().getResidentUsed(),
+                    "两表应共享同一预算对象");
+            // 若退回每表各持 30k 的下推语义，两表合计最多逐出到约 60 KB（每表各剩两段、
+            // 逐出计数合计 4）；共享池要压进 30720 必须逐出至少 6 段。
+            assertTrue(t1.getStore().getEvictedSegmentCount() + t2.getStore().getEvictedSegmentCount()
+                    >= 6, "共享池应逐出至少 6 段");
+            assertEquals("200", toString(s, "SELECT COUNT(*) FROM T1"));
+            assertEquals("200", toString(s, "SELECT COUNT(*) FROM T2"));
+            assertEquals("19900", toString(s, "SELECT SUM(ID) FROM T1"));
+            assertEquals("19900", toString(s, "SELECT SUM(ID) FROM T2"));
         }
     }
 
     /**
-     * ALTER TABLE SET RESIDENT_BYTES 的拒绝路径：非 OMAP 表、非法后缀、NULL 值都报错；
-     * IF EXISTS 的缺失表是空操作。
+     * 旧目录重放兼容：建表 WITH 参数 residentBytes 仍接受（合法值建表成功、非法后缀建表
+     * 报错），但不再驱动逐出——预算只由全局 SET 控制。
      */
     @Test
-    void alterTableSetResidentBytesRejectsBadTargets() throws Exception {
+    void withResidentBytesParamIsAcceptedButIgnored(@TempDir Path dir) throws Exception {
+        String url = "jdbc:h2:" + dir.resolve("withcompat");
+        String pad = "v".repeat(60);
+        try (Connection c = DriverManager.getConnection(url, "sa", "");
+                Statement s = c.createStatement()) {
+            // 文件库：若旧参数仍被消费，residentBytes=1 会立即逐出全部段。
+            s.execute(createTable("T", "ID INT PRIMARY KEY, V VARCHAR(64), IV INT",
+                    "\"segmentSize=50\", \"compactionMinRows=100000\", \"residentBytes=1\""));
+            for (int i = 0; i < 200; i++) {
+                s.execute("INSERT INTO T VALUES (" + i + ", '" + pad + i + "', " + i + ")");
+            }
+            org.h2.engine.SessionLocal session = (org.h2.engine.SessionLocal)
+                    ((org.h2.jdbc.JdbcConnection) c).getSession();
+            com.hyd.h2omap.table.OmapTable t = (com.hyd.h2omap.table.OmapTable)
+                    session.getDatabase().getMainSchema().findTableOrView(session, "T");
+            assertEquals(0, t.getStore().getResidentBudget(), "旧 WITH 参数不应驱动逐出");
+            assertTrue(t.getStore().isSegmentResident(0), "全局预算 0 时应全部驻留");
+            assertEquals("200", toString(s, "SELECT COUNT(*) FROM T"));
+            // 非法后缀与缺失数字在兼容解析下仍报错，旧目录的坏值不会被静默接受。
+            assertThrows(SQLException.class, () -> s.execute(createTable("T_BAD", "ID INT",
+                    "\"residentBytes=8x\"")));
+            assertThrows(SQLException.class, () -> s.execute(createTable("T_BAD2", "ID INT",
+                    "\"residentBytes=k\"")));
+        }
+    }
+
+    /**
+     * SET OMAP_RESIDENT_BYTES 的拒绝路径：非法后缀、缺失数字、负值、NULL 都报错。
+     */
+    @Test
+    void setOmapResidentBytesRejectsBadValues() throws Exception {
         execute(createTable("T", "ID INT", null));
-        execute("CREATE TABLE T_MV(ID INT) ENGINE \"org.h2.mvstore.db.Store\"");
-        assertThrows(SQLException.class, () -> execute("ALTER TABLE T_MV SET RESIDENT_BYTES '1'"));
-        assertThrows(SQLException.class, () -> execute("ALTER TABLE T SET RESIDENT_BYTES '40x'"));
-        assertThrows(SQLException.class, () -> execute("ALTER TABLE T SET RESIDENT_BYTES NULL"));
-        execute("ALTER TABLE IF EXISTS T_NOSUCH SET RESIDENT_BYTES '1'");
+        assertThrows(SQLException.class, () -> execute("SET OMAP_RESIDENT_BYTES '40x'"));
+        assertThrows(SQLException.class, () -> execute("SET OMAP_RESIDENT_BYTES 'k'"));
+        assertThrows(SQLException.class, () -> execute("SET OMAP_RESIDENT_BYTES '-1'"));
+        assertThrows(SQLException.class, () -> execute("SET OMAP_RESIDENT_BYTES NULL"));
     }
 
     /**
@@ -2520,7 +2656,8 @@ class OmapTableContractTest {
         try (Connection c = DriverManager.getConnection(url, "sa", "");
                 Statement s = c.createStatement()) {
             s.execute(createTable("T", "ID INT PRIMARY KEY, V VARCHAR(64), IV INT",
-                    "\"segmentSize=50\", \"compactionMinRows=100000\", \"residentBytes=40000\""));
+                    "\"segmentSize=50\", \"compactionMinRows=100000\""));
+            s.execute("SET OMAP_RESIDENT_BYTES '40000'");
             for (int i = 0; i < 400; i++) {
                 s.execute("INSERT INTO T VALUES (" + i + ", '" + pad + i + "', " + i + ")");
             }
@@ -2591,7 +2728,8 @@ class OmapTableContractTest {
         try (Connection c = DriverManager.getConnection(url, "sa", "");
                 Statement s = c.createStatement()) {
             s.execute(createTable("T", "ID INT, TS TIMESTAMP, V VARCHAR(64), IV INT",
-                    "\"segmentSize=50\", \"compactionMinRows=100000\", \"residentBytes=40000\""));
+                    "\"segmentSize=50\", \"compactionMinRows=100000\""));
+            s.execute("SET OMAP_RESIDENT_BYTES '40000'");
             for (int i = 0; i < 400; i++) {
                 s.execute("INSERT INTO T VALUES (" + i
                         + ", TIMESTAMPADD(MINUTE, " + i + ", TIMESTAMP '2026-01-01 00:00:00')"
@@ -2667,7 +2805,8 @@ class OmapTableContractTest {
         try (Connection c = DriverManager.getConnection(url, "sa", "");
                 Statement s = c.createStatement()) {
             s.execute(createTable("T", "ID INT, V VARCHAR(64), IV INT, CAT VARCHAR(8), TS TIMESTAMP",
-                    "\"segmentSize=50\", \"compactionMinRows=100000\", \"residentBytes=40000\""));
+                    "\"segmentSize=50\", \"compactionMinRows=100000\""));
+            s.execute("SET OMAP_RESIDENT_BYTES '40000'");
             for (int i = 0; i < 400; i++) {
                 s.execute("INSERT INTO T VALUES (" + i + ", '" + pad + i + "', " + i
                         + ", 'c" + (i % 4) + "', TIMESTAMPADD(MINUTE, " + i
@@ -2739,7 +2878,8 @@ class OmapTableContractTest {
         try (Connection c = DriverManager.getConnection(url, "sa", "");
                 Statement s = c.createStatement()) {
             s.execute(createTable("T", "ID INT, V VARCHAR(64), CAT VARCHAR(8), TS TIMESTAMP",
-                    "\"segmentSize=50\", \"compactionMinRows=100000\", \"residentBytes=80000\""));
+                    "\"segmentSize=50\", \"compactionMinRows=100000\""));
+            s.execute("SET OMAP_RESIDENT_BYTES '80000'");
             for (int i = 0; i < 400; i++) {
                 s.execute("INSERT INTO T VALUES (" + i + ", '" + pad + i + "', 'c" + (i % 4)
                         + "', TIMESTAMPADD(MINUTE, " + i
@@ -2914,7 +3054,8 @@ class OmapTableContractTest {
         try (Connection c = DriverManager.getConnection(url, "sa", "")) {
             try (Statement s = c.createStatement()) {
                 s.execute(createTable("T", "ID INT, TS BIGINT NOT NULL",
-                        "\"segmentSize=4\", \"residentBytes=1\""));
+                        "\"segmentSize=4\""));
+                s.execute("SET OMAP_RESIDENT_BYTES '1'");
                 for (int i = 1; i <= 40; i++) {
                     s.execute("INSERT INTO T VALUES (" + i + ", " + (i * 10) + ")");
                 }
@@ -3198,7 +3339,8 @@ class OmapTableContractTest {
         try (Connection c = DriverManager.getConnection(url, "sa", "")) {
             try (Statement s = c.createStatement()) {
                 s.execute(createTable("T", "ID INT, TS BIGINT NOT NULL",
-                        "\"segmentSize=4\", \"residentBytes=1\""));
+                        "\"segmentSize=4\""));
+                s.execute("SET OMAP_RESIDENT_BYTES '1'");
                 for (int i = 1; i <= 40; i++) {
                     s.execute("INSERT INTO T VALUES (" + i + ", " + (i * 10) + ")");
                 }
@@ -3257,6 +3399,14 @@ class OmapTableContractTest {
             }
         }
         return "";
+    }
+
+    /** 读 INFORMATION_SCHEMA.SETTINGS 里的指定设置值，未设置返回 null。 */
+    private static String settingValue(Statement s, String name) throws SQLException {
+        try (ResultSet rs = s.executeQuery("SELECT SETTING_VALUE FROM INFORMATION_SCHEMA.SETTINGS"
+                + " WHERE SETTING_NAME = '" + name + "'")) {
+            return rs.next() ? rs.getString(1) : null;
+        }
     }
 
     private static String toString(Statement s, String sql) throws SQLException {

@@ -42,6 +42,7 @@ import com.hyd.h2omap.engine.OmapOptions;
 import com.hyd.h2omap.stats.ZoneMap;
 import com.hyd.h2omap.storage.ColumnSegment;
 import com.hyd.h2omap.storage.ColumnarStore;
+import com.hyd.h2omap.storage.ResidentBudget;
 import com.hyd.h2omap.vector.NullBitmap;
 
 /**
@@ -82,7 +83,7 @@ class SegmentUpgradeTest {
     private static ColumnarStore newStore() {
         return new ColumnarStore(columns(),
                 OmapOptions.from(List.of("segmentSize=4", "compactionMinRows=100000")),
-                CompareMode.getInstance(null, 0));
+                CompareMode.getInstance(null, 0), new ResidentBudget(0));
     }
 
     /** 行首元素是 rowId，其余按列。b 为 null 时 B 列含 NULL。 */
