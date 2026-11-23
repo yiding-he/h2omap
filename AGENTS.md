@@ -28,7 +28,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变）。被替换的 8 个 H2 类按该版本源码合入，升级时必须逐类重新比对 |
 | 依赖 | 运行期只有 `com.h2database:h2`，测试用 `junit-jupiter`，构建期插件 `maven-shade-plugin` |
 | 测试口径 | 新增测试不建 `T_MV` MVStore 对照表，用例内预置期望值直接断言；既有含 MVStore 对照的用例保持不动，MVStore 仅保留结果正确性对照用途 |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（97 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（24 个用例）、`src/test/java/com/hyd/h2omap/storage/SegmentFileFormatTest.java`（10 个用例）、`src/test/java/com/hyd/h2omap/persistence/SegmentUpgradeTest.java`（6 个用例：v2→v3 升级、幂等重入、损坏文件拒绝开库）、`src/test/java/com/hyd/h2omap/persistence/ValueCodecTest.java`（3 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（101 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（24 个用例）、`src/test/java/com/hyd/h2omap/storage/SegmentFileFormatTest.java`（10 个用例）、`src/test/java/com/hyd/h2omap/persistence/SegmentUpgradeTest.java`（6 个用例：v2→v3 升级、幂等重入、损坏文件拒绝开库）、`src/test/java/com/hyd/h2omap/persistence/ValueCodecTest.java`（3 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/`。该目录可能不存在（已排除在版本控制之外）。Maven Central 的 `h2-2.5.252-sources.jar` 内容等价，但个别文件与该 zip 相差数行，核对行号时以 zip 为准 |
 | 临时目录 | 一次性脚本、探针程序与中间产物统一放 `.tmp/`（已在 `.gitignore` 排除，不进版本控制），任务收尾时清空；不再用 `target/dbg/` 或系统临时目录存放本仓库的调试产物 |
 | 文件规模 | 新增或重构的生产类控制在单次文件读取窗口内（约 1200 行 / 45 KB，源自我代理工具的读取上限），超出时按职责拆分；拆分提交只做纯搬移（包声明、可见性、import、限定名），不得顺带改逻辑，验收是全部判定用例与用例计数不变。判定依据：超限文件只能分段读取，分段读会丢失锁契约等跨段不变量的上下文，是代理误判的主要来源 |
@@ -158,7 +158,7 @@ delta rowset（Merge-on-Read 批次 2）：更新新像不再按行存放（`Map
 | --- | --- | --- |
 | `tryExecuteFlat` | 单表投影加 `WHERE`，可带 `LIMIT`、`OFFSET`；`ORDER BY` 单列且 `LIMIT` 为常量时走有序模式 | 投影项是单表列引用或常量；`tableFilter` 用的是扫描索引；有序模式要求排序键是被扫描表的列、`limit + offset` 不超过 10000 |
 | `tryExecuteGroup` | 单表聚合，可带 `GROUP BY`、`HAVING` | 分组键是单表列引用；结果列是聚合或分组键；`qualifyIndex < 0` |
-| `tryExecuteOrderedStreaming`（M20） | 单表无 `LIMIT` 的 `ORDER BY`，可带 `WHERE`、`OFFSET` | 排序键全是单表列引用；排序首列不含 NULL 行——按快照内各段骨架的 hasNull 判定，任一参与段首列 hasNull 为真即交回（M21 前要求首列声明 NOT NULL）；首列段间 zone 区间两两严格不相交（区间相交、边界缺失即交回 H2）；投影是单表列引用、常量或确定表达式（含 `SELECT *`；顶层子查询、非确定表达式与 `_ROWID_` 等伪列交回 H2）；`tableFilter` 用扫描索引 |
+| `tryExecuteOrderedStreaming`（M20/M22） | 单表无 `LIMIT` 的 `ORDER BY`，可带 `WHERE`、`OFFSET` | 排序键全是单表列引用；排序首列不含 NULL 行——按快照内各段骨架的 hasNull 判定，任一参与段首列 hasNull 为真即交回（M21 前要求首列声明 NOT NULL）；首列段间 zone 区间次邻严格分离（M22 起相邻段允许边界相交，相交带行归入下一发射单元一起归并；次邻区间相接/相交、边界缺失即交回 H2）；投影是单表列引用、常量或确定表达式（含 `SELECT *`；顶层子查询、非确定表达式与 `_ROWID_` 等伪列交回 H2）；`tableFilter` 用扫描索引 |
 
 共同的拒绝条件：`result` 为 null、`filters.size() != 1`、`FOR UPDATE`、窗口查询、`DISTINCT` 或 `distinctExpressions != null`、`qualifyIndex >= 0`、`WITH TIES`。`VectorizedFilter.compile()` 返回 null 时同样放弃下推。
 
@@ -172,7 +172,7 @@ delta rowset（Merge-on-Read 批次 2）：更新新像不再按行存放（`Map
 
 有序模式：`ORDER BY` 单列加常量 `LIMIT` 时，段按排序列在 zone map 上的边界排序后依次扫描，用容量为 `limit + offset` 的堆留下前 N 行；堆已满且某段内最好的一行也不优于第 N 名时整段跳过。物理聚簇与排序键同向时只需扫一两段；同向不成立时结果仍正确，只是跳过不了段。多列 `ORDER BY`、排序键为表达式、`LIMIT` 缺失或超过 10000 时交回 H2。
 
-有序流式执行（M20）：无 `LIMIT` 的 `ORDER BY` 不再强制全表物化排序。排序首列的段间 zone 区间两两严格不相交时（字典序由首列决定段间顺序，与后续列取值无关），段按发射方向的边界排序后逐段流式输出：段内一次排序（复合键比较器，键并列时 rowId 定序对齐 H2 稳定排序），delta 新像与开放段行按同一比较器预先排好后逐行归并进输出流；客户端取一行才推进一次，停止取数时未被触碰的段零读取（TCP 会话按 fetch 批次拉取，客户端弃游标即停扫）。投影延迟物化：排序阶段每段只读「排序键 ∪ 谓词列」，行真正发出时才按段读回投影列（`ColumnarStore.readDeferredProjection`，驻留段直读、逐出段走切片读、不进驻留模型），被谓词整段过滤空的段不产生任何投影读。投影含表达式时求值发生在发射期而非排序期：表达式引用列并入延迟读集，行发出时把该行引用列的值经 `TableFilter.set(Row)` 就位后调 `Expression.getValue(session)` 逐行求值，只对真正发射的行付费；非确定表达式（`ExpressionVisitor.DETERMINISTIC_VISITOR` 判定，如 `RAND()`）与顶层 `Subquery` 交回 H2，嵌套在其他表达式里的子查询照 H2 行式口径逐行求值，正确性相同、仅性能不设限。首列含 NULL 行的段存在时交回 H2（NULL 组跨段，`NULLS FIRST/LAST` 要求 NULL 行整体位于首/尾，流式段推进会把 NULL 组拆散；zone map 对 NULL 不可见，段间顺序无法覆盖 NULL 组）；区间相交（随机写入形态）同样交回。NULL 判定依据是段骨架的 hasNull——M21 起从「首列声明 NOT NULL」放宽为内容判定，hasNull 随段持久化、claim 时刻零 I/O；合并把 NULL 新像写回段后 hasNull 单调置真，下一轮同查询自动回退。首行延迟从「全表扫描 + 装箱 + 全量排序」降到「最新一段解码 + 段内排序 + 首批投影」。H2 2.5.252 对 lazy 结果不复用（`Query.executeQuery` 的复用门把 lazy 结果排除，部分读、读尽、读尽未关三种形态实测都重新执行），流式游标的 `reset()` 属防御性实现、当前不可达。
+有序流式执行（M20/M22）：无 `LIMIT` 的 `ORDER BY` 不再强制全表物化排序。排序首列的段间 zone 区间次邻严格分离（M22 起相邻段允许边界相交——亚秒级迟到写入形态；字典序由首列决定段间顺序，与后续列取值无关），段按发射方向的边界排序后逐发射单元流式输出：发射单元 U_k = 段 k 的主区间行（首键严格优于段 k+1 的近端界）∪ 段 k-1 的迟到带行（首键不严格优于段 k 的近端界），段内一次排序后按近端界二分切分主区间与迟到带，单元内按复合键比较器归并（键并列时 rowId 定序对齐 H2 稳定排序）、单元之间严格有序；delta 新像与开放段行按同一比较器预先排好后逐行归并进输出流（首键优于单元近端界的活像先于整单元发射）；客户端取一行才推进一次，停止取数时未被触碰的段零读取（TCP 会话按 fetch 批次拉取，客户端弃游标即停扫）。投影延迟物化：排序阶段每段只读「排序键 ∪ 谓词列」，行真正发出时才按行来源段读回投影列（`ColumnarStore.readDeferredProjection`，驻留段直读、逐出段走切片读、不进驻留模型；迟到带行与主区间行共享同一段的投影缓存），被谓词整段过滤空的段不产生任何投影读。投影含表达式时求值发生在发射期而非排序期：表达式引用列并入延迟读集，行发出时把该行引用列的值经 `TableFilter.set(Row)` 就位后调 `Expression.getValue(session)` 逐行求值，只对真正发射的行付费；非确定表达式（`ExpressionVisitor.DETERMINISTIC_VISITOR` 判定，如 `RAND()`）与顶层 `Subquery` 交回 H2，嵌套在其他表达式里的子查询照 H2 行式口径逐行求值，正确性相同、仅性能不设限。首列含 NULL 行的段存在时交回 H2（NULL 组跨段，`NULLS FIRST/LAST` 要求 NULL 行整体位于首/尾，流式段推进会把 NULL 组拆散；zone map 对 NULL 不可见，段间顺序无法覆盖 NULL 组）；次邻区间相接/相交（跨两段的极迟写入）同样交回；相邻段边界相交已由 M22 迟到带归并覆盖。NULL 判定依据是段骨架的 hasNull——M21 起从「首列声明 NOT NULL」放宽为内容判定，hasNull 随段持久化、claim 时刻零 I/O；合并把 NULL 新像写回段后 hasNull 单调置真，下一轮同查询自动回退。首行延迟从「全表扫描 + 装箱 + 全量排序」降到「最新一段解码 + 段内排序 + 首批投影」。H2 2.5.252 对 lazy 结果不复用（`Query.executeQuery` 的复用门把 lazy 结果排除，部分读、读尽、读尽未关三种形态实测都重新执行），流式游标的 `reset()` 属防御性实现、当前不可达。
 
 子查询下推（入口 `SubqueryFold`，由 `VectorizedFilter.compile` 末尾与 `compileComparison` 调用；内层形态解析与共享原语在 `SubqueryInner`，S3/S4/S5 各形态在 `CorrelatedAggFold`/`CorrelatedExistsFold`/`CorrelatedInFold`）：
 
@@ -404,8 +404,9 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 | M17 并行段加载（P1） | 恢复与惰性预载的批量读段走固定并发 4 的共享加载线程池；预载停止信号改为「本次发布触发任何预算逐出」，预算边界多读的装不下的段至多并发数 - 1 个；并行恢复任一段失败按段序号最小者抛出 | 完成 |
 | M18 查询期段文件 IO 统计 | 采集每次查询读了哪些段文件的哪些列、搬运多少字节与读请求次数，经替换后的 `Command` 归组、`JdbcStatement.getMoreResults()` 回传；另在两个读入口加在途请求合并，消除并发窗口内的重复读盘 | 完成 |
 | M19 逐出段列切片缓存 | 临时切片读的结果按 `(段号, 代数, 列集)` 缓存，字节预算 + LRU；预算是数据库全局变量 `SET OMAP_SLICE_CACHE_BYTES`（默认与下限 32 MiB，持久化进目录）；失效坐标只有 generation | 完成 |
-| M20 有序流式执行 | 无 `LIMIT` 的 `ORDER BY` 在首列段间 zone 区间两两严格不相交时按段流式输出：段按发射序边界排序、段内一次排序、delta 新像与开放段行归并；投影延迟物化，段内首行发出前才读投影列；客户端停止取数即停扫。首列实际含 NULL（骨架 hasNull 判定）、区间相交、排序键为表达式时交回 H2 | 完成 |
+| M20 有序流式执行 | 无 `LIMIT` 的 `ORDER BY` 在首列段间 zone 区间两两严格不相交时按段流式输出：段按发射序边界排序、段内一次排序、delta 新像与开放段行归并；投影延迟物化，段内首行发出前才读投影列；客户端停止取数即停扫。首列实际含 NULL（骨架 hasNull 判定）、次邻区间相接或相交（M22 起相邻相交由迟到带归并覆盖）、排序键为表达式时交回 H2 | 完成 |
 | M21 格式 v3 与启动自动升级 | 段文件/manifest 版本化（OSG3/OMAPR + formatVersion，每列 hasNull 进尾部目录与骨架）；v2 目录启动时并行自动升级、失败拒绝开库、崩溃重入幂等、manifest 新版本即整体跳过；有序流式 claim 门控从「首列声明 NOT NULL」放宽为「全部参与段首列 hasNull == false」 | 完成 |
+| M22 次邻分离门控与迟到带归并 | 有序流式 claim 门控从「首列段间 zone 区间两两严格不相交」放宽为「次邻段严格分离」：相邻段边界相交（迟到写入）时，段内排序后按下一发射单元的近端界二分切分主区间与迟到带，迟到带行归入下一单元与后段主区间一起归并；次邻相接/相交、首列实际含 NULL 仍整条交回 H2。发射单元与行来源段化（`Unit`），延迟投影按行来源段读回、共享段级投影缓存。修复懒加载段读路径竞态：`readSliceTransient`/`readSegmentTransient` 先查 `ref.loaded`，段被并发读回驻留时直接返回驻留内容，不再误判为不可读 | 完成 |
 
 已确认的设计决策：
 
@@ -443,7 +444,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - 默认引擎由替换后的 `Schema.createTable()` 决定，不依赖 `DEFAULT_TABLE_ENGINE`（它会把 H2 元数据表也交给本引擎）。
 - 磁盘格式演进走「版本化 + 启动时自动升级写回」，不以删除 `.omap` 目录重灌数据作为迁移手段；manifest 版本是全局升级不变量（新版本 manifest ⇒ 全部活跃段文件已同版本，升级整体跳过），升级失败按段号最小者拒绝开库，崩溃重入靠「段文件已最新 ⇒ 只读尾部目录回填」幂等。
 - 每列 hasNull 与 zone map 同构地在段文件尾部目录与 manifest 骨架中维护：有序流式的 claim 时刻必须零 I/O 证明未读段里没有 NULL 行，而 zone map 对 NULL 不可见、不携带 NULL 存在性；判定依据因此是段内容（hasNull）而非列声明（NOT NULL）。
-- 无 `LIMIT` 的 `ORDER BY` 优化走分段有序归并流式（M20），不给排序列建二级索引：数千万行的排序列索引要占数 GB 堆，且 `append` 从 O(1) 退化为 O(log N)，会摧毁写路径 O(1) 与内存设计的前提。触发前提是排序首列段间 zone 区间两两严格不相交且首列 `NOT NULL`；区间相交或首列可空时整条查询交回 H2 行式路径。排序阶段每段只读「排序键 ∪ 谓词列」，输出流只携带复合键与 rowId，投影列在该行真正发出时才读回（延迟物化），被谓词整段过滤空的段不产生投影列 I/O。投影含表达式时求值同样发生在发射期：排序阶段不受投影影响，表达式引用列并入延迟读集，行发出时经 `TableFilter.set(Row)` 就位后逐行求值；非确定表达式与顶层子查询交回 H2。段间顺序只由首列决定，多列排序在段内用复合键比较器、键并列时 rowId 定序。
+- 无 `LIMIT` 的 `ORDER BY` 优化走分段有序归并流式（M20/M22），不给排序列建二级索引：数千万行的排序列索引要占数 GB 堆，且 `append` 从 O(1) 退化为 O(log N)，会摧毁写路径 O(1) 与内存设计的前提。触发前提是排序首列段间 zone 区间次邻严格分离（M22 起；相邻段允许边界相交，相交带行归入下一发射单元一起归并）且快照内全部参与段首列 `hasNull == false`（M21 起按骨架内容判定）；次邻区间相接/相交或任一段首列实际含 NULL 时整条查询交回 H2 行式路径。现网实测（868 对相邻段全部亚秒级相交、次邻 0 对相交、最大重叠带 12 秒 / 段跨 90 秒）证明相邻相交是写入常态，严格两两不相交的门控在真实数据上永不命中——这是 M22 的立项依据。排序阶段每段只读「排序键 ∪ 谓词列」，输出流只携带复合键与 rowId，投影列在该行真正发出时才读回（延迟物化），被谓词整段过滤空的段不产生投影列 I/O。投影含表达式时求值同样发生在发射期：排序阶段不受投影影响，表达式引用列并入延迟读集，行发出时经 `TableFilter.set(Row)` 就位后逐行求值；非确定表达式与顶层子查询交回 H2。段间顺序只由首列决定，多列排序在段内用复合键比较器、键并列时 rowId 定序。
 - 向量化快照的 `extraRows` 是按数据列索引的行，不含 0 号 rowId；活像与开放段行的 rowId 由快照携带的 `extraRowIds` 对齐数组提供，取代旧实现从 `srcRow[0].getLong()` 反解的口径（那是首列数据的值，列 0 为数值列时会产生错误并列定序，该缺陷随 M20 一并修复）。
 - 性能数字记录在 `BENCHMARK_RESULT.md` 与 `problems/查询性能优化方向.md`；回归只要求集成测试与内部计数器断言。
 
@@ -462,7 +463,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - `ILIKE`、`REGEXP` 等谓词形态未下推。
 - 锚定前缀 `LIKE 'x%'` 在向量化路径里仍逐行 `getString` 装箱后交给 `CompareLike.test`（每次加锁），未在打包字节池上直接比较前缀；`LIKE` 只参与列裁剪，不提供列值区间，因此也不参与段级剪枝，前缀查询要读全部段的该列。
 - 查询期 IO 只做采集与回传（见「查询期段文件 IO 统计」）；并发查询的 IO 资源分配（配额、请求合并、优先级）未做，当前每个查询线程各自同步直读。
-- 有序流式执行（M20）不接受的形态：排序键为表达式、投影含顶层子查询或非确定表达式（普通表达式在发射期逐行求值）、投影引用 `_ROWID_` 等伪列、排序首列实际含 NULL（跨段 NULL 组的流式汇集未实现，任一参与段首列 hasNull 为真即整条交回）、段间区间相交（随机写入形态）、带 `LIMIT` 或 `WITH TIES`、多表连接与窗口查询；这些形态交回 H2 行式路径，无 `LIMIT` 时仍是全表物化排序。流式游标的 `reset()` 经一次性验证程序实测不可达（H2 对 lazy 结果不复用），属防御性实现。
+- 有序流式执行（M20）不接受的形态：排序键为表达式、投影含顶层子查询或非确定表达式（普通表达式在发射期逐行求值）、投影引用 `_ROWID_` 等伪列、排序首列实际含 NULL（跨段 NULL 组的流式汇集未实现，任一参与段首列 hasNull 为真即整条交回）、次邻区间相接或相交（跨两段以上的极迟写入；相邻段边界相交已由 M22 的迟到带归并覆盖）、带 `LIMIT` 或 `WITH TIES`、多表连接与窗口查询；这些形态交回 H2 行式路径，无 `LIMIT` 时仍是全表物化排序。流式游标的 `reset()` 经一次性验证程序实测不可达（H2 对 lazy 结果不复用），属防御性实现。
 
 ## 待核对
 
