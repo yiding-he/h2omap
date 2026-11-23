@@ -1,12 +1,14 @@
 # OMAP（On Memory Analyze Processing）
 
-基于 H2 的纯内存列式存储。走 JDBC，不做事务，面向 OLAP，同时要接住高频细粒度变更。
+基于 H2 的列式存储引擎，数据以列段形式驻留内存并持久化到段文件，支持按预算逐出与按需读回。走 JDBC，不做事务，面向 OLAP，同时要接住高频细粒度变更。
+
+名称沿用立项时的「内存分析」口径；持久化与段级逐出引入后，内存中驻留的是查询工作集而非全部数据，实际形态见下文「存储参数与全局设置」。
 
 本分支在 H2 `2.5.252` 基础上局部替换少数类以支持向量化下推与默认 OMAP 引擎，并通过 `maven-shade-plugin` 将修改后的类与 `h2-2.5.252` 合并为单个 Jar，消除运行时类加载顺序冲突。
 
 | 需求 | 结论 | 谁来做 |
 | --- | --- | --- |
-| 纯内存 | H2 已支持 | 本项目只管理自己的内存结构 |
+| 内存驻留与持久化 | 需要实现 | 本项目：列段驻留堆、WAL + 段快照持久化、按预算逐出与按需读回 |
 | JDBC 兼容 | 完全复用 H2 | `org.h2.jdbc` 直接可用，不用重写 |
 | 列式存储 | 需要实现 | 本项目 |
 | OLAP 扫描 | 需要实现 | 列段、zone map、迟物化 |
@@ -89,7 +91,7 @@ CREATE TABLE EVENTS_MV(TS TIMESTAMP, HOST VARCHAR, COST DOUBLE)
 
 使用 `ENGINE` 需要管理员权限（`command/ddl/CreateTable.java:76-78`）。
 
-表定义随 H2 元数据（`.mv.db`）持久化；在文件模式库（如 `jdbc:h2:/path/to/db`）下，OMAP 表数据默认同步写入 `<databasePath>.omap/<schema>_<table>/`（WAL + 增量列段快照），重启后自动加载回内存。纯内存模式（`jdbc:h2:mem:...`）默认不写盘；可通过 `WITH "backup=false"` 关闭持久化，或通过 `WITH "backupDir=/path"`、`WITH "syncIntervalMs=200"` 调整存储路径与 WAL 刷盘间隔。
+表定义随 H2 元数据（`.mv.db`）持久化；在文件模式库（如 `jdbc:h2:/path/to/db`）下，OMAP 表数据默认同步写入 `<databasePath>.omap/<schema>_<table>/`（WAL + 增量列段快照），重启后自动加载回内存。内存库（`jdbc:h2:mem:...`）默认不写盘；可通过 `WITH "backup=false"` 关闭持久化，或通过 `WITH "backupDir=/path"`、`WITH "syncIntervalMs=200"` 调整存储路径与 WAL 刷盘间隔。
 
 ### 存储参数与全局设置
 
@@ -99,20 +101,21 @@ CREATE TABLE EVENTS_MV(TS TIMESTAMP, HOST VARCHAR, COST DOUBLE)
 | --- | --- | --- |
 | `segmentSize` | 每个列段的目标行数 | 65536 |
 | `compactionMinRows` | delta 攒到多少行触发合并 | 16384 |
-| `residentBytes` | 冻结段驻留堆的估算字节数预算（0 不逐出，仅文件模式库生效） | 0 |
 | `backup` / `backupDir` / `syncIntervalMs` | 持久化开关、目录与 WAL 刷盘间隔 | 自动 / 同目录 / 200 ms |
+
+驻留预算不是建表参数：它是数据库全局设置 `OMAP_RESIDENT_BYTES`（见下文）。旧目录建表 SQL 里的 `WITH "residentBytes=..."` 仍被接受，但值被忽略。
 
 运行时配置语句：
 
 ```sql
--- 调整单表驻留预算：调小立即逐出，调大由后续查询自然填驻留；改动同步进建表 SQL
-ALTER TABLE T SET RESIDENT_BYTES '40k';   -- 等号可选，后缀 k/m/g 按 1024 换算
+-- 调整数据库全局的冻结段驻留预算：调小立即在各表内再平衡逐出，调大不预载、由后续查询自然填驻留
+SET OMAP_RESIDENT_BYTES '8g';           -- 等号可选，后缀 k/m/g 按 1024 换算；默认 0 不逐出，无下限
 
 -- 调整数据库全局的逐出段列切片缓存预算：调小立即按 LRU 淘汰，调大不预载
 SET OMAP_SLICE_CACHE_BYTES '64m';         -- 等号可选；默认与下限均为 32 MiB（32768k）
 ```
 
-两条语句均需管理员权限。`RESIDENT_BYTES` 持久化在表的建表 SQL 里；`OMAP_SLICE_CACHE_BYTES` 是数据库全局变量，持久化在 H2 目录的 `INFORMATION_SCHEMA.SETTINGS`，对库内全部 OMAP 表生效（每个表的切片缓存各自持有该预算）。
+两条语句均需管理员权限，值都持久化在 H2 目录的 `INFORMATION_SCHEMA.SETTINGS`，重开库重放后生效，对库内全部 OMAP 表生效。`OMAP_RESIDENT_BYTES` 是全部表共享的一个总预算（各表在自己的写锁内只能逐出本表的段，因此是软上限）；`OMAP_SLICE_CACHE_BYTES` 则由每张表的切片缓存各自持有。
 
 ## 已知限制
 

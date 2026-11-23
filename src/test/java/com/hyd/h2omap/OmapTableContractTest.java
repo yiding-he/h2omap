@@ -287,7 +287,7 @@ class OmapTableContractTest {
      */
     /**
      * 查询期段文件 IO 统计随第二个结果集返回客户端。
-     * segmentSize=4 产生 4 个冻结段；residentBytes=1 容不下任何段，全部逐出。
+     * segmentSize=4 产生 4 个冻结段；SET OMAP_RESIDENT_BYTES '1' 容不下任何段，全部逐出。
      * SUM(V) 命中逐出段时按需读回列切片，统计里应出现每次读取的字节数。
      */
     @Test
@@ -3699,19 +3699,6 @@ class OmapTableContractTest {
         com.hyd.h2omap.table.OmapTable t = (com.hyd.h2omap.table.OmapTable)
                 session.getDatabase().getMainSchema().findTableOrView(session, table);
         return t.getStore();
-    }
-
-    private static String createTableSqlFromScript(Statement s, String table) throws SQLException {
-        try (ResultSet rs = s.executeQuery("SCRIPT")) {
-            while (rs.next()) {
-                String row = rs.getString(1);
-                if (row != null && row.startsWith("CREATE")
-                        && (row.contains("\"" + table + "\"(") || row.contains("TABLE " + table + "("))) {
-                    return row;
-                }
-            }
-        }
-        return "";
     }
 
     /** 读 INFORMATION_SCHEMA.SETTINGS 里的指定设置值，未设置返回 null。 */

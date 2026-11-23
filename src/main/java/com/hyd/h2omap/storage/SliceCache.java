@@ -14,7 +14,7 @@ import java.util.Map;
  * 不再被命中。delta 的未回写删除与更新新像不在切片内，查询时的可见性判定另走 delta，
  * 所以 delta 变化不影响本缓存的正确性。
  *
- * <p>与段级驻留（{@code residentBytes}）相互独立：本缓存不计入驻留预算、不参与逐出、
+ * <p>与段级驻留（{@code SET OMAP_RESIDENT_BYTES} 的预算）相互独立：本缓存不计入驻留预算、不参与逐出、
  * 不触发逐出，驻留通道也不复用本缓存。两者叠加时驻留段走内存，逐出段走本缓存。
  *
  * <p>预算是数据库全局变量 {@code SET OMAP_SLICE_CACHE_BYTES} 的值（默认与下限均为 32 MiB），

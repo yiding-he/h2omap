@@ -150,7 +150,8 @@ public final class OmapOptions {
 
     /**
      * 解析字节数：纯数字按字节，可跟单位后缀 k/m/g（不区分大小写，按 1024 换算），
-     * 如 40960、40k、8g。建表 WITH 参数与 ALTER TABLE SET RESIDENT_BYTES 共用。
+     * 如 40960、40k、8g。SET OMAP_RESIDENT_BYTES 与 SET OMAP_SLICE_CACHE_BYTES 共用；
+     * 兼容接受的旧建表参数 residentBytes 也经此校验（值被忽略）。
      */
     public static long parseByteSize(String key, String value) {
         String s = value.trim();

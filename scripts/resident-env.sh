@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 重建 residentBytes 驻留预算测试环境：
+# 重建驻留预算（SET OMAP_RESIDENT_BYTES）测试环境：
 #   文件库 <数据目录>/benchdb，900 万行 10 列表 T（磁盘约 1 GB），
 #   生成后 SET OMAP_RESIDENT_BYTES '100m'（数据库全局驻留预算），重开库重放后生效。
 #

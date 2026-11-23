@@ -10,7 +10,7 @@ import com.hyd.h2omap.vector.NullBitmap;
 /**
  * 段文件的部分列读结果：只含请求列的向量与 zone map，外加行数与删除位图。
  *
- * <p>切片不进入驻留模型：不注册段引用、不计入 residentBytes 预算、不触发 LRU 触碰，
+ * <p>切片不进入驻留模型：不注册段引用、不计入驻留预算（SET OMAP_RESIDENT_BYTES）、不触发 LRU 触碰，
  * 只服务按需读路径。预加载与逐出读回都读整段，不经此类。
  */
 public final class ColumnSlice {
