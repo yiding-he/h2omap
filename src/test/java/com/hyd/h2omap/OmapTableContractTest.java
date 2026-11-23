@@ -2958,16 +2958,106 @@ class OmapTableContractTest {
     }
 
     @Test
-    void orderedStreamingOverlappingZonesFallBackToH2() throws SQLException {
+    void orderedStreamingAdjacentOverlapIsClaimedAndSorted() throws SQLException {
         execute(createTable("T4", "ID INT, TS BIGINT NOT NULL, V INT",
                 "\"segmentSize=4\", \"compactionMinRows=100000\""));
         execute("INSERT INTO T4 VALUES (1, 10, 1), (2, 5, 2), (3, 8, 3), (4, 2, 4)");
         execute("INSERT INTO T4 VALUES (5, 9, 5), (6, 7, 6), (7, 10, 7), (8, 3, 8)");
+        // 两段区间 [2,10] 与 [3,10] 相邻相交，次邻门控（两段时恒成立）应命中流式，
+        // 10 并列按 ID 定序
         long claims = omapStore("T4").getOrderedStreamingClaims();
         assertEquals(List.of("1/10", "7/10", "5/9", "3/8", "6/7", "2/5", "8/3", "4/2"),
                 rows("SELECT ID, TS FROM T4 ORDER BY TS DESC, ID"));
-        assertEquals(claims, omapStore("T4").getOrderedStreamingClaims(),
-                "段间区间相交应交回 H2 行式路径，不命中流式下推");
+        assertEquals(claims + 1, omapStore("T4").getOrderedStreamingClaims(),
+                "相邻段边界相交（次邻分离成立）应命中有序流式下推");
+    }
+
+    /**
+     * M22 迟到带归并：相邻段边界相交时，相交带的行归入下一发射单元一起排序。
+     * 段区间 [2,10]/[3,11]/[12,16]/[13,19]：seg0∩seg1 与 seg2∩seg3 相邻相交、
+     * 次邻严格分离；开放段行（17:4、18:7）与 delta 新像（9:6）落在早段区间内按序归并。
+     */
+    @Test
+    void orderedStreamingLateRowsMergeAcrossBoundaries() throws SQLException {
+        execute(createTable("T5", "ID INT, TS BIGINT NOT NULL, V INT, NAME VARCHAR",
+                "\"segmentSize=4\", \"compactionMinRows=100000\""));
+        execute("INSERT INTO T5 VALUES (1, 10, 1, 'a'), (2, 5, 2, 'b'), (3, 8, 1, 'c'), (4, 2, 3, 'd')");
+        execute("INSERT INTO T5 VALUES (5, 9, 5, 'e'), (6, 11, 6, 'f'), (7, 10, 7, 'g'), (8, 3, 8, 'h')");
+        execute("INSERT INTO T5 VALUES (9, 14, 9, 'i'), (10, 15, 1, 'j'), (11, 12, 2, 'k'), (12, 16, 3, 'l')");
+        execute("INSERT INTO T5 VALUES (13, 17, 4, 'm'), (14, 13, 5, 'n'), (15, 18, 6, 'o'), (16, 19, 7, 'p')");
+        execute("INSERT INTO T5 VALUES (17, 4, 8, 'q'), (18, 7, 9, 'r')");
+        execute("UPDATE T5 SET TS = 6 WHERE ID = 9");
+        long claims = omapStore("T5").getOrderedStreamingClaims();
+        assertEquals(List.of("4", "8", "17", "2", "9", "18", "3", "5", "1", "7",
+                "6", "11", "14", "10", "12", "13", "15", "16"),
+                rows("SELECT ID FROM T5 ORDER BY TS"));
+        assertEquals(List.of("16", "15", "13", "12", "10", "14", "11", "6", "1", "7",
+                "5", "3", "18", "9", "2", "17", "8", "4"),
+                rows("SELECT ID FROM T5 ORDER BY TS DESC"));
+        assertEquals(claims + 2, omapStore("T5").getOrderedStreamingClaims(),
+                "相邻相交、次邻分离的形态两条查询都应命中流式下推");
+    }
+
+    /** 迟到带形态叠加 WHERE 与 SELECT *：单元内行来自两个段，延迟投影按行来源段读回。 */
+    @Test
+    void orderedStreamingLateRowsWithWhereAndSelectStar() throws SQLException {
+        execute(createTable("T5B", "ID INT, TS BIGINT NOT NULL, V INT, NAME VARCHAR",
+                "\"segmentSize=4\", \"compactionMinRows=100000\""));
+        execute("INSERT INTO T5B VALUES (1, 10, 1, 'a'), (2, 5, 2, 'b'), (3, 8, 1, 'c'), (4, 2, 3, 'd')");
+        execute("INSERT INTO T5B VALUES (5, 9, 5, 'e'), (6, 11, 6, 'f'), (7, 10, 7, 'g'), (8, 3, 8, 'h')");
+        execute("INSERT INTO T5B VALUES (9, 14, 9, 'i'), (10, 15, 1, 'j'), (11, 12, 2, 'k'), (12, 16, 3, 'l')");
+        execute("INSERT INTO T5B VALUES (13, 17, 4, 'm'), (14, 13, 5, 'n'), (15, 18, 6, 'o'), (16, 19, 7, 'p')");
+        execute("INSERT INTO T5B VALUES (17, 4, 8, 'q'), (18, 7, 9, 'r')");
+        execute("UPDATE T5B SET TS = 6 WHERE ID = 9");
+        assertEquals(List.of("16", "15", "14", "6", "7", "5", "18", "9", "17", "8"),
+                rows("SELECT ID FROM T5B WHERE V >= 5 ORDER BY TS DESC"));
+        // SELECT *：迟到带行（1/a、2/b、3/c 来自 seg0，10/j、12/l 来自 seg2）与
+        // 主区间行在同一单元内交错发射，投影列按行来源段读回
+        assertEquals(List.of(
+                "4/2/3/d", "8/3/8/h", "17/4/8/q", "2/5/2/b", "9/6/9/i", "18/7/9/r",
+                "3/8/1/c", "5/9/5/e", "1/10/1/a", "7/10/7/g", "6/11/6/f", "11/12/2/k",
+                "14/13/5/n", "10/15/1/j", "12/16/3/l", "13/17/4/m", "15/18/6/o", "16/19/7/p"),
+                rows("SELECT * FROM T5B ORDER BY TS"));
+        assertTrue(omapStore("T5B").getOrderedStreamingClaims() >= 2);
+    }
+
+    /** 次邻区间相交（跨两段的极迟写入）整条交回 H2。 */
+    @Test
+    void orderedStreamingSecondNeighborOverlapFallsBackToH2() throws SQLException {
+        execute(createTable("T6", "ID INT, TS BIGINT NOT NULL, V INT",
+                "\"segmentSize=2\", \"compactionMinRows=100000\""));
+        execute("INSERT INTO T6 VALUES (1, 12, 1), (2, 2, 2)");
+        execute("INSERT INTO T6 VALUES (3, 9, 3), (4, 3, 4)");
+        execute("INSERT INTO T6 VALUES (5, 11, 5), (6, 8, 6)");
+        // 发射序 seg0[2,12]、seg1[3,9]、seg2[8,11]：seg0.max=12 >= seg2.min=8，次邻相交
+        long claims = omapStore("T6").getOrderedStreamingClaims();
+        assertEquals(List.of("2", "4", "6", "3", "5", "1"),
+                rows("SELECT ID FROM T6 ORDER BY TS"));
+        assertEquals(claims, omapStore("T6").getOrderedStreamingClaims(),
+                "次邻区间相交应交回 H2 行式路径，不命中流式下推");
+    }
+
+    /**
+     * 次邻区间相接（边界值相等）同样拒绝：等值键跨单元时无法按 rowId 定序。
+     * ASC 侧 seg2[5,10] 与 seg0[10,15] 次邻相接必须回退；
+     * DESC 侧次邻严格分离（seg0.min=10 > seg2.max=9），命中流式且 10 并列按 rowId 定序。
+     */
+    @Test
+    void orderedStreamingTouchingSecondNeighborFallsBackToH2() throws SQLException {
+        execute(createTable("T7", "ID INT, TS BIGINT NOT NULL, V INT",
+                "\"segmentSize=2\", \"compactionMinRows=100000\""));
+        execute("INSERT INTO T7 VALUES (1, 10, 1), (2, 15, 2)");
+        execute("INSERT INTO T7 VALUES (3, 8, 3), (4, 9, 4)");
+        execute("INSERT INTO T7 VALUES (5, 5, 5), (6, 10, 6)");
+        long claims = omapStore("T7").getOrderedStreamingClaims();
+        assertEquals(List.of("5", "3", "4", "1", "6", "2"),
+                rows("SELECT ID FROM T7 ORDER BY TS"));
+        assertEquals(claims, omapStore("T7").getOrderedStreamingClaims(),
+                "次邻区间相接（等值键跨单元）应交回 H2 行式路径");
+        assertEquals(List.of("2", "1", "6", "4", "3", "5"),
+                rows("SELECT ID FROM T7 ORDER BY TS DESC"));
+        assertEquals(claims + 1, omapStore("T7").getOrderedStreamingClaims(),
+                "DESC 侧次邻严格分离应命中流式下推");
     }
 
     @Test
