@@ -16,8 +16,10 @@ import org.h2.value.CompareMode;
 import org.h2.value.ValueClob;
 import org.h2.value.Value;
 import org.h2.value.ValueArray;
+import org.h2.value.ValueBigint;
 import org.h2.value.ValueInteger;
 import org.h2.value.ValueNull;
+import org.h2.value.ValueTimestamp;
 import org.h2.value.ValueVarchar;
 import org.junit.jupiter.api.Test;
 
@@ -25,15 +27,22 @@ import com.hyd.h2omap.engine.OmapOptions;
 import com.hyd.h2omap.vector.ArrayVector;
 import com.hyd.h2omap.vector.ClobVector;
 import com.hyd.h2omap.vector.ColumnVector;
+import com.hyd.h2omap.vector.DictVarcharVector;
+import com.hyd.h2omap.vector.DictValueVector;
 import com.hyd.h2omap.vector.IntVector;
+import com.hyd.h2omap.vector.LongVector;
+import com.hyd.h2omap.vector.NullBitmap;
+import com.hyd.h2omap.vector.TimestampVector;
 import com.hyd.h2omap.vector.ValueVector;
 import com.hyd.h2omap.vector.VarcharVector;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -148,6 +157,252 @@ class ColumnarStoreTest {
         assertNull(store.materialize(second));
         assertEquals(2, store.getRowCount());
         assertEquals("3", column(store.materialize(RowId.ofSegment(1, 0)), 0));
+    }
+
+    // ------------------------------------------------------------------
+    // 阶段 A：数值列与字典码的位打包编码
+    // ------------------------------------------------------------------
+
+    /** 单列指定类型的存储，用于直接观察列向量形态。 */
+    private static ColumnarStore newTypedStore(TypeInfo type, int segmentSize, int compactionMinRows) {
+        return new ColumnarStore(
+                new Column[] { new Column("A", type) },
+                OmapOptions.from(List.of("segmentSize=" + segmentSize,
+                        "compactionMinRows=" + compactionMinRows)),
+                CompareMode.getInstance(null, 0), new ResidentBudget(0));
+    }
+
+    private static Value[] row1(Value a) {
+        return new Value[] { a };
+    }
+
+    private static ColumnVector column0(ColumnarStore store) {
+        return store.loadedSegment(0).getColumn(0);
+    }
+
+    @Test
+    void narrowBigintColumnIsBitPackedAfterFreeze() {
+        // BIGINT 值域 [0, 9]：字典容量 min(4096, max(64, 64/4)) = 64 ≥ 10 会先走字典，
+        // 要观察数值列的位打包需要基数超过字典上限：这里用 100 个不同值、最大值 < 2^7。
+        ColumnarStore store = newTypedStore(TypeInfo.getTypeInfo(Value.BIGINT), 100, Integer.MAX_VALUE);
+        for (int i = 0; i < 100; i++) {
+            store.append(row1(ValueBigint.get(i)));
+        }
+        ColumnVector v = column0(store);
+        assertInstanceOf(LongVector.class, v);
+        assertTrue(((LongVector) v).isEncoded());
+        assertTrue(v.getEstimatedMemory() < 100 * Long.BYTES);
+        for (int i = 0; i < 100; i++) {
+            assertEquals(i, v.get(i).getLong());
+        }
+        // 开放段（未冻结）仍是可写态原始数组。
+        store.append(row1(ValueBigint.get(7)));
+        assertEquals(7, store.materialize(RowId.ofSegment(1, 0)).getValueList()[0].getLong());
+    }
+
+    @Test
+    void wideIntColumnStaysRawArray() {
+        ColumnarStore store = newTypedStore(TypeInfo.getTypeInfo(Value.BIGINT), 100, Integer.MAX_VALUE);
+        // 跨越 long 值域的大数：位打包不省，保持原始数组。
+        for (int i = 0; i < 100; i++) {
+            store.append(row1(ValueBigint.get(Long.MIN_VALUE + (long) i * 100_000_000_000L)));
+        }
+        ColumnVector v = column0(store);
+        assertInstanceOf(LongVector.class, v);
+        assertFalse(((LongVector) v).isEncoded());
+    }
+
+    @Test
+    void constantBigintColumnIsBitPackedWithZeroWidth() {
+        ColumnarStore store = newTypedStore(TypeInfo.getTypeInfo(Value.BIGINT), 32, Integer.MAX_VALUE);
+        for (int i = 0; i < 32; i++) {
+            store.append(row1(ValueBigint.get(5)));
+        }
+        // 全同值退化为单值字典（零宽码），不是 LongVector。
+        ColumnVector v = column0(store);
+        assertInstanceOf(DictValueVector.class, v);
+        assertTrue(((DictValueVector) v).isEncoded());
+        assertEquals(5L, v.get(31).getLong());
+    }
+
+    @Test
+    void nullRowsDoNotBreakEncodingAndStayNull() {
+        ColumnarStore store = newTypedStore(TypeInfo.getTypeInfo(Value.BIGINT), 100, Integer.MAX_VALUE);
+        for (int i = 0; i < 100; i++) {
+            store.append(row1(i % 3 == 0 ? ValueNull.INSTANCE : ValueBigint.get(i)));
+        }
+        ColumnVector v = column0(store);
+        assertInstanceOf(LongVector.class, v);
+        assertTrue(((LongVector) v).isEncoded());
+        for (int i = 0; i < 100; i++) {
+            Value val = v.get(i);
+            if (i % 3 == 0) {
+                assertSame(ValueNull.INSTANCE, val);
+            } else {
+                assertEquals(i, val.getLong());
+            }
+        }
+    }
+
+    @Test
+    void setOnEncodedColumnUnpacksAndKeepsOtherRows() {
+        ColumnarStore store = newTypedStore(TypeInfo.getTypeInfo(Value.BIGINT), 100, Integer.MAX_VALUE);
+        for (int i = 0; i < 100; i++) {
+            store.append(row1(ValueBigint.get(i)));
+        }
+        LongVector v = (LongVector) column0(store);
+        assertTrue(v.isEncoded());
+        ColumnVector copied = v.copy();
+        copied.set(3, ValueBigint.get(100));
+        assertFalse(((LongVector) copied).isEncoded());
+        assertEquals(100L, copied.get(3).getLong());
+        assertEquals(4L, copied.get(4).getLong());
+        // 原向量不受影响。
+        assertEquals(3L, v.get(3).getLong());
+        assertTrue(v.isEncoded());
+    }
+
+    @Test
+    void copyDoesNotShareWritableArray() {
+        // 可写态的 copy 必须深拷贝数组：合并回写在 copy 上 set 时，旧段仍被并发读者持有。
+        LongVector writable = LongVector.of(new long[] { 1, 2, 3 }, new NullBitmap(3));
+        LongVector copied = (LongVector) writable.copy();
+        copied.set(0, ValueBigint.get(9));
+        assertEquals(1L, writable.get(0).getLong());
+        DictVarcharVector dict = dictOf("a", "b", "c");
+        // 从可写态再 copy：连续两次合并时 columns[c] 已是上次合并产出的可写态，深拷贝必须在这个方向成立。
+        DictVarcharVector dictWritable = (DictVarcharVector) dict.copy();
+        assertFalse(dictWritable.isEncoded());
+        DictVarcharVector dictCopy = (DictVarcharVector) dictWritable.copy();
+        dictCopy.set(0, ValueVarchar.get("zzz"));
+        assertEquals("a", dictWritable.get(0).getString());
+        assertEquals("zzz", dictCopy.get(0).getString());
+    }
+
+    private static DictVarcharVector dictOf(String... values) {
+        List<Value[]> rows = new ArrayList<>();
+        for (int i = 0; i < values.length; i++) {
+            rows.add(new Value[] { ValueBigint.get(i), ValueVarchar.get(values[i]) });
+        }
+        ColumnSegment seg = ColumnSegment.build(0, rows,
+                new TypeInfo[] { TypeInfo.getTypeInfo(Value.VARCHAR) }, CompareMode.getInstance(null, 0));
+        return (DictVarcharVector) seg.getColumn(0);
+    }
+
+    @Test
+    void dictCodesAreBitPackedAfterFreeze() {
+        // compactionMinRows=1：一次 UPDATE 即触发合并，观察合并后字典码与 dictSize 的一致性。
+        ColumnarStore store = newStore(64, 1);
+        for (int i = 0; i < 64; i++) {
+            store.append(row(i, "C" + (i % 5)));
+        }
+        DictVarcharVector v = (DictVarcharVector) store.loadedSegment(0).getColumn(1);
+        assertTrue(v.isEncoded());
+        assertEquals(5, v.dictSize());
+        for (int i = 0; i < 64; i++) {
+            assertEquals("C" + (i % 5), v.get(i).getString());
+        }
+        store.update(RowId.ofSegment(0, 10), row(10, "NEW"));
+        DictVarcharVector mv = (DictVarcharVector) store.loadedSegment(0).getColumn(1);
+        assertEquals("NEW", mv.get(10).getString());
+        assertEquals(6, mv.dictSize());
+        for (int i = 0; i < 64; i++) {
+            int code = mv.codeAt(i);
+            assertTrue(code >= 0 && code < mv.dictSize(), "code=" + code + " i=" + i);
+        }
+    }
+
+    @Test
+    void secondCompactionKeepsDictConsistent() {
+        // 连续两次合并各自写入新字符串：第二次合并时列已是可写态，copy 必须深拷贝。
+        ColumnarStore store = newStore(64, 1);
+        for (int i = 0; i < 64; i++) {
+            store.append(row(i, "C" + (i % 5)));
+        }
+        store.update(RowId.ofSegment(0, 10), row(10, "N1"));
+        store.update(RowId.ofSegment(0, 20), row(20, "N2"));
+        DictVarcharVector mv = (DictVarcharVector) store.loadedSegment(0).getColumn(1);
+        assertEquals("N1", mv.get(10).getString());
+        assertEquals("N2", mv.get(20).getString());
+        assertEquals("C0", mv.get(15).getString());
+        assertEquals(7, mv.dictSize());
+        for (int i = 0; i < 64; i++) {
+            int code = mv.codeAt(i);
+            assertTrue(code >= 0 && code < mv.dictSize(), "code=" + code + " i=" + i);
+        }
+    }
+
+    @Test
+    void singleValueDictKeepsNullsAsMinusOne() {
+        ColumnarStore store = newStore(64, Integer.MAX_VALUE);
+        for (int i = 0; i < 63; i++) {
+            store.append(row(i, "S"));
+        }
+        store.append(new Value[] { ValueInteger.get(63), ValueNull.INSTANCE });
+        DictVarcharVector v = (DictVarcharVector) store.loadedSegment(0).getColumn(1);
+        assertTrue(v.isEncoded());
+        assertEquals(1, v.dictSize());
+        assertEquals(0, v.codeAt(0));
+        assertEquals(-1, v.codeAt(63));
+        assertEquals("S", v.get(0).getString());
+        assertSame(ValueNull.INSTANCE, v.get(63));
+    }
+
+    @Test
+    void bigValuesAbove32BitsStayRawArray() {
+        ColumnarStore store = newTypedStore(TypeInfo.getTypeInfo(Value.BIGINT), 100, Integer.MAX_VALUE);
+        // 100 个不同的正值，位宽 47 > 32：位打包不省，保持原始数组。
+        for (int i = 1; i <= 100; i++) {
+            store.append(row1(ValueBigint.get((long) i << 40)));
+        }
+        ColumnVector v = column0(store);
+        assertInstanceOf(LongVector.class, v);
+        assertFalse(((LongVector) v).isEncoded());
+        assertEquals(100L << 40, v.get(99).getLong());
+    }
+
+    @Test
+    void intEncodingRejectedWhenSavingsUnderThreshold() {
+        ColumnarStore store = newTypedStore(TypeInfo.getTypeInfo(Value.INTEGER), 100, Integer.MAX_VALUE);
+        // 100 个不同的值，位宽 31：打包后 24 + 49×8 = 416 B，相比原始 400 B 节省不到 15%，退回原数组。
+        for (int i = 1; i <= 100; i++) {
+            store.append(row1(ValueInteger.get(i << 24)));
+        }
+        ColumnVector v = column0(store);
+        assertInstanceOf(IntVector.class, v);
+        assertFalse(((IntVector) v).isEncoded());
+        assertEquals(100 << 24, v.get(99).getInt());
+    }
+
+    @Test
+    void compactionReEncodesNumericColumns() {
+        ColumnarStore store = newTypedStore(TypeInfo.getTypeInfo(Value.BIGINT), 100, 1);
+        for (int i = 0; i < 100; i++) {
+            store.append(row1(ValueBigint.get(i)));
+        }
+        assertTrue(((LongVector) column0(store)).isEncoded());
+        // 合并对 copy 出的可写态逐值 set，收尾必须重新选编码，否则合并后的段退回原数组。
+        store.update(RowId.ofSegment(0, 10), row1(ValueBigint.get(50)));
+        LongVector merged = (LongVector) column0(store);
+        assertTrue(merged.isEncoded());
+        assertEquals(50L, merged.get(10).getLong());
+        assertEquals(11L, merged.get(11).getLong());
+        assertEquals(99L, merged.get(99).getLong());
+    }
+
+    @Test
+    void constantTimestampColumnIsBitPackedByValueWidth() {
+        ColumnarStore store = newTypedStore(TypeInfo.getTypeInfo(Value.TIMESTAMP), 32, Integer.MAX_VALUE);
+        ValueTimestamp ts = ValueTimestamp.fromDateValueAndNanos(20260923, 10L * 3600 * 1_000_000_000L);
+        for (int i = 0; i < 32; i++) {
+            store.append(row1(ts));
+        }
+        // TIMESTAMP 不走字典，全同值列按 dateValue 的位宽正常打包，不设常量特例。
+        TimestampVector v = (TimestampVector) column0(store);
+        assertTrue(v.isDateEncoded());
+        assertEquals(ts, v.get(31));
+        assertEquals(ts.getDateValue(), v.dateAt(0));
+        assertEquals(ts.getDateValue(), v.dateAt(31));
     }
 
     @Test
