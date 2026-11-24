@@ -29,7 +29,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变）。被替换的 8 个 H2 类按该版本源码合入，升级时必须逐类重新比对 |
 | 依赖 | 运行期只有 `com.h2database:h2`，测试用 `junit-jupiter`，构建期插件 `maven-shade-plugin` |
 | 测试口径 | 新增测试不建 `T_MV` MVStore 对照表，用例内预置期望值直接断言；既有含 MVStore 对照的用例保持不动，MVStore 仅保留结果正确性对照用途 |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（110 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（24 个用例）、`src/test/java/com/hyd/h2omap/storage/SegmentFileFormatTest.java`（10 个用例）、`src/test/java/com/hyd/h2omap/persistence/SegmentUpgradeTest.java`（6 个用例：v2→v3 升级、幂等重入、损坏文件拒绝开库）、`src/test/java/com/hyd/h2omap/persistence/ValueCodecTest.java`（3 个用例）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（115 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（37 个用例）、`src/test/java/com/hyd/h2omap/storage/SegmentFileFormatTest.java`（10 个用例）、`src/test/java/com/hyd/h2omap/persistence/SegmentUpgradeTest.java`（6 个用例：v2→v3 升级、幂等重入、损坏文件拒绝开库）、`src/test/java/com/hyd/h2omap/persistence/ValueCodecTest.java`（5 个用例）、`src/test/java/com/hyd/h2omap/vector/BitPackedTest.java`（5 个用例：位宽边界、跨字、零宽拒绝、`bitsFor`）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/`。该目录可能不存在（已排除在版本控制之外）。Maven Central 的 `h2-2.5.252-sources.jar` 内容等价，但个别文件与该 zip 相差数行，核对行号时以 zip 为准 |
 | 临时目录 | 一次性脚本、探针程序与中间产物统一放 `.tmp/`（已在 `.gitignore` 排除，不进版本控制），任务收尾时清空；不再用 `target/dbg/` 或系统临时目录存放本仓库的调试产物 |
 | 文件规模 | 新增或重构的生产类控制在单次文件读取窗口内（约 1200 行 / 45 KB，源自我代理工具的读取上限），超出时按职责拆分；拆分提交只做纯搬移（包声明、可见性、import、限定名），不得顺带改逻辑，验收是全部判定用例与用例计数不变。判定依据：超限文件只能分段读取，分段读会丢失锁契约等跨段不变量的上下文，是代理误判的主要来源 |
@@ -335,7 +335,7 @@ src/main/java/com/hyd/h2omap/
 ├── index/         扫描索引、rowId 索引、游标
 ├── storage/       列段、开放段缓冲、delta、rowId 编码、延迟行、部分列读的列切片与占位列向量；段内行迭代器独立成文件 SegmentRowIterator，向量化快照的顶层记录 VectorizedSnapshot、极值结果 ExtremeValue 与快照构建器 SnapshotQuery；后台段加载与发布 SegmentLoader；检查点与开库恢复 StorePersistence；跨表驻共享账本 ResidentBudget（按 Database 经 OmapResidentBudgets 维护）；逐出段列切片缓存 SliceCache（预算由全局 SET OMAP_SLICE_CACHE_BYTES 配置，默认 32 MiB）
 ├── persistence/   WAL 增量日志、增量列段快照与重启恢复
-├── vector/        列向量（含字典向量、数组列与 CLOB 打包）、ValueVector 回退、null 位图
+├── vector/        列向量（含字典向量、数组列与 CLOB 打包、数值列与字典码的位打包 BitPacked：可写原始数组 / 编码态双形态）、ValueVector 回退、null 位图
 ├── vectorized/    单表过滤与聚合下推：谓词编译入口 VectorizedFilter（含过滤树编译与区间/签名工具），各谓词节点独立成文件 AndNode/OrNode/ColCmpNode/ArithLongCmpNode/InNode/NullCheckNode/CardinalityCmpNode/ArrayContainsNode/LikeNode 与原始 long 集合 LongSet；子查询折叠（SubqueryFold 入口 + SubqueryInner + CorrelatedAggFold/CorrelatedInFold/CorrelatedExistsFold）；执行入口 OmapVectorizedExecutor（facade，含共用快照管线）+ FlatExecutor/OrderedExecutor/GroupExecutor；流式执行 FlatStreamingExecutor/OrderedStreamingExecutor/OrderedMergeExecutor（行源 FlatStreamingRowSource/OrderedStreamingRowSource，共用投影分类 ProjectionPlan 与发射行视图 EmitRow）；聚合口径 AggSpec、累加器 AggState、HAVING 编译 HavingPredicates；段级部分聚合缓存（SegmentAggCache）
 └── stats/         zone map；查询期段文件 IO 统计 QueryIoStats（收集器 + 明细记录）
 
@@ -357,6 +357,7 @@ src/test/java/com/hyd/h2omap/
 ├── storage/ColumnarStoreTest.java 存储层
 ├── storage/SegmentFileFormatTest.java 段文件 v2 格式与部分列读
 ├── vector/ValueVectorTest.java   回退向量
+├── vector/BitPackedTest.java     位打包
 ├── persistence/ValueCodecTest.java 段向量编码往返
 └── bench/                        测试数据生成与规模验证
 ```
@@ -384,7 +385,7 @@ src/test/java/com/hyd/h2omap/
 
 ## 当前状态与后续阶段
 
-M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成，M12（Merge-on-Read 与冷热分层）四个批次全部交付；M13（CLOB 打包存储，方案 B2）已完成；M14（段文件尾部列目录重设计，P2）、M15（裸 MIN/MAX 定界与逐出段部分列读，A+P3）、M16（快照按段懒加载与大块 I/O）、M17（并行段加载，P1）、M18（查询期段文件 IO 统计与在途读合并）、M19（逐出段列切片缓存）、M20（无 LIMIT 的 ORDER BY 有序流式执行）、M21（磁盘格式 v3、启动自动升级与有序流式 claim 门控放宽）、M22（次邻分离门控与迟到带归并）、M23（平面查询流式执行）与 M24（段间无序 ORDER BY 的 k 路归并流式执行）已完成。判定依据为 115 个契约用例、34 个存储层用例（ColumnarStoreTest 24 + SegmentFileFormatTest 10）、6 个 SegmentUpgradeTest 升级用例、3 个编码用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
+M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成，M12（Merge-on-Read 与冷热分层）四个批次全部交付；M13（CLOB 打包存储，方案 B2）已完成；M14（段文件尾部列目录重设计，P2）、M15（裸 MIN/MAX 定界与逐出段部分列读，A+P3）、M16（快照按段懒加载与大块 I/O）、M17（并行段加载，P1）、M18（查询期段文件 IO 统计与在途读合并）、M19（逐出段列切片缓存）、M20（无 LIMIT 的 ORDER BY 有序流式执行）、M21（磁盘格式 v3、启动自动升级与有序流式 claim 门控放宽）、M22（次邻分离门控与迟到带归并）、M23（平面查询流式执行）与 M24（段间无序 ORDER BY 的 k 路归并流式执行）已完成；列编码与压缩阶段 A（数值列与字典码位打包，计划见 `problems/列编码与压缩实施计划.md`）已完成，阶段 B（列块压缩与格式 v4）、C（段内分页）、D（浮点编码）未开始。判定依据为 115 个契约用例、47 个存储层用例（ColumnarStoreTest 37 + SegmentFileFormatTest 10）、6 个 SegmentUpgradeTest 升级用例、5 个编码用例、5 个位打包用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
 
 阶段编号按提出顺序，M7、M8 的实际交付早于 M6。
 
@@ -415,6 +416,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 | M22 次邻分离门控与迟到带归并 | 有序流式 claim 门控从「首列段间 zone 区间两两严格不相交」放宽为「次邻段严格分离」：相邻段边界相交（迟到写入）时，段内排序后按下一发射单元的近端界二分切分主区间与迟到带，迟到带行归入下一单元与后段主区间一起归并；次邻相接/相交、首列实际含 NULL 仍整条交回 H2。发射单元与行来源段化（`Unit`），延迟投影按行来源段读回、共享段级投影缓存。修复懒加载段读路径竞态：`readSliceTransient`/`readSegmentTransient` 先查 `ref.loaded`，段被并发读回驻留时直接返回驻留内容，不再误判为不可读 | 完成 |
 | M23 平面查询流式执行 | 无 `LIMIT` 无 `ORDER BY` 的单表平面查询流式下推：不建 `LocalResult`、不全量物化，客户端取一行才推进一次，停止取数即停扫，未触碰的段零读取。发射序驻留段优先（与 M16 无序 LIMIT 同口径），逐出段首次取行才临时切片读回、不进驻留模型；投影分类（`ProjectionPlan`）与发射行视图（`EmitRow`）从 M20 抽出共用。带 `LIMIT` 仍走 `tryExecuteFlat` 物化路径，带 `ORDER BY` 走有序流式 | 完成 |
 | M24 归并流式执行 | 段间 zone 无序的 `ORDER BY` 走 k 路归并流式：每个参与段只读排序键列、段内排序成键流，全体段头进堆归并，delta 新像与开放段行作为独立键流参与；无 zone 门控、无 hasNull 门控（NULL 组由比较器全局定序）；键流量按 `Value.getMemory()` 精确记账，超 `omap.mergeStreamMaxBytes`（默认 2 GiB）整条交回 H2。claim 链「有序流式 → 归并流式 → H2」，随机键形态（现网 `ORDER BY KEY1` 81.5 s 全量排序）首行延迟降到键列读 + 段内排序 + 堆初始化 | 完成 |
+| 列编码与压缩 | A 位打包：`INT`/`BIGINT`/`TIMESTAMP`（dateValue）与字典码按位宽打包（`BitPacked`，`long[]` 字包），向量双形态（开放段与合并回写用可写原始数组、冻结段用编码态），查询路径经单点读 `longAt`/`codeAt`/`dateAt`，不新增向量类型；编码后字节数不比原始省 15% 以上、含负值或位宽 > 32 时退回原数组；磁盘格式 v3 不变。B 列块压缩 + 格式 v4 + 启动升级、C 段内分页与页级剪枝、D 浮点编码未开始，见 `problems/列编码与压缩实施计划.md` | A 完成；B/C/D 未开始 |
 
 已确认的设计决策：
 
@@ -427,6 +429,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - 数组列拆成「前缀和下标数组 `starts` + 按行拼接的元素列」两部分：`CARDINALITY` 退化为一次整数减法。元素值类型与列声明的元素类型不一致，或元素类型带扩展类型（嵌套数组）时退回 `ValueVector`；只比较元素的值类型，不比较精度，因为 H2 给 `ARRAY[]` 的元素类型是 `NULL`、给 `ARRAY['a','bb']` 的元素类型是 `CHARACTER VARYING(2)` 这样的窄类型。数组列不参与 zone map 剪枝。
 - `ARRAY_CONTAINS` 在元素列上求值：按 `starts` 的区间找每行是否有元素相等，不在行上重建 `ValueArray`；`INT`/`BIGINT`/`DOUBLE`/`VARCHAR` 元素列走原始数组，字典元素列先在字典上算出匹配位图，其余类型逐元素 `compareTo`。语义按 H2：数组为 NULL 时结果是 NULL（`ARRAY_CONTAINS` 与 `NOT ...` 两种情况都不命中），非数组首参也返回 NULL。
 - 字典向量在建段时按基数决定：`VARCHAR` 与低基数数值列尝试建字典，容量上限 `min(4096, max(64, 行数 / 4))`，超出则退回普通向量。
+- 列编码不新增向量类型、只在 `ColumnVector` 内部换表示：向量化路径对数值列有 61 处 `instanceof XxxVector` 分发并直接读原始数组，新增类型要补全部分支，且位打包数组上逐行随机解包比原始数组更慢。因此 `IntVector`/`LongVector`/`TimestampVector`（只打包 dateValue；timeNanos 约 37 位超上限，保留原数组）与两个字典向量的码是双形态——可写态原始数组（开放段、合并回写、`ValueCodec` 读回）与编码态 `BitPacked`（冻结段）；逐行访问走单点读 `longAt`/`codeAt`/`dateAt`（一次移位一次与），整列一次性消费（序列化、建集合、哈希预计算）走 `raw*()` 整列解包且不缓存。编码在 `ColumnSegment.build()` 字典判定之后与 `applyDelta()` 末尾按列选择：按最大值位宽打包（全同值列基数 1 必先走单值字典，没有常量特例），编码后字节数不比原始省 15% 以上、含负值（按非负最大值定位宽，负值使位宽为 0）或位宽 > 32 即退回原数组；合并产出的可写态在收尾重新选编码。不做差分编码：差分态的随机单点读要 O(index) 累加，而向量化路径按选择向量随机访问占多数。磁盘格式 v3 不变，`ValueCodec` 写盘前整列解包。
 - 行式路径的区间剪枝只作用于没有未回写更新新像的段：段的 zone map 可能落后于 delta 的新像（重开后 WAL 重放把更新放回 delta 的窗口，或合并阈值未触发的窗口），被剪段内的 delta 新像会随段一起丢。删除只会收窄值域，不改变 zone map 的有效性，纯删除段仍参与剪枝（`updatedSegments` 判定）。向量化路径不受此影响（`extraRows` 无条件保留）。
 - delta rowset 的列向量只在锁内可读：`upsert` 追加与容量翻倍都会替换或改动向量内部数组，无锁读者可能看到未完整发布的向量（实测在并发合并用例里解码出负长度）。因此向量化快照在读锁内物化活像，合并第一阶段在写锁内顺带物化；位置不可变只是让锁外的「按位置双重比对」不需要值引用比对，不意味着内容可以无锁读。
 - 段级逐出按段级 LRU（未访问段按段号老优先、访问过的按访问序）而不是固定段号序：时间滚动场景下自然退化为逐出最老段，随机访问场景下被逐出的才是真冷段；逐出后段仍可见，行数、删除位图与每列 zone map 留在堆上的骨架里，因此逐出语义不复用惰性加载的「`loaded == null` 即不可见」标记，需要段内容的读路径同步读回。
@@ -466,6 +469,7 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - 数组列的剪枝与按元素过滤：数组列不参与 zone map 剪枝（算值域要重建每行 `ValueArray`，而数组值域几乎不能用于跳段），`UNNEST` 与按元素过滤也没有下推路径。
 - `collectVisibleRowIds` 的数组按 `rowCount` 估计值起步并在超出时扩容，因此估计值与实际可见行数不一致时不会越界；但行数仍不可能超过 `Integer.MAX_VALUE`（`long[]` 的长度上限）。
 - 向量化路径对 `delta` 新像与开放段的行逐行求值，这些行不参与按列扫描。
+- 位打包只覆盖非负、位宽 ≤ 32 的 `INT`/`BIGINT`/`TIMESTAMP` dateValue 列与字典码；含负值的数值列、位宽 > 32 的列、`DOUBLE`、`timeNanos`、`ValueVector` 保持原始数组。列块压缩、段内分页与浮点编码是列编码与压缩计划的后续阶段（B/C/D），未开始。
 - `GROUP BY` 的键必须是单表列引用，表达式分组键不下推。
 - 多表连接条件下的下推。子查询下推只覆盖单表 `WHERE`：投影里的子查询、JOIN 条件里的子查询、多表查询里的关联子查询仍走 H2 行式路径。
 - 关联 `IN (SELECT ...)` 的投影为表达式时不折叠（内层投影限列引用）；关联子查询的关联键限单列等值，多关联条件、关联键为表达式、内层 `HAVING`/`GROUP BY`/`DISTINCT`/窗口、内层非 OMAP 表均回退。
@@ -494,3 +498,4 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - 外部表引擎样例：`.h2/test/org/h2/test/db/TestTableEngines.java`
 - 量化对比与优化记录：`BENCHMARK_RESULT.md`、`problems/查询性能优化方向.md`
 - 标量子查询的定位记录与当前限制：`problems/子查询暂不支持.md`（文件名沿用问题发现时的判断；正文记录两轮修复：结果集复用与子查询下推，以及仍未覆盖的形态）
+- 列编码与压缩的分阶段实施计划（阶段 A 已交付，阶段 A 的实际取舍以本文「已确认的设计决策」为准）：`problems/列编码与压缩实施计划.md`
