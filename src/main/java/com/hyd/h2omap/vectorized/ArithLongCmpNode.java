@@ -52,20 +52,19 @@ final class ArithLongCmpNode implements VectorizedFilter.Node {
         ColumnVector vec = segment.getColumn(col);
         if (vec instanceof IntVector) {
             IntVector iv = (IntVector) vec;
-            int[] vals = iv.rawValues();
             NullBitmap nulls = iv.nulls();
             boolean hasNull = nulls.hasNull();
             int out = 0;
             if (fullRange) {
                 if (!hasNull) {
                     for (int i = 0; i < selCount; i++) {
-                        if (matchLong(evalArith(vals[i]))) {
+                        if (matchLong(evalArith(iv.longAt(i)))) {
                             sel[out++] = i;
                         }
                     }
                 } else {
                     for (int i = 0; i < selCount; i++) {
-                        if (!nulls.isNull(i) && matchLong(evalArith(vals[i]))) {
+                        if (!nulls.isNull(i) && matchLong(evalArith(iv.longAt(i)))) {
                             sel[out++] = i;
                         }
                     }
@@ -73,7 +72,7 @@ final class ArithLongCmpNode implements VectorizedFilter.Node {
             } else {
                 for (int i = 0; i < selCount; i++) {
                     int idx = sel[i];
-                    if ((!hasNull || !nulls.isNull(idx)) && matchLong(evalArith(vals[idx]))) {
+                    if ((!hasNull || !nulls.isNull(idx)) && matchLong(evalArith(iv.longAt(idx)))) {
                         sel[out++] = idx;
                     }
                 }
@@ -82,20 +81,19 @@ final class ArithLongCmpNode implements VectorizedFilter.Node {
         }
         if (vec instanceof LongVector) {
             LongVector lv = (LongVector) vec;
-            long[] vals = lv.rawValues();
             NullBitmap nulls = lv.nulls();
             boolean hasNull = nulls.hasNull();
             int out = 0;
             if (fullRange) {
                 for (int i = 0; i < selCount; i++) {
-                    if ((!hasNull || !nulls.isNull(i)) && matchLong(evalArith(vals[i]))) {
+                    if ((!hasNull || !nulls.isNull(i)) && matchLong(evalArith(lv.longAt(i)))) {
                         sel[out++] = i;
                     }
                 }
             } else {
                 for (int i = 0; i < selCount; i++) {
                     int idx = sel[i];
-                    if ((!hasNull || !nulls.isNull(idx)) && matchLong(evalArith(vals[idx]))) {
+                    if ((!hasNull || !nulls.isNull(idx)) && matchLong(evalArith(lv.longAt(idx)))) {
                         sel[out++] = idx;
                     }
                 }

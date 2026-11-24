@@ -18,7 +18,10 @@ import com.hyd.h2omap.vector.ArrayVector;
 import com.hyd.h2omap.vector.ColumnVector;
 import com.hyd.h2omap.vector.DictValueVector;
 import com.hyd.h2omap.vector.DictVarcharVector;
+import com.hyd.h2omap.vector.IntVector;
+import com.hyd.h2omap.vector.LongVector;
 import com.hyd.h2omap.vector.NullBitmap;
+import com.hyd.h2omap.vector.TimestampVector;
 
 /**
  * 列段。写满就换新段，段号与段内偏移在行的整个生命周期里都不变，
@@ -154,11 +157,38 @@ public final class ColumnSegment {
                 }
             }
         }
+        encodeNumericColumns(vectors);
         ZoneMap[] zones = new ZoneMap[columnTypes.length];
         for (int c = 0; c < columnTypes.length; c++) {
             zones[c] = ZoneMap.of(vectors[c], compareMode);
         }
         return new ColumnSegment(segmentId, count, vectors, zones, compareMode);
+    }
+
+    /**
+     * 对冻结后的数值列按值域选位打包编码；不划算的列保持原始数组（见 {@link IntVector#tryEncode}）。
+     * 字典列在 {@code tryBuild} 内已位打包，不在这里处理。
+     */
+    private static void encodeNumericColumns(ColumnVector[] vectors) {
+        for (int c = 0; c < vectors.length; c++) {
+            ColumnVector v = vectors[c];
+            if (v instanceof IntVector) {
+                IntVector enc = IntVector.tryEncode((IntVector) v);
+                if (enc != null) {
+                    vectors[c] = enc;
+                }
+            } else if (v instanceof LongVector) {
+                LongVector enc = LongVector.tryEncode((LongVector) v);
+                if (enc != null) {
+                    vectors[c] = enc;
+                }
+            } else if (v instanceof TimestampVector) {
+                TimestampVector enc = TimestampVector.tryEncode((TimestampVector) v);
+                if (enc != null) {
+                    vectors[c] = enc;
+                }
+            }
+        }
     }
 
     /** 数组列的元素类型。不是 TypeInfo 或缺失时返回 null，让调用方退回 ValueVector。 */
@@ -355,6 +385,7 @@ public final class ColumnSegment {
                 newZones[c] = ZoneMap.of(newColumns[c], compareMode);
             }
         }
+        encodeNumericColumns(newColumns);
         return new ColumnSegment(
                 segmentId,
                 generation + 1,

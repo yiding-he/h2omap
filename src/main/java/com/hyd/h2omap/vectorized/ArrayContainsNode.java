@@ -100,7 +100,6 @@ final class ArrayContainsNode implements VectorizedFilter.Node {
         }
         if (elements instanceof IntVector && targetType == Value.INTEGER) {
             IntVector iv = (IntVector) elements;
-            int[] vals = iv.rawValues();
             NullBitmap elementNulls = iv.nulls();
             boolean hasNull = elementNulls.hasNull();
             int t = target.getInt();
@@ -112,7 +111,7 @@ final class ArrayContainsNode implements VectorizedFilter.Node {
                 }
                 boolean found = false;
                 for (int j = starts[idx], end = starts[idx + 1]; j < end; j++) {
-                    if ((!hasNull || !elementNulls.isNull(j)) && vals[j] == t) {
+                    if ((!hasNull || !elementNulls.isNull(j)) && iv.longAt(j) == t) {
                         found = true;
                         break;
                     }
@@ -125,7 +124,6 @@ final class ArrayContainsNode implements VectorizedFilter.Node {
         }
         if (elements instanceof LongVector && targetType == Value.BIGINT) {
             LongVector lv = (LongVector) elements;
-            long[] vals = lv.rawValues();
             NullBitmap elementNulls = lv.nulls();
             boolean hasNull = elementNulls.hasNull();
             long t = target.getLong();
@@ -137,7 +135,7 @@ final class ArrayContainsNode implements VectorizedFilter.Node {
                 }
                 boolean found = false;
                 for (int j = starts[idx], end = starts[idx + 1]; j < end; j++) {
-                    if ((!hasNull || !elementNulls.isNull(j)) && vals[j] == t) {
+                    if ((!hasNull || !elementNulls.isNull(j)) && lv.longAt(j) == t) {
                         found = true;
                         break;
                     }
@@ -200,7 +198,6 @@ final class ArrayContainsNode implements VectorizedFilter.Node {
         }
         if (elements instanceof DictVarcharVector && VectorizedFilter.isStringType(targetType)) {
             DictVarcharVector dv = (DictVarcharVector) elements;
-            int[] codes = dv.rawCodes();
             Value[] dict = dv.rawDict();
             boolean[] matched = new boolean[dv.dictSize()];
             for (int d = 0; d < matched.length; d++) {
@@ -214,7 +211,7 @@ final class ArrayContainsNode implements VectorizedFilter.Node {
                 }
                 boolean found = false;
                 for (int j = starts[idx], end = starts[idx + 1]; j < end; j++) {
-                    int code = codes[j];
+                    int code = dv.codeAt(j);
                     if (code >= 0 && matched[code]) {
                         found = true;
                         break;

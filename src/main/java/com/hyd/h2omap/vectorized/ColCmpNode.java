@@ -1,5 +1,6 @@
 package com.hyd.h2omap.vectorized;
 
+import java.util.function.IntUnaryOperator;
 import java.util.BitSet;
 import java.util.function.IntConsumer;
 
@@ -88,19 +89,18 @@ final class ColCmpNode implements VectorizedFilter.Node {
         }
         if (vec instanceof DictVarcharVector) {
             DictVarcharVector dv = (DictVarcharVector) vec;
-            return filterDict(dv.rawCodes(), dv.rawDict(), dv.dictSize(), sel, selCount, fullRange,
+            return filterDict(dv::codeAt, dv.rawDict(), dv.dictSize(), sel, selCount, fullRange,
                     session, compareMode);
         }
         if (vec instanceof DictValueVector) {
             DictValueVector dv = (DictValueVector) vec;
-            return filterDict(dv.rawCodes(), dv.rawDict(), dv.dictSize(), sel, selCount, fullRange,
+            return filterDict(dv::codeAt, dv.rawDict(), dv.dictSize(), sel, selCount, fullRange,
                     session, compareMode);
         }
         return filterGeneric(vec, sel, selCount, fullRange, session, compareMode);
     }
 
     private int filterInt(IntVector vec, int[] sel, int selCount, boolean fullRange) {
-        int[] vals = vec.rawValues();
         NullBitmap nulls = vec.nulls();
         boolean hasNull = nulls.hasNull();
         long target = constant.getLong();
@@ -108,14 +108,14 @@ final class ColCmpNode implements VectorizedFilter.Node {
         if (fullRange) {
             if (!hasNull) {
                 for (int i = 0; i < selCount; i++) {
-                    if (matchLong(vals[i], target)) {
+                    if (matchLong(vec.longAt(i), target)) {
                         sel[out++] = i;
                     }
                 }
             } else {
                 long[] bits = nulls.rawBits();
                 for (int i = 0; i < selCount; i++) {
-                    if ((bits[i >>> 6] & (1L << i)) == 0 && matchLong(vals[i], target)) {
+                    if ((bits[i >>> 6] & (1L << i)) == 0 && matchLong(vec.longAt(i), target)) {
                         sel[out++] = i;
                     }
                 }
@@ -124,7 +124,7 @@ final class ColCmpNode implements VectorizedFilter.Node {
             if (!hasNull) {
                 for (int i = 0; i < selCount; i++) {
                     int idx = sel[i];
-                    if (matchLong(vals[idx], target)) {
+                    if (matchLong(vec.longAt(idx), target)) {
                         sel[out++] = idx;
                     }
                 }
@@ -132,7 +132,7 @@ final class ColCmpNode implements VectorizedFilter.Node {
                 long[] bits = nulls.rawBits();
                 for (int i = 0; i < selCount; i++) {
                     int idx = sel[i];
-                    if ((bits[idx >>> 6] & (1L << idx)) == 0 && matchLong(vals[idx], target)) {
+                    if ((bits[idx >>> 6] & (1L << idx)) == 0 && matchLong(vec.longAt(idx), target)) {
                         sel[out++] = idx;
                     }
                 }
@@ -142,21 +142,20 @@ final class ColCmpNode implements VectorizedFilter.Node {
     }
 
     private int filterLong(LongVector vec, int[] sel, int selCount, boolean fullRange) {
-        long[] vals = vec.rawValues();
         NullBitmap nulls = vec.nulls();
         boolean hasNull = nulls.hasNull();
         long target = constant.getLong();
         int out = 0;
         if (fullRange) {
             for (int i = 0; i < selCount; i++) {
-                if ((!hasNull || !nulls.isNull(i)) && matchLong(vals[i], target)) {
+                if ((!hasNull || !nulls.isNull(i)) && matchLong(vec.longAt(i), target)) {
                     sel[out++] = i;
                 }
             }
         } else {
             for (int i = 0; i < selCount; i++) {
                 int idx = sel[i];
-                if ((!hasNull || !nulls.isNull(idx)) && matchLong(vals[idx], target)) {
+                if ((!hasNull || !nulls.isNull(idx)) && matchLong(vec.longAt(idx), target)) {
                     sel[out++] = idx;
                 }
             }
@@ -204,7 +203,7 @@ final class ColCmpNode implements VectorizedFilter.Node {
         return out;
     }
 
-    private int filterDict(int[] codes, Value[] dict, int dictSize,
+    private int filterDict(IntUnaryOperator codes, Value[] dict, int dictSize,
             int[] sel, int selCount, boolean fullRange, SessionLocal session, CompareMode compareMode) {
         boolean[] allowed = new boolean[dictSize];
         boolean anyAllowed = false;
@@ -221,7 +220,7 @@ final class ColCmpNode implements VectorizedFilter.Node {
         int out = 0;
         if (fullRange) {
             for (int i = 0; i < selCount; i++) {
-                int code = codes[i];
+                int code = codes.applyAsInt(i);
                 if (code >= 0 && allowed[code]) {
                     sel[out++] = i;
                 }
@@ -229,7 +228,7 @@ final class ColCmpNode implements VectorizedFilter.Node {
         } else {
             for (int i = 0; i < selCount; i++) {
                 int idx = sel[i];
-                int code = codes[idx];
+                int code = codes.applyAsInt(idx);
                 if (code >= 0 && allowed[code]) {
                     sel[out++] = idx;
                 }
@@ -291,15 +290,13 @@ final class ColCmpNode implements VectorizedFilter.Node {
         ValueTimestamp ts = (ValueTimestamp) constant;
         long targetDate = ts.getDateValue();
         long targetNanos = ts.getTimeNanos();
-        long[] dates = vec.rawDateValues();
-        long[] nanos = vec.rawTimeNanos();
         NullBitmap nulls = vec.nulls();
         boolean hasNull = nulls.hasNull();
         int out = 0;
         if (fullRange) {
             if (!hasNull) {
                 for (int i = 0; i < selCount; i++) {
-                    if (matchTimestamp(dates[i], nanos[i], targetDate, targetNanos)) {
+                    if (matchTimestamp(vec.dateAt(i), vec.nanosAt(i), targetDate, targetNanos)) {
                         sel[out++] = i;
                     }
                 }
@@ -307,7 +304,7 @@ final class ColCmpNode implements VectorizedFilter.Node {
                 long[] bits = nulls.rawBits();
                 for (int i = 0; i < selCount; i++) {
                     if ((bits[i >>> 6] & (1L << i)) == 0
-                            && matchTimestamp(dates[i], nanos[i], targetDate, targetNanos)) {
+                            && matchTimestamp(vec.dateAt(i), vec.nanosAt(i), targetDate, targetNanos)) {
                         sel[out++] = i;
                     }
                 }
@@ -316,7 +313,7 @@ final class ColCmpNode implements VectorizedFilter.Node {
             if (!hasNull) {
                 for (int i = 0; i < selCount; i++) {
                     int idx = sel[i];
-                    if (matchTimestamp(dates[idx], nanos[idx], targetDate, targetNanos)) {
+                    if (matchTimestamp(vec.dateAt(idx), vec.nanosAt(idx), targetDate, targetNanos)) {
                         sel[out++] = idx;
                     }
                 }
@@ -325,7 +322,7 @@ final class ColCmpNode implements VectorizedFilter.Node {
                 for (int i = 0; i < selCount; i++) {
                     int idx = sel[i];
                     if ((bits[idx >>> 6] & (1L << idx)) == 0
-                            && matchTimestamp(dates[idx], nanos[idx], targetDate, targetNanos)) {
+                            && matchTimestamp(vec.dateAt(idx), vec.nanosAt(idx), targetDate, targetNanos)) {
                         sel[out++] = idx;
                     }
                 }

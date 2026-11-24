@@ -263,7 +263,6 @@ final class CorrelatedInFold {
         /** 整数值列的快路径；键列是 IntVector、LongVector 或字典向量。 */
         private int filterInt(ColumnVector keyVec, IntVector valVec, int[] sel, int selCount,
                 boolean fullRange, SessionLocal session) {
-            int[] vals = valVec.rawValues();
             long[] valBits = SubqueryInner.nullableBits(valVec);
             int[] keyVals = keyVec instanceof IntVector ? ((IntVector) keyVec).rawValues() : null;
             long[] keyValsL = keyVec instanceof LongVector ? ((LongVector) keyVec).rawValues() : null;
@@ -273,14 +272,14 @@ final class CorrelatedInFold {
             int out = 0;
             if (fullRange) {
                 for (int i = 0; i < selCount; i++) {
-                    if (matchInt(i, vals, valBits, keyVals, keyValsL, keyCodes, dictKm, keyBits)) {
+                    if (matchInt(valVec, i, valBits, keyVals, keyValsL, keyCodes, dictKm, keyBits)) {
                         sel[out++] = i;
                     }
                 }
             } else {
                 for (int i = 0; i < selCount; i++) {
                     int idx = sel[i];
-                    if (matchInt(idx, vals, valBits, keyVals, keyValsL, keyCodes, dictKm, keyBits)) {
+                    if (matchInt(valVec, idx, valBits, keyVals, keyValsL, keyCodes, dictKm, keyBits)) {
                         sel[out++] = idx;
                     }
                 }
@@ -288,18 +287,17 @@ final class CorrelatedInFold {
             return out;
         }
 
-        private boolean matchInt(int idx, int[] vals, long[] valBits, int[] keyVals, long[] keyValsL,
+        private boolean matchInt(IntVector valVec, int idx, long[] valBits, int[] keyVals, long[] keyValsL,
                 int[] keyCodes, KeyMembership[] dictKm, long[] keyBits) {
             if (valBits != null && (valBits[idx >>> 6] & (1L << (idx & 63))) != 0) {
                 return false;
             }
             KeyMembership km = membershipAt(idx, keyVals, keyValsL, keyCodes, dictKm, keyBits);
-            return matchLong(km, vals[idx]);
+            return matchLong(km, valVec.longAt(idx));
         }
 
         private int filterLong(ColumnVector keyVec, LongVector valVec, int[] sel, int selCount,
                 boolean fullRange, SessionLocal session) {
-            long[] vals = valVec.rawValues();
             long[] valBits = SubqueryInner.nullableBits(valVec);
             int[] keyVals = keyVec instanceof IntVector ? ((IntVector) keyVec).rawValues() : null;
             long[] keyValsL = keyVec instanceof LongVector ? ((LongVector) keyVec).rawValues() : null;
@@ -309,14 +307,14 @@ final class CorrelatedInFold {
             int out = 0;
             if (fullRange) {
                 for (int i = 0; i < selCount; i++) {
-                    if (matchLongRow(i, vals, valBits, keyVals, keyValsL, keyCodes, dictKm, keyBits)) {
+                    if (matchLongRow(valVec, i, valBits, keyVals, keyValsL, keyCodes, dictKm, keyBits)) {
                         sel[out++] = i;
                     }
                 }
             } else {
                 for (int i = 0; i < selCount; i++) {
                     int idx = sel[i];
-                    if (matchLongRow(idx, vals, valBits, keyVals, keyValsL, keyCodes, dictKm, keyBits)) {
+                    if (matchLongRow(valVec, idx, valBits, keyVals, keyValsL, keyCodes, dictKm, keyBits)) {
                         sel[out++] = idx;
                     }
                 }
@@ -324,13 +322,13 @@ final class CorrelatedInFold {
             return out;
         }
 
-        private boolean matchLongRow(int idx, long[] vals, long[] valBits, int[] keyVals,
+        private boolean matchLongRow(LongVector valVec, int idx, long[] valBits, int[] keyVals,
                 long[] keyValsL, int[] keyCodes, KeyMembership[] dictKm, long[] keyBits) {
             if (valBits != null && (valBits[idx >>> 6] & (1L << (idx & 63))) != 0) {
                 return false;
             }
             KeyMembership km = membershipAt(idx, keyVals, keyValsL, keyCodes, dictKm, keyBits);
-            return matchLong(km, vals[idx]);
+            return matchLong(km, valVec.longAt(idx));
         }
 
         /** NOT IN 的成员判定：见类注释的三值语义。 */

@@ -1,5 +1,6 @@
 package com.hyd.h2omap.vectorized;
 
+import java.util.function.IntUnaryOperator;
 import java.util.BitSet;
 import java.util.HashSet;
 import java.util.List;
@@ -68,17 +69,17 @@ final class InNode implements VectorizedFilter.Node {
         ColumnVector vec = segment.getColumn(col);
         if (vec instanceof DictVarcharVector) {
             DictVarcharVector dv = (DictVarcharVector) vec;
-            return filterDict(dv.rawCodes(), dv.rawDict(), dv.dictSize(), sel, selCount, fullRange);
+            return filterDict(dv::codeAt, dv.rawDict(), dv.dictSize(), sel, selCount, fullRange);
         }
         if (vec instanceof DictValueVector) {
             DictValueVector dv = (DictValueVector) vec;
-            return filterDict(dv.rawCodes(), dv.rawDict(), dv.dictSize(), sel, selCount, fullRange);
+            return filterDict(dv::codeAt, dv.rawDict(), dv.dictSize(), sel, selCount, fullRange);
         }
         if (longSet != null && vec instanceof IntVector) {
-            return filterLongSet(((IntVector) vec).rawValues(), sel, selCount, fullRange);
+            return filterLongSet((IntVector) vec, sel, selCount, fullRange);
         }
         if (longSet != null && vec instanceof LongVector) {
-            return filterLongSet(((LongVector) vec).rawValues(), sel, selCount, fullRange);
+            return filterLongSet((LongVector) vec, sel, selCount, fullRange);
         }
         int out = 0;
         if (fullRange) {
@@ -107,18 +108,18 @@ final class InNode implements VectorizedFilter.Node {
         return set.contains(v) ^ not;
     }
 
-    private int filterLongSet(int[] vals, int[] sel, int selCount, boolean fullRange) {
+    private int filterLongSet(IntVector vec, int[] sel, int selCount, boolean fullRange) {
         int out = 0;
         if (fullRange) {
             for (int i = 0; i < selCount; i++) {
-                if (longSet.contains(vals[i]) ^ not) {
+                if (longSet.contains(vec.longAt(i)) ^ not) {
                     sel[out++] = i;
                 }
             }
         } else {
             for (int i = 0; i < selCount; i++) {
                 int idx = sel[i];
-                if (longSet.contains(vals[idx]) ^ not) {
+                if (longSet.contains(vec.longAt(idx)) ^ not) {
                     sel[out++] = idx;
                 }
             }
@@ -126,18 +127,18 @@ final class InNode implements VectorizedFilter.Node {
         return out;
     }
 
-    private int filterLongSet(long[] vals, int[] sel, int selCount, boolean fullRange) {
+    private int filterLongSet(LongVector vec, int[] sel, int selCount, boolean fullRange) {
         int out = 0;
         if (fullRange) {
             for (int i = 0; i < selCount; i++) {
-                if (longSet.contains(vals[i]) ^ not) {
+                if (longSet.contains(vec.longAt(i)) ^ not) {
                     sel[out++] = i;
                 }
             }
         } else {
             for (int i = 0; i < selCount; i++) {
                 int idx = sel[i];
-                if (longSet.contains(vals[idx]) ^ not) {
+                if (longSet.contains(vec.longAt(idx)) ^ not) {
                     sel[out++] = idx;
                 }
             }
@@ -145,7 +146,7 @@ final class InNode implements VectorizedFilter.Node {
         return out;
     }
 
-    private int filterDict(int[] codes, Value[] dict, int dictSize,
+    private int filterDict(IntUnaryOperator codes, Value[] dict, int dictSize,
             int[] sel, int selCount, boolean fullRange) {
         boolean[] allowed = new boolean[dictSize];
         boolean anyAllowed = false;
@@ -161,7 +162,7 @@ final class InNode implements VectorizedFilter.Node {
         int out = 0;
         if (fullRange) {
             for (int i = 0; i < selCount; i++) {
-                int code = codes[i];
+                int code = codes.applyAsInt(i);
                 if (code >= 0 && allowed[code]) {
                     sel[out++] = i;
                 }
@@ -169,7 +170,7 @@ final class InNode implements VectorizedFilter.Node {
         } else {
             for (int i = 0; i < selCount; i++) {
                 int idx = sel[i];
-                int code = codes[idx];
+                int code = codes.applyAsInt(idx);
                 if (code >= 0 && allowed[code]) {
                     sel[out++] = idx;
                 }

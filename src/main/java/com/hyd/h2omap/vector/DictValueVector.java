@@ -15,13 +15,18 @@ import org.h2.value.ValueNull;
 /**
  * 低基数数值列的字典编码向量（支持 TINYINT / SMALLINT / INTEGER / BIGINT / REAL / DOUBLE）。
  *
- * <p>段内去重值预存为不可变 {@link Value} 字典数组，每行仅存 4 字节整数编码
- * （{@code -1} 表示 null）。读取时直接按编码返回缓存的 {@link Value} 引用，
- * 消除重复装箱分配。
+ * <p>段内去重值预存为不可变 {@link Value} 字典数组，每行只存字典下标：
+ * 建段后是位打包 {@link BitPacked}（宽度 {@code ceil(log2(字典大小))}，10 个取值的列每行 4 位），
+ * 开放段写入期间是 {@code int[]}（{@code -1} 表示 null）。读取时直接按编码返回缓存的
+ * {@link Value} 引用，消除重复装箱分配。
  */
 public final class DictValueVector implements ColumnVector {
 
-    private final int[] codes;
+    /** 可写态的码（{@code -1} 表示 null）；编码态为 {@code null}。 */
+    private int[] codes;
+
+    /** 编码态的位打包码；可写态为 {@code null}。 */
+    private BitPacked packedCodes;
 
     private Value[] dict;
 
@@ -34,6 +39,7 @@ public final class DictValueVector implements ColumnVector {
     private DictValueVector(int[] codes, Value[] dict, int dictSize,
             Map<Value, Integer> dictLookup, NullBitmap nulls) {
         this.codes = codes;
+        this.packedCodes = null;
         this.dict = dict;
         this.dictSize = dictSize;
         this.dictLookup = dictLookup;
@@ -70,33 +76,63 @@ public final class DictValueVector implements ColumnVector {
                 codes[r] = id;
             }
         }
-        return new DictValueVector(
+        DictValueVector v = new DictValueVector(
                 codes, dictList.toArray(new Value[0]), dictList.size(), null, nulls);
+        v.packCodes();
+        return v;
     }
 
+    /** 把可写态的码按字典大小位打包；字典大小为 1 时用 1 位区分「null / 该值」。 */
+    private void packCodes() {
+        if (codes == null || dictSize <= 0) {
+            return;
+        }
+        if (dictSize == 1) {
+            packedCodes = BitPacked.pack(codes.length, 1, i -> codes[i] < 0 ? 0 : 1);
+            singleValue = true;
+        } else {
+            int w = BitPacked.bitsFor(dictSize - 1);
+            packedCodes = BitPacked.pack(codes.length, w, i -> codes[i] < 0 ? 0 : codes[i]);
+        }
+        codes = null;
+    }
+
+    private boolean singleValue;
+
     public static DictValueVector of(int[] codes, Value[] dict, NullBitmap nulls) {
-        return new DictValueVector(codes, dict, dict.length, null, nulls);
+        DictValueVector v = new DictValueVector(codes, dict, dict.length, null, nulls);
+        v.packCodes();
+        return v;
+    }
+
+    /** 可写形态：开放段写入与合并回写用，码保持 {@code int[]}。 */
+    private static DictValueVector writable(int[] codes, Value[] dict, int dictSize, NullBitmap nulls) {
+        return new DictValueVector(codes, dict, dictSize, null, nulls);
     }
 
     @Override
     public ColumnVector copy() {
-        return new DictValueVector(
-                codes.clone(), Arrays.copyOf(dict, dictSize), dictSize, null, nulls.copy());
+        return writable(codes != null ? codes.clone() : rawCodes(), Arrays.copyOf(dict, dictSize), dictSize,
+                nulls.copy());
     }
 
     @Override
     public int size() {
-        return codes.length;
+        return packedCodes != null ? packedCodes.size() : codes.length;
     }
 
     @Override
     public Value get(int index) {
-        int code = codes[index];
+        int code = codeAt(index);
         return code < 0 ? ValueNull.INSTANCE : dict[code];
     }
 
+    /** 编码态不可写；当前全部调用方都先经 {@link #copy()} 取可写态，这里的解包只是接口契约的防线。 */
     @Override
     public void set(int index, Value value) {
+        if (codes == null) {
+            unpackInPlace();
+        }
         if (value.getValueType() == Value.NULL) {
             codes[index] = -1;
             nulls.setNull(index);
@@ -124,8 +160,38 @@ public final class DictValueVector implements ColumnVector {
         nulls.clear(index);
     }
 
+    private void unpackInPlace() {
+        this.codes = rawCodes();
+        this.packedCodes = null;
+        this.singleValue = false;
+    }
+
+    /** 整列码解包（不缓存），供序列化与复制。 */
     public int[] rawCodes() {
-        return codes;
+        if (codes != null) {
+            return codes;
+        }
+        int n = packedCodes.size();
+        int[] out = new int[n];
+        for (int i = 0; i < n; i++) {
+            out[i] = codeAt(i);
+        }
+        return out;
+    }
+
+    /** 查询路径的单点读：字典下标，{@code -1} 表示 null。两种形态常数时间。 */
+    public int codeAt(int index) {
+        if (codes != null) {
+            return codes[index];
+        }
+        if (singleValue) {
+            return packedCodes.get(index) == 0 ? -1 : 0;
+        }
+        return nulls.isNull(index) ? -1 : (int) packedCodes.get(index);
+    }
+
+    public boolean isEncoded() {
+        return codes == null;
     }
 
     public Value[] rawDict() {
@@ -143,7 +209,9 @@ public final class DictValueVector implements ColumnVector {
 
     @Override
     public long getEstimatedMemory() {
-        return 32L + (long) codes.length * Integer.BYTES
-                + (long) dict.length * 32L + nulls.getEstimatedMemory();
+        long codeMem = codes != null
+                ? 16L + (long) codes.length * Integer.BYTES
+                : packedCodes.getEstimatedMemory();
+        return 32L + codeMem + (long) dict.length * 32L + nulls.getEstimatedMemory();
     }
 }

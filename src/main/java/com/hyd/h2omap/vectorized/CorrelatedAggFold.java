@@ -264,7 +264,7 @@ final class CorrelatedAggFold {
             boolean asDouble = resultValueType == Value.DOUBLE;
             boolean asLong = resultValueType == Value.BIGINT;
             if (vec instanceof IntVector) {
-                int v = ((IntVector) vec).rawValues()[idx];
+                int v = (int) ((IntVector) vec).longAt(idx);
                 if (asDouble) {
                     doubleSum += v;
                 } else if (asLong) {
@@ -275,7 +275,7 @@ final class CorrelatedAggFold {
                 return true;
             }
             if (vec instanceof LongVector) {
-                long v = ((LongVector) vec).rawValues()[idx];
+                long v = ((LongVector) vec).longAt(idx);
                 if (asDouble) {
                     doubleSum += v;
                 } else if (asLong) {
@@ -300,7 +300,7 @@ final class CorrelatedAggFold {
         /** 按原始数组比较 MIN/MAX；不支持的向量类型返回 {@code false}。 */
         private boolean addExtremeRaw(ColumnVector vec, int idx) {
             if (vec instanceof IntVector) {
-                int v = ((IntVector) vec).rawValues()[idx];
+                int v = (int) ((IntVector) vec).longAt(idx);
                 Integer cur = (Integer) extremeRaw;
                 if (cur == null || (type == AggregateType.MIN ? v < cur : v > cur)) {
                     extremeRaw = v;
@@ -308,7 +308,7 @@ final class CorrelatedAggFold {
                 return true;
             }
             if (vec instanceof LongVector) {
-                long v = ((LongVector) vec).rawValues()[idx];
+                long v = ((LongVector) vec).longAt(idx);
                 Long cur = (Long) extremeRaw;
                 if (cur == null || (type == AggregateType.MIN ? v < cur : v > cur)) {
                     extremeRaw = v;

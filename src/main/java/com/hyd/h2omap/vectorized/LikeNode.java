@@ -64,10 +64,9 @@ final class LikeNode implements VectorizedFilter.Node {
                     dictMatched[d] = matchString(dict[d].getString());
                 }
             }
-            int[] codes = dv.rawCodes();
             if (fullRange) {
                 for (int i = 0; i < selCount; i++) {
-                    int c = codes[i];
+                    int c = dv.codeAt(i);
                     if (c >= 0 && dictMatched[c]) {
                         sel[out++] = i;
                     }
@@ -75,7 +74,7 @@ final class LikeNode implements VectorizedFilter.Node {
             } else {
                 for (int i = 0; i < selCount; i++) {
                     int idx = sel[i];
-                    int c = codes[idx];
+                    int c = dv.codeAt(idx);
                     if (c >= 0 && dictMatched[c]) {
                         sel[out++] = idx;
                     }

@@ -72,12 +72,11 @@ final class AggState {
         if ((spec.type == AggregateType.SUM || spec.type == AggregateType.AVG)
                 && vec instanceof IntVector) {
             IntVector iv = (IntVector) vec;
-            int[] vals = iv.rawValues();
             NullBitmap nulls = iv.nulls();
             if (!nulls.hasNull()) {
                 long s = 0;
                 for (int i = 0; i < segCount; i++) {
-                    s += vals[i];
+                    s += iv.longAt(i);
                 }
                 longSum += s;
                 count += segCount;
@@ -87,7 +86,7 @@ final class AggState {
                 long c = 0;
                 for (int i = 0; i < segCount; i++) {
                     if (!nulls.isNull(i)) {
-                        s += vals[i];
+                        s += iv.longAt(i);
                         c++;
                     }
                 }
@@ -165,12 +164,11 @@ final class AggState {
         if ((spec.type == AggregateType.SUM || spec.type == AggregateType.AVG)
                 && vec instanceof IntVector) {
             IntVector iv = (IntVector) vec;
-            int[] vals = iv.rawValues();
             NullBitmap nulls = iv.nulls();
             if (!nulls.hasNull()) {
                 long s = 0;
                 for (int i = 0; i < selCount; i++) {
-                    s += vals[sel[i]];
+                    s += iv.longAt(sel[i]);
                 }
                 longSum += s;
                 count += selCount;
@@ -181,7 +179,7 @@ final class AggState {
                 for (int i = 0; i < selCount; i++) {
                     int idx = sel[i];
                     if (!nulls.isNull(idx)) {
-                        s += vals[idx];
+                        s += iv.longAt(idx);
                         c++;
                     }
                 }
@@ -238,17 +236,16 @@ final class AggState {
             DictVarcharVector dv = (DictVarcharVector) vec;
             int dictSize = dv.dictSize();
             boolean[] seen = new boolean[dictSize];
-            int[] codes = dv.rawCodes();
             if (full) {
                 for (int i = 0; i < selCount; i++) {
-                    int c = codes[i];
+                    int c = dv.codeAt(i);
                     if (c >= 0) {
                         seen[c] = true;
                     }
                 }
             } else {
                 for (int i = 0; i < selCount; i++) {
-                    int c = codes[sel[i]];
+                    int c = dv.codeAt(sel[i]);
                     if (c >= 0) {
                         seen[c] = true;
                     }
@@ -266,17 +263,16 @@ final class AggState {
             DictValueVector dv = (DictValueVector) vec;
             int dictSize = dv.dictSize();
             boolean[] seen = new boolean[dictSize];
-            int[] codes = dv.rawCodes();
             if (full) {
                 for (int i = 0; i < selCount; i++) {
-                    int c = codes[i];
+                    int c = dv.codeAt(i);
                     if (c >= 0) {
                         seen[c] = true;
                     }
                 }
             } else {
                 for (int i = 0; i < selCount; i++) {
-                    int c = codes[sel[i]];
+                    int c = dv.codeAt(sel[i]);
                     if (c >= 0) {
                         seen[c] = true;
                     }
@@ -316,7 +312,6 @@ final class AggState {
         if ((spec.type == AggregateType.SUM || spec.type == AggregateType.AVG)
                 && rightVec == null && rt == Value.BIGINT && leftVec instanceof IntVector) {
             IntVector iv = (IntVector) leftVec;
-            int[] vals = iv.rawValues();
             NullBitmap nulls = iv.nulls();
             boolean hasNull = nulls.hasNull();
             long c = spec.arithConst.getLong();
@@ -325,7 +320,7 @@ final class AggState {
             for (int i = 0; i < selCount; i++) {
                 int idx = full ? i : sel[i];
                 if (!hasNull || !nulls.isNull(idx)) {
-                    s += evalLongOp(vals[idx], c);
+                    s += evalLongOp(iv.longAt(idx), c);
                     cnt++;
                 }
             }

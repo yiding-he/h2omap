@@ -1,5 +1,6 @@
 package com.hyd.h2omap.vectorized;
 
+import java.util.function.IntUnaryOperator;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
@@ -328,11 +329,11 @@ final class GroupExecutor {
                     ColumnVector keyVec = seg.getColumn(groupKeyCol);
                     if (keyVec instanceof DictVarcharVector) {
                         DictVarcharVector dv = (DictVarcharVector) keyVec;
-                        groupByDict(seg, dv.rawCodes(), dv.rawDict(), dv.dictSize(),
+                        groupByDict(seg, dv::codeAt, dv.rawDict(), dv.dictSize(),
                                 sel, selCount, full, specs, aggCount, partial, session, compareMode);
                     } else if (keyVec instanceof DictValueVector) {
                         DictValueVector dv = (DictValueVector) keyVec;
-                        groupByDict(seg, dv.rawCodes(), dv.rawDict(), dv.dictSize(),
+                        groupByDict(seg, dv::codeAt, dv.rawDict(), dv.dictSize(),
                                 sel, selCount, full, specs, aggCount, partial, session, compareMode);
                     } else {
                         for (int i = 0; i < selCount; i++) {
@@ -610,7 +611,7 @@ final class GroupExecutor {
 
     private static void groupByDict(
             ColumnSegment seg,
-            int[] codes,
+            IntUnaryOperator codes,
             Value[] dict,
             int dictSize,
             int[] sel,
@@ -625,7 +626,7 @@ final class GroupExecutor {
         AggState[][] local = new AggState[dictSize + 1][];
         for (int i = 0; i < selCount; i++) {
             int idx = full ? i : sel[i];
-            int code = codes[idx];
+            int code = codes.applyAsInt(idx);
             int slot = code >= 0 ? code : dictSize;
             AggState[] states = local[slot];
             if (states == null) {
