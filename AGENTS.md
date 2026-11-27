@@ -29,7 +29,7 @@ OMAP 是 H2 的外部表引擎（`org.h2.api.TableEngine`）。H2 提供 SQL 前
 | H2 版本 | 固定 `2.5.252`，不跟进 `2.5.259-SNAPSHOT`（`canGetRowCount` 等签名仍在变）。被替换的 8 个 H2 类按该版本源码合入，升级时必须逐类重新比对 |
 | 依赖 | 运行期只有 `com.h2database:h2`，测试用 `junit-jupiter`，构建期插件 `maven-shade-plugin` |
 | 测试口径 | 新增测试不建 `T_MV` MVStore 对照表，用例内预置期望值直接断言；既有含 MVStore 对照的用例保持不动，MVStore 仅保留结果正确性对照用途 |
-| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（115 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（37 个用例）、`src/test/java/com/hyd/h2omap/storage/SegmentFileFormatTest.java`（10 个用例）、`src/test/java/com/hyd/h2omap/persistence/SegmentUpgradeTest.java`（6 个用例：v2→v3 升级、幂等重入、损坏文件拒绝开库）、`src/test/java/com/hyd/h2omap/persistence/ValueCodecTest.java`（5 个用例）、`src/test/java/com/hyd/h2omap/vector/BitPackedTest.java`（5 个用例：位宽边界、跨字、零宽拒绝、`bitsFor`）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
+| 判定依据 | `src/test/java/com/hyd/h2omap/OmapTableContractTest.java`（115 个用例）、`src/test/java/com/hyd/h2omap/storage/ColumnarStoreTest.java`（39 个用例）、`src/test/java/com/hyd/h2omap/storage/SegmentFileFormatTest.java`（10 个用例）、`src/test/java/com/hyd/h2omap/persistence/SegmentUpgradeTest.java`（6 个用例：v2→v3 升级、幂等重入、损坏文件拒绝开库）、`src/test/java/com/hyd/h2omap/persistence/ValueCodecTest.java`（5 个用例）、`src/test/java/com/hyd/h2omap/vector/BitPackedTest.java`（5 个用例：位宽边界、跨字、零宽拒绝、`bitsFor`）、`src/test/java/com/hyd/h2omap/vector/ValueVectorTest.java`（3 个用例）与 `src/test/java/com/hyd/h2omap/bench/DataScaleTest.java`（3 个用例），以及 `src/test/java/com/hyd/h2omap/bench/DataScaleLargeTest.java`（1 个 100 万行用例，需 `-Domap.scale=large -DargLine=-Xmx3g` 才运行）。改动表、索引、存储或向量化实现后必须跑通；不得为了让改动通过而放宽、跳过或删除用例 |
 | 查 H2 源码 | `.h2/` 目录存放本仓库依赖的 H2 `2.5.252` 源码包内容（`.h2/main/org/h2/...`、`.h2/test/org/h2/...`、`.h2/docsrc/html/...`），已在 `.gitignore` 中排除，属本地参考。重新获取：`https://github.com/h2database/h2database/releases/download/version-2.5.252/h2-2026-09-23.zip`，只取其中的 `h2/src/`。该目录可能不存在（已排除在版本控制之外）。Maven Central 的 `h2-2.5.252-sources.jar` 内容等价，但个别文件与该 zip 相差数行，核对行号时以 zip 为准 |
 | 临时目录 | 一次性脚本、探针程序与中间产物统一放 `.tmp/`（已在 `.gitignore` 排除，不进版本控制），任务收尾时清空；不再用 `target/dbg/` 或系统临时目录存放本仓库的调试产物 |
 | 文件规模 | 新增或重构的生产类控制在单次文件读取窗口内（约 1200 行 / 45 KB，源自我代理工具的读取上限），超出时按职责拆分；拆分提交只做纯搬移（包声明、可见性、import、限定名），不得顺带改逻辑，验收是全部判定用例与用例计数不变。判定依据：超限文件只能分段读取，分段读会丢失锁契约等跨段不变量的上下文，是代理误判的主要来源 |
@@ -141,7 +141,7 @@ rowId 在 `append` 时就确定，之后不变。段号在开放段创建时预�
 
 迭代器是创建时刻的快照：构造时固定最后一个段号与开放段的行数。开放段在迭代期间被写满冻结时，迭代器改从段列表读它，rowId 不变；冻结之后新开的段不在本次快照内。
 
-合并（compaction）：`delta` 的改动数达到 `compactionMinRows` 时由写路径同步触发，分两阶段。第一阶段在写锁内把更新与删除按段归组，活像在此阶段物化成不可变快照（列向量只在锁内可读，锁外的无锁读者可能看到未完整发布的向量），并记下当时的段引用与活像位置；锁外对每个受影响的段调用 `applyDelta` 生成新段（Copy-On-Compact，旧段仍对先前取到的快照有效），新段的 zone map 随建段重算；第二阶段在写锁内替换段映射里的引用、按不可变位置双重比对移除 `delta` 里已写回的条目（防止误删锁外期间的新更新），再重算 `dirtySegments`，死位置超过半数时重排回收 rowset。回写后整段全删的段直接摘除。段号与段内偏移都不变，所以 rowId 稳定；除全删段被摘除外段不删除。
+合并（compaction）：`delta` 的改动数达到 `compactionMinRows` 时由写路径同步触发，分三步。第一步在写锁内把更新与删除按段归组，活像在此步物化成不可变快照（列向量只在锁内可读，锁外的无锁读者可能看到未完整发布的向量），并记下当时的段引用与活像位置；这一步只登记段引用，不读回逐出段。随后在表锁之外对要重写的逐出段逐个 `ensureResident`（段文件读取与解码不持表写锁，读回期间本表写入照常进行），再对每个受影响的段调用 `applyDelta` 生成新段（Copy-On-Compact，旧段仍对先前取到的快照有效），新段的 zone map 随建段重算；最后在写锁内按 generation 逐段安装新段（读回的基段在安装前被预算逐出不影响安装），按不可变位置双重比对移除 `delta` 里已写回的条目（防止误删锁外期间的新更新），再重算 `dirtySegments`，死位置超过半数时重排回收 rowset；锁外期间被摘除或代数已变的段只跳过该段，不整轮放弃。合并由 `compactLock` 串行化：已有合并在进行时，到达阈值的写线程直接返回、不排队（`compactionReadBacks`、`compactionSkippedTriggers`、`compactionSkippedSegments` 三个包可见计数器供验收）。回写后整段全删的段直接摘除。段号与段内偏移都不变，所以 rowId 稳定；除全删段被摘除外段不删除。
 
 全删段丢弃（Merge-on-Read 批次 1）：段内已标记删除的行数（段位图加 delta 未回写部分）达到段行数时，写路径立即把整段从 `segments` 摘除，rowId 空洞保留不复用，行数在逐行删除时已扣过、不再调整；索引条目在每次删除时由 H2 逐行清理，摘除时无需处理。段文件在下次 checkpoint 随 manifest 摘除后由文件清理删除；恢复时 WAL 重放后由 `dropEmptySegments()` 一次性扫描补摘，惰性加载的段在加载完成时补摘。对按时间滚动的清理服务，这意味着最老的段被删空后零重写回收磁盘。
 
@@ -385,7 +385,7 @@ src/test/java/com/hyd/h2omap/
 
 ## 当前状态与后续阶段
 
-M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成，M12（Merge-on-Read 与冷热分层）四个批次全部交付；M13（CLOB 打包存储，方案 B2）已完成；M14（段文件尾部列目录重设计，P2）、M15（裸 MIN/MAX 定界与逐出段部分列读，A+P3）、M16（快照按段懒加载与大块 I/O）、M17（并行段加载，P1）、M18（查询期段文件 IO 统计与在途读合并）、M19（逐出段列切片缓存）、M20（无 LIMIT 的 ORDER BY 有序流式执行）、M21（磁盘格式 v3、启动自动升级与有序流式 claim 门控放宽）、M22（次邻分离门控与迟到带归并）、M23（平面查询流式执行）与 M24（段间无序 ORDER BY 的 k 路归并流式执行）已完成；列编码与压缩阶段 A（数值列与字典码位打包，计划见 `problems/列编码与压缩实施计划.md`）已完成，阶段 B（列块压缩与格式 v4）、C（段内分页）、D（浮点编码）未开始。判定依据为 115 个契约用例、47 个存储层用例（ColumnarStoreTest 37 + SegmentFileFormatTest 10）、6 个 SegmentUpgradeTest 升级用例、5 个编码用例、5 个位打包用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
+M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫描）、M3（合并与并发）、M4（索引区间查询）已完成；M5 的字典编码与延迟物化已交付，与 MVStore 的量化对比数据在 `problems/查询性能优化方向.md`，M6 判决点未开始。之后追加的 M7（向量化下推）、M8（持久化与单 Jar 打包）、M9（数组列列式存储）、M10（子查询下推）与 M11（段级剪枝与有序 LIMIT）均已完成，M12（Merge-on-Read 与冷热分层）四个批次全部交付；M13（CLOB 打包存储，方案 B2）已完成；M14（段文件尾部列目录重设计，P2）、M15（裸 MIN/MAX 定界与逐出段部分列读，A+P3）、M16（快照按段懒加载与大块 I/O）、M17（并行段加载，P1）、M18（查询期段文件 IO 统计与在途读合并）、M19（逐出段列切片缓存）、M20（无 LIMIT 的 ORDER BY 有序流式执行）、M21（磁盘格式 v3、启动自动升级与有序流式 claim 门控放宽）、M22（次邻分离门控与迟到带归并）、M23（平面查询流式执行）与 M24（段间无序 ORDER BY 的 k 路归并流式执行）已完成；列编码与压缩阶段 A（数值列与字典码位打包，计划见 `problems/列编码与压缩实施计划.md`）已完成，阶段 B（列块压缩与格式 v4）、C（段内分页）、D（浮点编码）未开始。判定依据为 115 个契约用例、49 个存储层用例（ColumnarStoreTest 39 + SegmentFileFormatTest 10）、6 个 SegmentUpgradeTest 升级用例、5 个编码用例、5 个位打包用例、3 个向量用例、3 个规模用例，另有 1 个 100 万行用例需显式开启。生产代码改动见 git 历史。后续每个阶段都以可运行的集成测试作为结束条件。
 
 阶段编号按提出顺序，M7、M8 的实际交付早于 M6。
 
@@ -441,8 +441,8 @@ M0（接入契约验证）、M1（段真正产生）、M2（剪枝与流式扫�
 - 驻留预算是库级共享账本而非表级 WITH 参数：`SET OMAP_RESIDENT_BYTES` 的值持久化进 H2 目录 `Setting`，建表时经 `OmapResidentBudgets` 读同一值，重放之后建的表共享同一预算；逐出判定在各表自己的写锁内只能逐本表的段，预算因此是软上限（超出量以长期无写入的冷表持量为上界，硬上限需要跨表锁或后台线程，违反现有约定）。全局占用是无锁 `AtomicLong` 账本、各表写锁内经 `residentAdd` 统一入口增量维护：账本求和不得逐个加其他表的锁，跨表锁序在两表并发发布下死锁（已实证并被「共享预算多表预载」用例覆盖）。旧目录里的表级 `WITH "residentBytes=..."` 保留解析但忽略，`ALTER TABLE SET RESIDENT_BYTES` 命令与 `Parser` 对应分支删除（缩小 H2 升级比对面）。预载只在启动时执行，预算调大不重启预载线程，由后续查询自然填驻留。
 - 冻结同步在 `append` 的写锁内完成，不交给后台线程。
 - 合并采用「就地写回」而不是「写新段」：段内保留删除位图，delta 的新值写回列向量，rowId 全程不变，因此不需要段集合快照与引用计数。
-- 合并分两阶段：写锁内按段归组 delta 改动并记下段引用，锁外 `applyDelta` 生成新段（Copy-On-Compact，先前取到的迭代器仍读旧段），写锁内替换段引用并按「rowId 加值」双重比对移除 delta 条目。
-- 合并由写路径同步触发（`append`/`remove`/`update` 后判断 delta 大小），不交给后台线程。
+- 合并分三步：写锁内按段归组 delta 改动并登记段引用（不读回逐出段），锁外读回要重写的逐出段并 `applyDelta` 生成新段（Copy-On-Compact，先前取到的迭代器仍读旧段），写锁内按 generation 逐段替换段引用并按「rowId 加值」双重比对移除 delta 条目；被摘除或代数已变的段只跳过、不整轮放弃。逐出段在读回时不持表写锁：现网驻留预算 4 GiB 小于数据量 10.6 GiB 时，合并曾在写锁内同步读回被逐出的段，DELETE 清理任务触发的合并把本表写入冻结数十秒，9 个 INSERT 会话排队在合并上并占满连接池（2026-11-27 定位报告）。
+- 合并由写路径同步触发（`append`/`remove`/`update` 后判断 delta 大小），不交给后台线程；已有合并在进行时触发方直接返回，delta 留给下一次写触发，写线程不在合并上排队。
 - 读迭代器采用创建时刻快照：固定最后一个段号与开放段行数，开放段冻结后从段列表继续读，冻结后新开的段不可见；`OmapCursor` 每批 512 行在单次读锁内取回。
 - zone map 比较失败（JSON、几何等不可比较的类型）时该列退化为「恒相交」，不参与剪枝；剪枝只是优化，不能让它阻止建段。
 - 主键与唯一索引用 `ConcurrentSkipListMap` 维护「索引键 → rowId」，`find` 按 `subMap`/`tailMap`/`headMap` 取区间后在存储锁之外迭代。`getCost` 沿用 `getCostRangeIndex` 且不额外加码——加码会让范围查询永远选扫描索引，区间分支不会被调用。

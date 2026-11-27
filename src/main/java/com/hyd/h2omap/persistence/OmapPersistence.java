@@ -59,7 +59,7 @@ import com.hyd.h2omap.vector.NullBitmap;
 /**
  * OMAP 表的磁盘持久化管理：WAL 增量日志 + 增量列段快照 + 定时异步刷盘。
  */
-public final class OmapPersistence {
+public class OmapPersistence {
 
     /** manifest v3：骨架每列在 zone 之后追加 hasNull，供有序流式 claim 免 I/O 判定。 */
     private static final int MANIFEST_MAGIC_V3 = 0x4F4D4152;  // OMAPR

@@ -3,12 +3,21 @@
  */
 package com.hyd.h2omap.storage;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
 
+import org.h2.engine.Database;
+import org.h2.engine.SessionLocal;
+import org.h2.jdbc.JdbcConnection;
 import org.h2.result.Row;
 import org.h2.table.Column;
 import org.h2.value.TypeInfo;
@@ -21,9 +30,12 @@ import org.h2.value.ValueInteger;
 import org.h2.value.ValueNull;
 import org.h2.value.ValueTimestamp;
 import org.h2.value.ValueVarchar;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import com.hyd.h2omap.engine.OmapOptions;
+import com.hyd.h2omap.persistence.OmapPersistence;
 import com.hyd.h2omap.vector.ArrayVector;
 import com.hyd.h2omap.vector.ClobVector;
 import com.hyd.h2omap.vector.ColumnVector;
@@ -41,6 +53,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -946,5 +959,143 @@ class ColumnarStoreTest {
         assertEquals("c", column(store.materialize(ids[3]), 1));
         assertNull(store.materialize(ids[4]));
         assertEquals(19, store.collectVisibleRowIds(false).length);
+    }
+
+    @TempDir
+    Path dir;
+
+    private static Database database;
+
+    @BeforeAll
+    static void openDatabase() throws Exception {
+        Connection c = DriverManager.getConnection(
+                "jdbc:h2:mem:columnarStoreTest;DB_CLOSE_DELAY=-1", "sa", "");
+        database = ((SessionLocal) ((JdbcConnection) c).getSession()).getDatabase();
+    }
+
+    /** 读回可门控的 persistence：第一次 {@link #loadSegment} 在闩锁释放前不返回。 */
+    private static final class GatedPersistence extends OmapPersistence {
+
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch proceed = new CountDownLatch(1);
+
+        GatedPersistence(Path dir) {
+            super(dir, database, CompareMode.getInstance(null, 0), 60_000);
+        }
+
+        @Override
+        public ColumnSegment loadSegment(int segmentId, int generation) throws IOException {
+            if (entered.getCount() > 0) {
+                entered.countDown();
+                try {
+                    if (!proceed.await(30, TimeUnit.SECONDS)) {
+                        throw new IOException("gate timeout");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException(e);
+                }
+            }
+            return super.loadSegment(segmentId, generation);
+        }
+    }
+
+    /** 3 个已冻结段、预算只够驻留一段的文件模式存储：seg 0 与 seg 1 被逐出，seg 2 驻留。 */
+    private static ColumnarStore newEvictingStore(OmapPersistence p, int compactionMinRows) {
+        ColumnarStore store = newStore(64, compactionMinRows);
+        store.setPersistence(p);
+        long budget = 0;
+        for (int i = 0; i < 192; i++) {
+            store.append(row(i, "v" + i));
+        }
+        for (int i = 0; i < 3; i++) {
+            budget = Math.max(budget, store.segments().get(i).getEstimatedMemory());
+        }
+        store.setResidentBudget(budget);
+        assertNull(store.segments.get(0).loaded);
+        assertNull(store.segments.get(1).loaded);
+        assertNotNull(store.segments.get(2).loaded);
+        return store;
+    }
+
+    /**
+     * 合并读回逐出段期间不持有表写锁：另一线程的 append 与 remove 立即完成，
+     * 期间到达阈值的触发直接返回而不排队；读回完成后合并照常写回。
+     */
+    @Test
+    void compactionReadBackDoesNotBlockWriters() throws Exception {
+        GatedPersistence p = new GatedPersistence(dir.resolve("t-compact-gated"));
+        try {
+            ColumnarStore store = newEvictingStore(p, 16);
+            for (int i = 0; i < 15; i++) {
+                store.remove(RowId.ofSegment(0, i));
+            }
+            Thread deleter = new Thread(() -> store.remove(RowId.ofSegment(0, 15)));
+            deleter.start();
+            assertTrue(p.entered.await(10, TimeUnit.SECONDS), "合并应停在 seg 0 的读回入口");
+
+            long start = System.nanoTime();
+            store.append(row(1000, "x"));
+            store.remove(RowId.ofSegment(1, 0));
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+            p.proceed.countDown();
+            deleter.join(30_000);
+            assertFalse(deleter.isAlive());
+
+            assertTrue(elapsedMs < 2000, "读回期间写入不应被阻塞，实际 " + elapsedMs + " ms");
+            assertEquals(2, store.compactionSkippedTriggers.get());
+            assertEquals(1, store.compactionReadBacks.get());
+            assertEquals(0, store.compactionSkippedSegments.get());
+            assertNotNull(store.segments.get(0).loaded, "合并应把新代 seg 0 安装回段列表");
+            assertEquals(1, store.segments.get(0).generation);
+            assertEquals(16, store.segments.get(0).loaded.getDeletedCount());
+            assertEquals(1, store.delta.deletedSize(), "seg 0 的删除已写回段位图，seg 1 的删除仍留在 delta");
+            assertFalse(store.isVisible(RowId.ofSegment(0, 3)));
+            assertTrue(store.isVisible(RowId.ofSegment(0, 20)));
+            assertFalse(store.isVisible(RowId.ofSegment(1, 0)));
+            assertEquals(176, store.getRowCount());
+        } finally {
+            p.close();
+        }
+    }
+
+    /**
+     * 读回的基段在第三阶段之前被预算逐出时，仍按代数安装新段并清掉对应 delta，
+     * 不再因对象身份不符整轮放弃。
+     */
+    @Test
+    void compactionInstallsByGenerationAfterBaseSegmentIsEvicted() throws Exception {
+        OmapPersistence p = new OmapPersistence(dir.resolve("t-compact-evicted-base"), database,
+                CompareMode.getInstance(null, 0), 60_000);
+        try {
+            ColumnarStore store = newEvictingStore(p, 32);
+            for (int i = 0; i < 16; i++) {
+                store.remove(RowId.ofSegment(0, i));
+            }
+            for (int i = 0; i < 15; i++) {
+                store.remove(RowId.ofSegment(1, i));
+            }
+            assertNull(store.segments.get(1).loaded);
+            // 第 32 条删除触发合并：读回 seg 0 与 seg 1 各触发一次逐出，后读回的段把先读回的段挤出预算。
+            store.remove(RowId.ofSegment(1, 15));
+            assertEquals(2, store.compactionReadBacks.get());
+            assertEquals(0, store.compactionSkippedSegments.get());
+            assertEquals(0, store.compactionSkippedTriggers.get());
+            assertEquals(0, store.delta.deletedSize());
+            assertNotNull(store.segments.get(0).loaded);
+            assertNotNull(store.segments.get(1).loaded);
+            assertEquals(1, store.segments.get(0).generation);
+            assertEquals(1, store.segments.get(1).generation);
+            assertEquals(16, store.segments.get(0).loaded.getDeletedCount());
+            assertEquals(16, store.segments.get(1).loaded.getDeletedCount());
+            assertNull(store.segments.get(2).loaded, "seg 2 被读回的段挤出预算，不在本次合并内");
+            assertFalse(store.isVisible(RowId.ofSegment(0, 3)));
+            assertFalse(store.isVisible(RowId.ofSegment(1, 15)));
+            assertTrue(store.isVisible(RowId.ofSegment(0, 16)));
+            assertEquals(160, store.getRowCount());
+        } finally {
+            p.close();
+        }
     }
 }

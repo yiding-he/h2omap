@@ -18,6 +18,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.h2.engine.SessionLocal;
@@ -77,7 +78,8 @@ public final class ColumnarStore {
 
     final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
-    private final Object compactMonitor = new Object();
+    /** 串行化本表的合并；写线程触发合并时若已有合并在进行则直接返回，不排队。 */
+    private final ReentrantLock compactLock = new ReentrantLock();
 
     private final AtomicLong dataModificationId = new AtomicLong();
 
@@ -144,6 +146,15 @@ public final class ColumnarStore {
 
     /** 累计逐出段数，供测试断言。 */
     private final AtomicLong evictedSegments = new AtomicLong();
+
+    /** 合并时从段文件读回的段数。 */
+    final AtomicLong compactionReadBacks = new AtomicLong();
+
+    /** 写路径触发合并时因另一轮合并在进行中而直接返回的次数。 */
+    final AtomicLong compactionSkippedTriggers = new AtomicLong();
+
+    /** 合并第三阶段因段被摘除或代数已变而跳过的段数。 */
+    final AtomicLong compactionSkippedSegments = new AtomicLong();
 
     /** 段加载完成后的通知，用来让 H2 的查询结果缓存失效。 */
     volatile Runnable visibilityListener;
@@ -500,11 +511,19 @@ public final class ColumnarStore {
      * <p>段号与段内偏移都不变，已交给 H2 的 rowId 因此仍然有效。
      * 合并后重算被触及段的 zone map。
      *
+     * <p>逐出段的读回（段文件读取与解码）不持有表写锁，读回期间本表写入照常进行；
+     * 另一轮合并正在进行时，触发方直接返回，delta 留给下一次写触发。
+     *
      * @return 合并的改动行数
      */
     public long compact() {
+        if (!compactLock.tryLock()) {
+            compactionSkippedTriggers.incrementAndGet();
+            return 0;
+        }
         long compactedCount;
-        synchronized (compactMonitor) {
+        try {
+            Map<Integer, SegmentRef> baseRefs = new TreeMap<>();
             Map<Integer, ColumnSegment> baseSegments = new HashMap<>();
             Map<Integer, List<Map.Entry<Integer, Value[]>>> updatesBySeg = new HashMap<>();
             Map<Integer, List<Integer>> deletesBySeg = new HashMap<>();
@@ -520,42 +539,39 @@ public final class ColumnarStore {
                 }
                 // 列向量只在锁内安全，第一阶段就把活像物化成不可变快照；
                 // 第三阶段按不可变位置双重比对，锁外期间的新更新不会被误删。
+                // 这里只登记段引用，不读回逐出段：读盘与解码全部在锁外进行。
                 int[] positions = delta.updatedPositions();
                 snapPositions = new int[positions.length];
                 snapRowIds = new long[positions.length];
                 for (int pos : positions) {
                     long rowId = delta.updatedRowIdAt(pos);
                     int segId = RowId.segmentId(rowId);
-                    ColumnSegment seg = segment(segId);
-                    if (seg == null) {
-                        // 受影响的段已被逐出：合并需要重写段内容，先同步读回。
-                        seg = ensureResident(segments.get(segId));
+                    SegmentRef ref = refOf(segId);
+                    if (ref == null) {
+                        continue;
                     }
-                    if (seg != null) {
-                        baseSegments.putIfAbsent(segId, seg);
-                        updatesBySeg.computeIfAbsent(segId, k -> new ArrayList<>())
-                                .add(new AbstractMap.SimpleImmutableEntry<>(
-                                        RowId.offset(rowId), delta.updatedValueAt(pos)));
-                        snapPositions[snapCount] = pos;
-                        snapRowIds[snapCount] = rowId;
-                        snapCount++;
-                    }
+                    baseRefs.putIfAbsent(segId, ref);
+                    updatesBySeg.computeIfAbsent(segId, k -> new ArrayList<>())
+                            .add(new AbstractMap.SimpleImmutableEntry<>(
+                                    RowId.offset(rowId), delta.updatedValueAt(pos)));
+                    snapPositions[snapCount] = pos;
+                    snapRowIds[snapCount] = rowId;
+                    snapCount++;
                 }
                 for (Map.Entry<Integer, DeltaStore.SegmentDeleteBitmap> entry : delta.segmentDeleteEntries()) {
                     int segId = entry.getKey();
-                    ColumnSegment seg = segment(segId);
-                    if (seg == null) {
-                        seg = ensureResident(segments.get(segId));
+                    SegmentRef ref = refOf(segId);
+                    if (ref == null) {
+                        continue;
                     }
-                    if (seg != null) {
-                        baseSegments.putIfAbsent(segId, seg);
-                        List<Integer> offsets = deletesBySeg.computeIfAbsent(segId, k -> new ArrayList<>());
-                        for (int off = entry.getValue().bits.nextSetBit(0); off >= 0;
-                                off = entry.getValue().bits.nextSetBit(off + 1)) {
-                            if (off < seg.getRowCount()) {
-                                offsets.add(off);
-                                foldedDeletes++;
-                            }
+                    ColumnSegment seg = ref.loaded;
+                    int rowCount = seg != null ? seg.getRowCount() : ref.skeleton.rowCount;
+                    baseRefs.putIfAbsent(segId, ref);
+                    List<Integer> offsets = deletesBySeg.computeIfAbsent(segId, k -> new ArrayList<>());
+                    for (int off = entry.getValue().bits.nextSetBit(0); off >= 0;
+                            off = entry.getValue().bits.nextSetBit(off + 1)) {
+                        if (off < rowCount) {
+                            offsets.add(off);
                         }
                     }
                 }
@@ -563,6 +579,24 @@ public final class ColumnarStore {
                 lock.writeLock().unlock();
             }
 
+            if (baseRefs.isEmpty()) {
+                return 0;
+            }
+
+            // 只读回要重写的段；读回的段之后被预算逐出也不影响第三阶段按代数安装。
+            for (Map.Entry<Integer, SegmentRef> entry : baseRefs.entrySet()) {
+                SegmentRef ref = entry.getValue();
+                ColumnSegment seg = ref.loaded;
+                if (seg == null) {
+                    seg = ensureResident(ref);
+                    if (seg != null) {
+                        compactionReadBacks.incrementAndGet();
+                    }
+                }
+                if (seg != null) {
+                    baseSegments.put(entry.getKey(), seg);
+                }
+            }
             if (baseSegments.isEmpty()) {
                 return 0;
             }
@@ -580,8 +614,10 @@ public final class ColumnarStore {
                 for (Map.Entry<Integer, ColumnSegment> entry : builtSegments.entrySet()) {
                     int segId = entry.getKey();
                     SegmentRef ref = segments.get(segId);
-                    if (ref == null || ref.loaded != baseSegments.get(segId)) {
-                        return 0;
+                    if (ref == null || ref.generation != baseSegments.get(segId).getGeneration()) {
+                        // 锁外期间该段已被摘除或代数已变：只跳过这一段，delta 条目保留。
+                        compactionSkippedSegments.incrementAndGet();
+                        continue;
                     }
                     ColumnSegment newSeg = entry.getValue();
                     if (newSeg.getDeletedCount() >= newSeg.getRowCount()) {
@@ -597,6 +633,10 @@ public final class ColumnarStore {
                         ref.residentBytes = newSeg.getEstimatedMemory();
                     }
                     delta.clearSegmentDeletes(segId);
+                    List<Integer> offsets = deletesBySeg.get(segId);
+                    if (offsets != null) {
+                        foldedDeletes += offsets.size();
+                    }
                 }
                 for (int i = 0; i < snapCount; i++) {
                     delta.removeUpdatedIfSamePosition(snapRowIds[i], snapPositions[i]);
@@ -608,6 +648,8 @@ public final class ColumnarStore {
             } finally {
                 lock.writeLock().unlock();
             }
+        } finally {
+            compactLock.unlock();
         }
         if (persistence != null && compactedCount >= Math.max(1024, options.getCompactionMinRows())) {
             checkpoint();
